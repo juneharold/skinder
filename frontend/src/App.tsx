@@ -60,7 +60,21 @@ function readLocation() {
 export default function App() {
   const [location, setLocation] = useState(readLocation);
   const { view, q, category } = location;
-  const [skills, setSkills] = useState<Skill[]>([]);
+  const [skillsById, setSkillsById] = useState<Record<string, Skill>>({});
+  const skillCache = useRef<Record<string, Skill>>({});
+  const [catalogIds, setCatalogIds] = useState<string[]>([]);
+  const [catalogCategories, setCatalogCategories] = useState<string[]>([]);
+  const [catalogTotal, setCatalogTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreError, setMoreError] = useState("");
+  const catalogAbort = useRef<AbortController | null>(null);
+  const filterKey = JSON.stringify([q, category]);
+  const initialFilter = useRef(filterKey);
+  const currentFilter = useRef(filterKey);
+  currentFilter.current = filterKey;
+  const [skillLoadError, setSkillLoadError] = useState("");
+  const [skillRetry, setSkillRetry] = useState(0);
   const [profile, setProfile] = useState<Profile>(defaultProfile);
   const [health, setHealth] = useState<Health | null>(null);
   const [session, setSession] = useState<MatchSession | null>(null);
@@ -119,6 +133,85 @@ export default function App() {
     sessionRef.current = next;
     setSession(next);
   }, []);
+  const cacheSkills = useCallback((items: Skill[]) => {
+    const next = { ...skillCache.current };
+    for (const item of items) next[item.id] = item;
+    skillCache.current = next;
+    setSkillsById(next);
+  }, []);
+  const loadCatalog = useCallback(async (offset = 0) => {
+    const requestVersion = ++loadVersions.current.catalog;
+    catalogAbort.current?.abort();
+    const controller = new AbortController();
+    catalogAbort.current = controller;
+    const current = () =>
+      !controller.signal.aborted &&
+      requestVersion === loadVersions.current.catalog &&
+      currentFilter.current === filterKey;
+    if (offset) setLoadingMore(true);
+    else setLoads((previous) => ({ ...previous, catalog: "loading" }));
+    setMoreError("");
+    try {
+      const next = await api.catalog({
+        q,
+        category: category === "All skills" ? undefined : category,
+        offset,
+        limit: 50,
+      }, controller.signal);
+      if (!current()) return;
+      cacheSkills(next.skills);
+      setCatalogIds((previous) => [...new Set([
+        ...(offset ? previous : []), ...next.skills.map((skill) => skill.id),
+      ])]);
+      setCatalogCategories(next.categories);
+      setCatalogTotal(next.total ?? 0);
+      setHasMore(next.has_more ?? false);
+      setLoads((previous) => ({ ...previous, catalog: "ready" }));
+      setLoadErrors((previous) => ({ ...previous, catalog: undefined }));
+    } catch (error) {
+      if (!current()) return;
+      if (offset) setMoreError(message(error));
+      else {
+        setLoads((previous) => ({ ...previous, catalog: "error" }));
+        setLoadErrors((previous) => ({ ...previous, catalog: message(error) }));
+      }
+    } finally {
+      if (current()) setLoadingMore(false);
+    }
+  }, [q, category, filterKey, cacheSkills]);
+  useEffect(() => {
+    setLoads((previous) => ({ ...previous, catalog: "loading" }));
+    setLoadingMore(false);
+    let timer: number | undefined;
+    if (initialFilter.current === filterKey) void loadCatalog();
+    else timer = window.setTimeout(() => void loadCatalog(), 250);
+    return () => {
+      clearTimeout(timer);
+      catalogAbort.current?.abort();
+    };
+  }, [filterKey, loadCatalog]);
+  const recommendedIds = JSON.stringify(session?.recommendations.map((item) => item.skill_id) ?? []);
+  useEffect(() => {
+    let active = true;
+    const missing = (JSON.parse(recommendedIds) as string[])
+      .filter((id) => !skillCache.current[id]);
+    setSkillLoadError("");
+    if (!missing.length) return;
+    void (async () => {
+      // Match batches contain at most twelve skills; keep detail requests bounded.
+      for (let offset = 0; offset < missing.length; offset += 12) {
+        const results = await Promise.allSettled(missing.slice(offset, offset + 12).map((id) => api.skill(id)));
+        if (!active) return;
+        cacheSkills(results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []));
+        if (results.some((result) => result.status === "rejected"))
+          setSkillLoadError("Some recommended skills could not be loaded. Try again to review them.");
+      }
+    })();
+    return () => { active = false; };
+  }, [recommendedIds, skillRetry, cacheSkills]);
+  useEffect(() => {
+    cacheSkills(saved.map((item) => item.skill));
+  }, [saved, cacheSkills]);
 
   const load = useCallback(
     async (resource: Resource) => {
@@ -131,10 +224,6 @@ export default function App() {
         (resource !== "session" || generation === sessionVersion.current) &&
         (resource !== "saved" || savedGeneration === savedVersion.current);
       try {
-        if (resource === "catalog") {
-          const next = await api.catalog();
-          if (current()) setSkills(next.skills);
-        }
         if (resource === "profile") {
           const next = await api.profile();
           if (current()) {
@@ -170,7 +259,7 @@ export default function App() {
   );
   useEffect(() => {
     (
-      ["catalog", "profile", "session", "saved", "health"] as Resource[]
+      ["profile", "session", "saved", "health"] as Resource[]
     ).forEach((resource) => void load(resource));
   }, [load]);
   useEffect(() => {
@@ -460,9 +549,7 @@ export default function App() {
       (item) => !reviewedIds.has(item.skill_id),
     ) ?? [];
   const recommendation = remaining[0];
-  const currentSkill = skills.find(
-    (skill) => skill.id === recommendation?.skill_id,
-  );
+  const currentSkill = recommendation ? skillsById[recommendation.skill_id] : undefined;
   const lastChoice = session
     ? [...session.feedback]
         .reverse()
@@ -475,10 +562,10 @@ export default function App() {
   const total = session?.recommendations.length ?? 0;
   const reviewed = total - remaining.length;
   const savedIds = new Set(saved.map((item) => item.skill.id));
-  const categories = [...new Set(skills.map((skill) => skill.category))].sort();
-  const visibleSkills = (
-    view === "saved" ? saved.map((item) => item.skill) : skills
-  ).filter(
+  const categories = view === "saved"
+    ? [...new Set(saved.map((item) => item.skill.category))].sort()
+    : catalogCategories;
+  const visibleSkills = view === "explore" ? catalogIds.map((id) => skillsById[id]) : saved.map((item) => item.skill).filter(
     (skill) =>
       (category === "All skills" || skill.category === category) &&
       `${skill.name} ${skill.description} ${skill.author} ${skill.tags.join(" ")}`
@@ -493,7 +580,7 @@ export default function App() {
           {resource === "session" ? "your current task" : resource}.{" "}
           {loadErrors[resource]}
         </p>
-        <button onClick={() => void load(resource)}>Retry {resource}</button>
+        <button onClick={() => void (resource === "catalog" ? loadCatalog() : load(resource))}>Retry {resource}</button>
       </div>
     ) : null;
   const matchNotice = matchError && (
@@ -627,6 +714,11 @@ export default function App() {
           </div>
         )}
         {resourceNotice("health")}
+        {health?.retrieval_mode === "keyword-only" && (
+          <p className="status-notice" role="status">
+            Search is using keywords only. Matches may be less precise.
+          </p>
+        )}
         {profileBusy && (
           <p className="status-notice" role="status">
             Saving preferences…
@@ -846,8 +938,12 @@ export default function App() {
                             : "You can try again when you’re ready."}
                         </div>
                       )}
-                      {resourceNotice("catalog")}
-                      {loads.catalog === "loading" ? (
+                      {!currentSkill && recommendation && skillLoadError ? (
+                        <div className="error-notice" role="alert">
+                          <p>{skillLoadError}</p>
+                          <button onClick={() => setSkillRetry((value) => value + 1)}>Retry skills</button>
+                        </div>
+                      ) : !currentSkill && recommendation ? (
                         <div className="empty-state" role="status">
                           Loading skills…
                         </div>
@@ -936,7 +1032,7 @@ export default function App() {
                           </div>
                         </div>
                       ) : (
-                        loads.catalog === "ready" && (
+                        !recommendation && (
                           <div className="empty-state" role="status">
                             <span className="diamond">♦</span>
                             <span className="eyebrow">
@@ -1079,8 +1175,8 @@ export default function App() {
               loads[view === "saved" ? "saved" : "catalog"] === "ready" && (
                 <>
                   <p className="result-count" role="status">
-                    {visibleSkills.length}{" "}
-                    {visibleSkills.length === 1 ? "skill" : "skills"}
+                    {view === "explore" ? catalogTotal : visibleSkills.length}{" "}
+                    {(view === "explore" ? catalogTotal : visibleSkills.length) === 1 ? "skill" : "skills"}
                     {category !== "All skills" ? ` in ${category}` : ""}
                     {q ? ` matching “${q}”` : ""}
                   </p>
@@ -1145,6 +1241,14 @@ export default function App() {
                       </article>
                     ))}
                   </div>
+                  {view === "explore" && hasMore && (
+                    <div className="section-line">
+                      {moreError && <p className="error-notice" role="alert">{moreError}</p>}
+                      <button disabled={loadingMore} onClick={() => void loadCatalog(catalogIds.length)}>
+                        {loadingMore ? "Loading more…" : moreError ? "Retry loading more" : "Load more"}
+                      </button>
+                    </div>
+                  )}
                   {visibleSkills.length === 0 && (
                     <div className="empty-state">
                       <span className="diamond">♦</span>

@@ -94,9 +94,9 @@ export default function SkillCard({
         )}
         <div className="card-source">
           <span className="small muted">
-            {skill.compatibility
-              .map((agent) => (agent === "codex" ? "Codex" : "Claude Code"))
-              .join(" · ")}
+            {skill.compatibility?.length
+              ? skill.compatibility.map((agent) => (agent === "codex" ? "Codex" : "Claude Code")).join(" · ")
+              : "Compatibility not verified"}
           </span>
           <button className="text-button" onClick={onOpen}>
             View skill &amp; source <ArrowUpRight size={17} />

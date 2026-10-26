@@ -1,5 +1,6 @@
 import type {
   Agent,
+  Catalog,
   FeedbackResult,
   Health,
   MatchSession,
@@ -39,7 +40,17 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 const body = (value: unknown) => JSON.stringify(value);
 export const api = {
   health: () => request<Health>("/health"),
-  catalog: () => request<{ skills: Skill[]; categories: string[] }>("/catalog"),
+  catalog: (
+    filters: { q?: string; category?: string; offset?: number; limit?: number } = {},
+    signal?: AbortSignal,
+  ) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== "") params.set(key, String(value));
+    }
+    return request<Catalog>(`/catalog?${params}`, { signal });
+  },
+  skill: (id: string) => request<Skill>(`/skills/${encodeURIComponent(id)}`),
   profile: () => request<Profile>("/profile"),
   saveProfile: (profile: Profile) =>
     request<Profile>("/profile", { method: "PUT", body: body(profile) }),

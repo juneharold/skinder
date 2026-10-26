@@ -1,6 +1,7 @@
 import type { components } from "./api-schema";
 
 export type Skill = components["schemas"]["Skill"];
+export type Catalog = components["schemas"]["Catalog"];
 export type Profile = components["schemas"]["Profile"];
 export type Agent = Profile["agent"];
 export type Recommendation = components["schemas"]["Recommendation"];

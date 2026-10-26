@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import App from "./App";
@@ -10,6 +10,139 @@ beforeEach(() => vi.restoreAllMocks());
 afterEach(() => vi.restoreAllMocks());
 
 describe("skill discovery", () => {
+  it("uses server totals and categories while loading one catalog page at a time", async () => {
+    window.history.replaceState({}, "", "/?view=explore");
+    const skills = Array.from({ length: 51 }, (_, index) =>
+      skill(`skill-${index}`, `Skill ${index}`, index === 50 ? "Writing" : "Design"),
+    );
+    installBackend({ session: null, skills });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText("51 skills")).toBeVisible();
+    expect(screen.getByRole("option", { name: "Writing" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Skill 50" })).not.toBeInTheDocument();
+    expect(api.catalog).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await screen.findByRole("heading", { name: "Skill 50" })).toBeVisible();
+    expect(api.catalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({ offset: 50, limit: 50 }), expect.any(AbortSignal),
+    );
+    expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("article")).toHaveLength(51);
+    await user.selectOptions(screen.getByLabelText("Category"), "Writing");
+    expect(await screen.findByText("1 skill in Writing")).toBeVisible();
+    expect(screen.getAllByRole("article")).toHaveLength(1);
+    expect(api.catalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({ category: "Writing", offset: 0 }), expect.any(AbortSignal),
+    );
+  });
+
+  it("ignores an old next page after the search changes, even if it ignores cancellation", async () => {
+    window.history.replaceState({}, "", "/?view=explore");
+    const first = skill("alpha", "Alpha Skill");
+    const match = skill("beta", "Beta Skill", "Writing");
+    const stale = skill("stale", "Stale Skill");
+    installBackend({ session: null, skills: [first, match, stale] });
+    const nextPage = deferred<Awaited<ReturnType<typeof api.catalog>>>();
+    vi.mocked(api.catalog).mockImplementation(async (filters = {}) => {
+      if (filters.offset) return nextPage.promise;
+      return {
+        skills: filters.q === "Beta" ? [match] : [first],
+        categories: ["Design", "Writing"],
+        total: filters.q === "Beta" ? 1 : 3,
+        has_more: !filters.q,
+      };
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Load more" }));
+    await user.type(screen.getByRole("textbox", { name: "Search skills" }), "Beta");
+    expect(await screen.findByRole("heading", { name: "Beta Skill" })).toBeVisible();
+    await act(async () => {
+      nextPage.resolve({ skills: [stale], categories: ["Design"], total: 3, has_more: false });
+      await nextPage.promise;
+    });
+    expect(screen.queryByRole("heading", { name: "Stale Skill" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Alpha Skill" })).not.toBeInTheDocument();
+    expect(screen.getByText("1 skill matching “Beta”")).toBeVisible();
+    expect(api.catalog).toHaveBeenCalledTimes(3);
+  });
+
+  it("hydrates a restored recommendation outside the catalog page and keeps it through filtering", async () => {
+    const match = skill("match", "Restored Match");
+    const visible = skill("visible", "Visible Skill", "Writing");
+    installBackend({ skills: [match, visible], session: sessionFor([match]) });
+    vi.mocked(api.catalog).mockResolvedValue({ skills: [visible], categories: ["Writing"], total: 1, has_more: false });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Restored Match" })).toBeVisible();
+    expect(api.skill).toHaveBeenCalledWith("match");
+    await user.click(screen.getByRole("link", { name: "Explore" }));
+    await user.type(screen.getByRole("textbox", { name: "Search skills" }), "Visible");
+    await waitFor(() => expect(api.catalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({ q: "Visible", offset: 0 }), expect.any(AbortSignal),
+    ));
+    await user.click(screen.getByRole("link", { name: "Discover" }));
+    expect(screen.getByRole("heading", { name: "Restored Match" })).toBeVisible();
+    expect(api.skill).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers a retry for failed recommendation details without claiming the deck is empty", async () => {
+    installBackend();
+    vi.mocked(api.catalog).mockRejectedValue(new Error("The catalog is unavailable."));
+    vi.mocked(api.skill).mockRejectedValueOnce(new Error("The skill is unavailable."));
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Retry skills" }));
+    expect(screen.queryByRole("heading", { name: "No matching skills yet." })).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Thoughtful Design" })).toBeVisible();
+    expect(api.match).not.toHaveBeenCalled();
+  });
+
+  it("keeps unknown imported metadata explicit and directs setup to the source", async () => {
+    const imported = {
+      ...skill("imported", "Imported Skill"),
+      provenance: "skillsmp" as const,
+      compatibility: null,
+      revision: null,
+      license: null,
+      workflow: [],
+      requirements: [],
+      output_style: [],
+      evidence: [],
+      provider_url: "https://skillsmp.com/skills/imported",
+    };
+    installBackend({ skills: [imported] });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText("Compatibility not verified")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "View skill & source" }));
+    const dialog = screen.getByRole("dialog", { name: "Skill details" });
+    expect(within(dialog).getByText(/License unknown.*Source revision unknown/)).toBeVisible();
+    expect(within(dialog).getByText(/workflow has not been verified/)).toBeVisible();
+    expect(within(dialog).getByText(/Setup requirements have not been verified/)).toBeVisible();
+    expect(within(dialog).getByText(/No source evidence/)).toBeVisible();
+    expect(within(dialog).getByRole("link", { name: "View on SkillsMP" })).toHaveAttribute("href", imported.provider_url);
+    expect(within(dialog).queryByRole("button", { name: "Copy installation command" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByText(/npx skills/)).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Claude Code" })).not.toBeInTheDocument();
+  });
+
+  it("explains when search is limited to keywords", async () => {
+    installBackend();
+    vi.mocked(api.health).mockResolvedValue({
+      status: "ok", catalog_count: 3, indexed_count: 0, retrieval_mode: "keyword-only",
+      codex: { installed: true, authenticated: true, message: "Ready." },
+    });
+    render(<App />);
+    expect(await screen.findByText(/Search is using keywords only/)).toBeVisible();
+  });
+
   it("retries a failed save for the same skill without starting a new match", async () => {
     const backend = installBackend();
     vi.mocked(api.feedback).mockRejectedValueOnce(

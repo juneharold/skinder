@@ -220,6 +220,16 @@ export interface components {
             skills: components["schemas"]["Skill"][];
             /** Categories */
             categories: string[];
+            /**
+             * Total
+             * @default 0
+             */
+            total: number;
+            /**
+             * Has More
+             * @default false
+             */
+            has_more: boolean;
         };
         /** CodexStatus */
         CodexStatus: {
@@ -290,6 +300,21 @@ export interface components {
             /** Catalog Count */
             catalog_count: number;
             codex: components["schemas"]["CodexStatus"];
+            /**
+             * Indexed Count
+             * @default 0
+             */
+            indexed_count: number;
+            /**
+             * Retrieval Mode
+             * @default keyword-only
+             * @enum {string}
+             */
+            retrieval_mode: "hybrid" | "keyword-only";
+            /** Sync Status */
+            sync_status?: {
+                [key: string]: unknown;
+            } | null;
         };
         /** InstallCommands */
         InstallCommands: {
@@ -401,11 +426,8 @@ export interface components {
             slug: string;
             /** Description */
             description: string;
-            /**
-             * Category
-             * @enum {string}
-             */
-            category: "Development" | "Design" | "Writing" | "Research" | "Documents" | "Data" | "Productivity" | "Marketing";
+            /** Category */
+            category: string;
             /** Author */
             author: string;
             /** Repository */
@@ -413,11 +435,11 @@ export interface components {
             /** Source Url */
             source_url: string;
             /** Revision */
-            revision: string;
+            revision: string | null;
             /** License */
-            license: string;
+            license: string | null;
             /** Compatibility */
-            compatibility: ("codex" | "claude-code")[];
+            compatibility: ("codex" | "claude-code")[] | null;
             /** Requirements */
             requirements: string[];
             /** Tags */
@@ -429,6 +451,16 @@ export interface components {
             /** Evidence */
             evidence: components["schemas"]["Evidence"][];
             install_commands: components["schemas"]["InstallCommands"];
+            /**
+             * Provenance
+             * @default bundled
+             * @enum {string}
+             */
+            provenance: "bundled" | "skillsmp";
+            /** Provider Url */
+            provider_url?: string | null;
+            /** Content Language */
+            content_language?: string | null;
         };
     };
     responses: never;

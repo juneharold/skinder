@@ -33,13 +33,13 @@ export default function SkillDetail({
   saveError: { message: string; label: string; retry: () => void } | null;
 }) {
   const [agent, setAgent] = useState<Agent>(
-    skill.compatibility.includes(initialAgent)
+    skill.compatibility?.includes(initialAgent)
       ? initialAgent
-      : (skill.compatibility[0] ?? initialAgent),
+      : (skill.compatibility?.[0] ?? initialAgent),
   );
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
-  const command = skill.install_commands[agent];
+  const command = skill.provenance === "skillsmp" ? null : skill.install_commands[agent];
   async function copy() {
     if (!command) return;
     try {
@@ -85,11 +85,11 @@ export default function SkillDetail({
       )}
       <a
         className="source-line"
-        href={`https://github.com/${skill.repository}`}
+        href={skill.repository ? `https://github.com/${skill.repository}` : skill.source_url}
         target="_blank"
         rel="noreferrer"
       >
-        {skill.repository}
+        {skill.repository || "Original source"}
         <ArrowUpRight size={15} />
       </a>
       {recommendation && (
@@ -111,14 +111,14 @@ export default function SkillDetail({
       <div className="detail-columns">
         <section>
           <h3>How it works</h3>
-          <ul>
+          {skill.workflow.length ? <ul>
             {skill.workflow.map((item) => (
               <li key={item}>
                 <CircleCheck size={14} />
                 {item}
               </li>
             ))}
-          </ul>
+          </ul> : <p className="muted small">The workflow has not been verified. Check the source for details.</p>}
         </section>
         <section>
           <h3>What to expect</h3>
@@ -133,7 +133,9 @@ export default function SkillDetail({
             </ul>
           ) : (
             <p className="muted small">
-              The source does not specify an output style.
+              {skill.provenance === "skillsmp"
+                ? "Output style has not been verified."
+                : "The source does not specify an output style."}
             </p>
           )}
         </section>
@@ -148,18 +150,21 @@ export default function SkillDetail({
           </ul>
         </section>
       )}
+      {!skill.requirements.length && skill.provenance === "skillsmp" && (
+        <p className="small muted">Setup requirements have not been verified.</p>
+      )}
       <section className="install-section">
         <div className="section-line">
           <h3>
             <Terminal size={17} />
             Installation command
           </h3>
-          <div className="mini-segment">
+          {skill.compatibility?.length ? <div className="mini-segment">
             {(["codex", "claude-code"] as const).map((target) => (
               <button
                 key={target}
                 aria-pressed={agent === target}
-                disabled={!skill.compatibility.includes(target)}
+                disabled={!skill.compatibility?.includes(target)}
                 onClick={() => {
                   setAgent(target);
                   setCopied(false);
@@ -169,7 +174,7 @@ export default function SkillDetail({
                 {target === "codex" ? "Codex" : "Claude Code"}
               </button>
             ))}
-          </div>
+          </div> : <span className="small muted">Compatibility not verified</span>}
         </div>
         {command ? (
           <>
@@ -213,14 +218,20 @@ export default function SkillDetail({
           ))}
         </details>
       )}
+      {!skill.evidence.length && (
+        <p className="small muted">No source evidence is available to verify working style.</p>
+      )}
       <div className="detail-footer">
         <span>
-          {skill.license} · Source {skill.revision.slice(0, 7)}
+          {skill.license || "License unknown"} · {skill.revision ? `Source ${skill.revision.slice(0, 7)}` : "Source revision unknown"}
         </span>
         <a href={skill.source_url} target="_blank" rel="noreferrer">
           Read the skill
           <ExternalLink size={14} />
         </a>
+        {skill.provider_url && (
+          <a href={skill.provider_url} target="_blank" rel="noreferrer">View on SkillsMP <ExternalLink size={14} /></a>
+        )}
       </div>
     </Dialog>
   );

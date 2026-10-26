@@ -26,6 +26,7 @@ export function skill(
     author: "Example",
     repository: "example/skills",
     source_url: `https://github.com/example/skills/blob/abc/${id}/SKILL.md`,
+    provenance: "bundled",
     revision: "abc",
     license: "MIT",
     compatibility: ["codex", "claude-code"],
@@ -126,9 +127,22 @@ export function installBackend(options: BackendOptions = {}) {
     return { feedback, saved: savedResponse() };
   };
 
-  vi.spyOn(api, "catalog").mockResolvedValue({
-    skills: structuredClone(skills),
-    categories: [...new Set(skills.map((item) => item.category))],
+  vi.spyOn(api, "catalog").mockImplementation(async ({ q = "", category, offset = 0, limit = 50 } = {}) => {
+    const filtered = skills.filter((item) =>
+      (!category || category === item.category) &&
+      `${item.name} ${item.description} ${item.author} ${item.tags.join(" ")}`.toLowerCase().includes(q.toLowerCase()),
+    );
+    return {
+      skills: structuredClone(filtered.slice(offset, offset + limit)),
+      categories: [...new Set(skills.map((item) => item.category))],
+      total: filtered.length,
+      has_more: offset + limit < filtered.length,
+    };
+  });
+  vi.spyOn(api, "skill").mockImplementation(async (id) => {
+    const item = skills.find((candidate) => candidate.id === id);
+    if (!item) throw new Error("This skill could not be found.");
+    return structuredClone(item);
   });
   vi.spyOn(api, "profile").mockImplementation(async () => structuredClone(profile));
   vi.spyOn(api, "saveProfile").mockImplementation(async (next) => {
@@ -144,6 +158,8 @@ export function installBackend(options: BackendOptions = {}) {
   vi.spyOn(api, "health").mockResolvedValue({
     status: "ok",
     catalog_count: skills.length,
+    indexed_count: skills.length,
+    retrieval_mode: "hybrid",
     codex: { installed: true, authenticated: true, available: true, message: "Ready." },
   } as Health);
   vi.spyOn(api, "feedback").mockImplementation(async (...args) =>

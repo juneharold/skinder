@@ -215,3 +215,87 @@ def test_requests_are_serial_and_at_least_two_seconds_apart(catalog):
     Sync(catalog, provider.client, sleep=sleep, monotonic=lambda: elapsed[0]).run()
     assert len(starts) >= 7
     assert all(second - first >= 2 for first, second in pairwise(starts))
+
+
+@pytest.mark.parametrize("route", ["javascript://skillsmp.com/foo", "http://skillsmp.com/foo",
+                                  "https://other.example/foo"])
+def test_provider_links_require_https_and_provider_host(route):
+    assert import_skill(skill_row(route=route)).provider_url is None
+
+
+def test_capped_expansion_only_enqueues_newly_discovered_values(catalog):
+    provider = Provider(lambda _: page([skill_row()], capped=True))
+    sync = Sync(catalog, provider.client, sleep=lambda _: None)
+    sync.state["discovered"]["language"] = ["en"]
+    key = json.dumps({"filters": {}, "sort": "stars"}, sort_keys=True)
+    with catalog.connect() as db:
+        data = json.loads(db.execute("SELECT data FROM sync_partitions WHERE key=?", (key,)).fetchone()[0])
+    sync.page(key, data)
+    # An unchanged expansion must do no queue writes, even on subsequent capped pages.
+    original = sync.enqueue
+    def reject_enqueue(*args, **kwargs):
+        pytest.fail("Repeated expansion attempted a queue write")
+    sync.enqueue = reject_enqueue
+    assert sync.expand(data) is False
+    sync.enqueue = original
+    sync.add_filter("language", "ko")
+    with catalog.connect() as db:
+        queued = [json.loads(row[0]) for row in db.execute("SELECT data FROM sync_partitions")]
+    assert any(row["filters"] == {"language": "ko"} for row in queued)
+    root = next(row for row in queued if row["filters"] == {} and row["sort"] == "stars")
+    assert root["expanded_values"] == 2
+
+
+def test_interrupted_upsert_keeps_authoritative_unique_inventory(catalog, monkeypatch):
+    provider = Provider(lambda _: page([skill_row()]))
+    original = catalog.upsert
+    def interrupt_after_write(*args, **kwargs):
+        original(*args, **kwargs)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(catalog, "upsert", interrupt_after_write)
+    with pytest.raises(KeyboardInterrupt):
+        run(catalog, provider)
+    status = sync_status(catalog)
+    assert status["status"] == "paused"
+    assert status["imported_unique_total"] == 1 and status["added"] == 0
+    monkeypatch.setattr(catalog, "upsert", original)
+    assert run(catalog, provider)["imported_unique_total"] == 1
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_cli_exit_codes_and_indexing_after_pause(catalog, monkeypatch, tmp_path, capsys, interrupted):
+    import sys
+    from types import SimpleNamespace
+
+    from skinder import sync as module
+
+    def skills(request):
+        assert request.url.params["limit"] == "50"
+        if interrupted:
+            raise KeyboardInterrupt
+        return page([skill_row()])
+
+    provider = Provider(skills)
+    original = module.Sync
+    monkeypatch.setattr(module, "Sync", lambda *args, **kwargs:
+                        original(*args, **kwargs, sleep=lambda _: None))
+    def client(**kwargs):
+        assert "Skinder" in kwargs["headers"]["User-Agent"]
+        return provider.client
+    monkeypatch.setattr(module.httpx, "Client", client)
+    monkeypatch.setattr(CatalogStore, "seed", lambda _: None)
+    marker = tmp_path / "indexed"
+    def index(catalog, *, allow_download):
+        marker.write_text(str(catalog.count()))
+        return {"indexed_count": catalog.count()}
+    monkeypatch.setitem(sys.modules, "skinder.retrieval", SimpleNamespace(index_catalog=index))
+    with pytest.raises(SystemExit) as exit_info:
+        module.main(["--db", str(catalog.path), "--max-requests", "4"])
+    assert exit_info.value.code == (130 if interrupted else 2)
+    report = json.loads(capsys.readouterr().out)
+    assert report["sync"]["status"] == "paused"
+    if interrupted:
+        assert not marker.exists()
+    else:
+        assert marker.read_text() == "1"
+        assert report["index"]["indexed_count"] == 1

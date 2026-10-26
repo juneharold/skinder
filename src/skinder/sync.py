@@ -34,6 +34,9 @@ def sync_status(catalog):
         if not row:
             return None
         state = json.loads(row[0])
+        imported_unique = db.execute(
+            "SELECT count(DISTINCT skill_id) FROM catalog_aliases WHERE provider='skillsmp'"
+        ).fetchone()[0]
         rows = db.execute("SELECT status,count(*) AS n FROM sync_partitions GROUP BY status").fetchall()
         diagnostics = [json.loads(row[0]) for row in db.execute(
             "SELECT data FROM sync_partitions WHERE status='unresolved' "
@@ -51,6 +54,9 @@ def sync_status(catalog):
         "discovery_pending", "discovery_seen", "discovered",
     )} | {
         "partitions": counts,
+        "imported_unique_total": imported_unique,
+        "counter_scope": "Row counters describe this run and may undercount interrupted writes; "
+                         "imported_unique_total is the durable distinct provider inventory across runs",
         "partition_examples": [{key: value for key, value in row.items()
                                 if key != "fingerprints"} for row in diagnostics],
         "discovered": {key: len(value) for key, value in state["discovered"].items()},
@@ -139,7 +145,8 @@ def import_skill(row, category=None, previous=None):
         tags.add(category)
     route = row.get("route")
     provider_url = urljoin(BASE, route) if isinstance(route, str) else None
-    if provider_url and urlsplit(provider_url).netloc != "skillsmp.com":
+    if provider_url and (urlsplit(provider_url).scheme != "https"
+                         or urlsplit(provider_url).netloc != "skillsmp.com"):
         provider_url = None
     return Skill(
         id=identifier, name=row["name"].strip(), slug=path.split("/")[-2] if "/" in path else row["name"],
@@ -279,28 +286,41 @@ class Sync:
             self.enqueue({kind: value})
             # Newly found filters must also refine capped groups discovered earlier.
             with self.catalog.connect() as db:
-                partitions = db.execute("SELECT data FROM sync_partitions").fetchall()
+                partitions = db.execute(
+                    "SELECT key,data FROM sync_partitions WHERE json_extract(data,'$.capped')=1"
+                ).fetchall()
             for row in partitions:
-                data = json.loads(row[0])
-                if data["capped"] and data["sort"] == "stars":
-                    self.expand(data)
+                data = json.loads(row["data"])
+                if self.expand(data):
+                    with self.catalog.connect() as db:
+                        db.execute("UPDATE sync_partitions SET data=? WHERE key=?",
+                                   (json.dumps(data), row["key"]))
 
     def warn(self, message):
         if message not in self.state["warnings"]:
             self.state["warnings"].append(message)
 
     def expand(self, data):
-        self.enqueue(data["filters"], "recent")
+        if data["sort"] != "stars":
+            return False
+        changed = False
+        if not data.get("recent_enqueued"):
+            self.enqueue(data["filters"], "recent")
+            data["recent_enqueued"] = changed = True
         for dimension in DIMENSIONS:
             if dimension not in data["filters"]:
-                for value in self.state["discovered"][dimension]:
+                values = self.state["discovered"][dimension]
+                count = data.get("expanded_values", 0)
+                for value in values[count:]:
                     self.enqueue(data["filters"] | {dimension: value})
-                return
+                data["expanded_values"] = len(values)
+                return changed or count != len(values)
+        return changed
 
     def page(self, key, data):
         try:
             response = self.request("/api/skills", {
-                **data["filters"], "page": data["page"], "limit": 100, "sortBy": data["sort"],
+                **data["filters"], "page": data["page"], "limit": 50, "sortBy": data["sort"],
             })
         except Paused as exc:
             if not str(exc).startswith("Request budget reached"):
@@ -377,8 +397,11 @@ class Sync:
                 elif not partition:
                     break
             self.state["status"] = "completed"
-        except (Paused, KeyboardInterrupt) as exc:
-            self.state.update(status="paused", last_error=str(exc) or "Interrupted; rerun to resume")
+        except Paused as exc:
+            self.state.update(status="paused", last_error=str(exc))
+        except KeyboardInterrupt:
+            self.state.update(status="paused", last_error="Interrupted; rerun to resume")
+            raise
         finally:
             self.save()
         return sync_status(self.catalog)
@@ -412,11 +435,19 @@ def main(argv=None):
         catalog.seed()
         result = {}
         if not args.index_only:
-            with httpx.Client(timeout=30, follow_redirects=False) as client:
-                result["sync"] = Sync(catalog, client, max_requests=args.max_requests).run()
+            try:
+                with httpx.Client(timeout=30, follow_redirects=False, headers={
+                    "User-Agent": "Skinder/0.1 (best-effort SkillsMP catalog sync)",
+                }) as client:
+                    result["sync"] = Sync(catalog, client, max_requests=args.max_requests).run()
+            except KeyboardInterrupt:
+                print(json.dumps({"sync": sync_status(catalog)}, indent=2))
+                raise SystemExit(130) from None
         from .retrieval import index_catalog
         result["index"] = index_catalog(catalog, allow_download=True)
         print(json.dumps(result, indent=2))
+        if result.get("sync", {}).get("status") == "paused":
+            raise SystemExit(2)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import httpx
 import pytest
@@ -16,11 +17,64 @@ class MetadataOnly:
         return [match_metadata(skill) for skill in skills]
 
 
+@pytest.mark.parametrize("user_source,catalog_source", [
+    ("default", "default"),
+    ("environment", "default"),
+    ("environment", "environment"),
+    ("explicit", "environment"),
+    ("explicit", "explicit"),
+])
+async def test_database_paths_select_persisted_user_and_catalog_data(
+    tmp_path, monkeypatch, user_source, catalog_source,
+):
+    monkeypatch.setattr("skinder.app.ROOT", tmp_path)
+    monkeypatch.delenv("SKINDER_USER_DB_PATH", raising=False)
+    monkeypatch.delenv("SKINDER_CATALOG_DB_PATH", raising=False)
+    user_db_path = tmp_path / ".data" / "user.sqlite3"
+    options = {}
+    if user_source != "default":
+        user_db_path = tmp_path / "environment" / "user.sqlite3"
+        monkeypatch.setenv("SKINDER_USER_DB_PATH", str(user_db_path))
+    if user_source == "explicit":
+        user_db_path = tmp_path / "explicit" / "user.sqlite3"
+        options["user_db_path"] = user_db_path
+    catalog_db_path = user_db_path.with_name("catalog.sqlite3")
+    if catalog_source != "default":
+        catalog_db_path = tmp_path / "environment" / "catalog.sqlite3"
+        monkeypatch.setenv("SKINDER_CATALOG_DB_PATH", str(catalog_db_path))
+    if catalog_source == "explicit":
+        catalog_db_path = tmp_path / "explicit" / "catalog.sqlite3"
+        options["catalog_db_path"] = catalog_db_path
+
+    catalog_store = CatalogStore(catalog_db_path)
+    skill = example_skill(1)
+    catalog_store.upsert(skill)
+    catalog_store.close()
+    app = create_app(**options)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8742"
+        ) as client,
+    ):
+        response = await client.put("/api/profile", json={"output_style": "Use a short table."})
+        assert response.status_code == 200
+        profile = response.json()
+        catalog = (await client.get("/api/catalog")).json()
+        assert [item["id"] for item in catalog["skills"]] == [skill.id]
+
+    with sqlite3.connect(user_db_path) as connection:
+        saved_profile = connection.execute("SELECT data FROM profile WHERE id=1").fetchone()[0]
+        assert json.loads(saved_profile) == profile
+    if user_source == "explicit":
+        assert not (tmp_path / "environment" / "user.sqlite3").exists()
+
+
 @pytest.mark.asyncio
 async def test_fresh_catalog_can_be_browsed_and_matched_before_import(tmp_path, monkeypatch):
     monkeypatch.setattr("skinder.matcher.shutil.which", lambda name: None)
     app = create_app(
-        db_path=tmp_path / "state.sqlite3", catalog_db_path=tmp_path / "catalog.sqlite3"
+        user_db_path=tmp_path / "user.sqlite3", catalog_db_path=tmp_path / "catalog.sqlite3"
     )
     async with (
         app.router.lifespan_context(app),

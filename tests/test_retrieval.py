@@ -87,7 +87,7 @@ def test_stale_vectors_are_excluded_and_changed_records_get_new_ids(catalog):
     index_catalog(catalog, embedder=TestEmbedder())
     retriever = HybridRetriever(catalog, embedder=TestEmbedder())
     assert retriever.status()["indexed_count"] == 2
-    with catalog.sessions() as session:
+    with catalog.db_sessions() as session:
         original = dict(session.execute(select(
             SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
         )).all())
@@ -98,7 +98,7 @@ def test_stale_vectors_are_excluded_and_changed_records_get_new_ids(catalog):
     index_catalog(catalog, embedder=TestEmbedder())
 
     assert retriever.status()["indexed_count"] == 2
-    with catalog.sessions() as session:
+    with catalog.db_sessions() as session:
         current = dict(session.execute(select(
             SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
         ).join(CatalogSkillRecord, and_(
@@ -129,13 +129,13 @@ def test_failed_publication_preserves_old_index_and_resumes(catalog, monkeypatch
     assert ids(HybridRetriever(catalog, embedder=TestEmbedder()).search(
         "stellar", "codex", []
     )) == ["original"]
-    with catalog.sessions() as session:
+    with catalog.db_sessions() as session:
         persisted = dict(session.execute(select(
             SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
         )).all())
     monkeypatch.setattr(retrieval, "_publish", publish)
     index_catalog(catalog, embedder=TestEmbedder())
-    with catalog.sessions() as session:
+    with catalog.db_sessions() as session:
         assert dict(session.execute(select(
             SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
         )).all()) == persisted
@@ -176,7 +176,7 @@ def test_model_change_reembeds_and_publishes_new_generation(catalog, monkeypatch
 
     assert manifest(catalog)["generation"] != previous["generation"]
     assert HybridRetriever(catalog, embedder=TestEmbedder()).status()["indexed_count"] == 1
-    with catalog.sessions() as session:
+    with catalog.db_sessions() as session:
         assert session.scalar(select(func.count()).select_from(SkillEmbeddingRecord)) == 2
 
 

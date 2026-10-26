@@ -32,8 +32,8 @@ def sqlite_engine(url):
 
 
 def migration_config(kind):
-    if kind not in {"state", "catalog"}:
-        raise ValueError("Database kind must be 'state' or 'catalog'")
+    if kind not in {"user", "catalog"}:
+        raise ValueError("Database kind must be 'user' or 'catalog'")
     config = Config()
     config.set_main_option("script_location", f"skinder:migrations/{kind}")
     return config

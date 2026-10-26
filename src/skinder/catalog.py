@@ -17,7 +17,7 @@ from .orm import CatalogAliasRecord, CatalogSkillRecord
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def default_catalog_path():
+def default_catalog_db_path():
     return Path(os.environ.get("SKINDER_CATALOG_DB_PATH", ROOT / ".data" / "catalog.sqlite3"))
 
 
@@ -49,7 +49,7 @@ class CatalogStore:
         self.path = Path(path)
         self.engine = create_database(self.path, "catalog")
         # Each operation owns its session, including worker-thread searches.
-        self.sessions = sessionmaker(self.engine, expire_on_commit=False)
+        self.db_sessions = sessionmaker(self.engine, expire_on_commit=False)
 
     def close(self):
         self.engine.dispose()
@@ -59,7 +59,7 @@ class CatalogStore:
         text_hash = hashlib.sha256(content.encode()).hexdigest()
         payload = skill.model_dump_json(by_alias=True)
         source_updated_at = str(source_updated_at) if source_updated_at is not None else None
-        with self.sessions.begin() as session:
+        with self.db_sessions.begin() as session:
             # Serialize the read/modify/write decision and its FTS update across writers.
             session.connection(execution_options={"sqlite_begin_mode": "IMMEDIATE"})
             previous = session.get(CatalogSkillRecord, skill.id)
@@ -99,14 +99,14 @@ class CatalogStore:
         return "updated" if previous else "added"
 
     def get(self, skill_id):
-        with self.sessions() as session:
+        with self.db_sessions() as session:
             row = session.get(CatalogSkillRecord, skill_id)
             return Skill.model_validate_json(row.data) if row else None
 
     def get_many(self, ids):
         ids = list(dict.fromkeys(ids))
         found = {}
-        with self.sessions() as session:
+        with self.db_sessions() as session:
             for start in range(0, len(ids), 500):
                 batch = ids[start:start + 500]
                 rows = session.execute(select(CatalogSkillRecord.id, CatalogSkillRecord.data).where(
@@ -116,7 +116,7 @@ class CatalogStore:
         return [found[skill_id] for skill_id in ids if skill_id in found]
 
     def count(self):
-        with self.sessions() as session:
+        with self.db_sessions() as session:
             return session.scalar(select(func.count()).select_from(CatalogSkillRecord))
 
     def page(self, *, q="", category=None, offset=0, limit=50):
@@ -136,7 +136,7 @@ class CatalogStore:
                          literal_column("catalog_skills.rowid"))
         if category:
             statement = statement.where(CatalogSkillRecord.category == category)
-        with self.sessions() as session:
+        with self.db_sessions() as session:
             total = session.scalar(select(func.count()).select_from(statement.subquery()), params)
             rows = session.scalars(
                 statement.order_by(*order).limit(limit).offset(offset), params,
@@ -167,7 +167,7 @@ class CatalogStore:
                 CatalogSkillRecord.compatibility.is_(None),
                 select(compatibility.c.value).where(compatibility.c.value == agent).exists(),
             ))
-        with self.sessions() as session:
+        with self.db_sessions() as session:
             rows = session.scalars(statement.order_by(
                 literal_column("bm25(skills_fts,0,4,1,2,2)"),
                 literal_column("catalog_skills.rowid"),

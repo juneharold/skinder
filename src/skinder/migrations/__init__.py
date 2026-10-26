@@ -1,1 +1,1 @@
-"""Packaged Alembic histories for personal state and the shared catalog."""
+"""Packaged Alembic histories for user data and the shared catalog."""

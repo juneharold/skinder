@@ -46,7 +46,7 @@ def _paths(catalog):
 
 
 def _identity(catalog):
-    with catalog.sessions() as session:
+    with catalog.db_sessions() as session:
         return session.get(RetrievalMetaRecord, "identity").value
 
 
@@ -152,7 +152,7 @@ def _manifest(root, identity):
 
 
 def _indexed_count(catalog, generation):
-    with catalog.sessions() as session:
+    with catalog.db_sessions() as session:
         return session.scalar(select(func.count()).select_from(RetrievalMemberRecord).join(
             SkillEmbeddingRecord,
             SkillEmbeddingRecord.vector_id == RetrievalMemberRecord.vector_id,
@@ -200,7 +200,7 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
     # Keyset pagination bounds memory and resumes from persisted embeddings after interruption.
     last_id = ""
     while True:
-        with catalog.sessions() as session:
+        with catalog.db_sessions() as session:
             rows = session.execute(select(
                 CatalogSkillRecord.id, CatalogSkillRecord.text_hash,
                 CatalogSkillRecord.retrieval_text,
@@ -215,7 +215,7 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
         if not rows:
             break
         vectors = _embed(embedder, ["passage: " + row.retrieval_text for row in rows])
-        with catalog.sessions.begin() as session:
+        with catalog.db_sessions.begin() as session:
             session.execute(insert(SkillEmbeddingRecord).on_conflict_do_nothing(
                 index_elements=["skill_id", "text_hash", "model_fingerprint"],
             ), [{"skill_id": row.id, "text_hash": row.text_hash,
@@ -230,7 +230,7 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
     try:
         last_id = 0
         while True:
-            with catalog.sessions() as session:
+            with catalog.db_sessions() as session:
                 rows = session.execute(select(
                     SkillEmbeddingRecord.vector_id, SkillEmbeddingRecord.vector,
                 ).join(CatalogSkillRecord, and_(
@@ -245,7 +245,7 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
             keys = np.array([row.vector_id for row in rows], dtype=np.uint64)
             vectors = np.stack([np.frombuffer(row.vector, dtype=np.float32) for row in rows])
             index.add(keys, vectors, threads=4)
-            with catalog.sessions.begin() as session:
+            with catalog.db_sessions.begin() as session:
                 session.add_all(RetrievalMemberRecord(generation=generation, vector_id=int(key))
                                 for key in keys)
             last_id = int(keys[-1])
@@ -260,7 +260,7 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
         _publish(root, manifest)
     except BaseException:
         (root / filename).unlink(missing_ok=True)
-        with catalog.sessions.begin() as session:
+        with catalog.db_sessions.begin() as session:
             session.execute(delete(RetrievalMemberRecord).where(
                 RetrievalMemberRecord.generation == generation
             ))
@@ -268,7 +268,7 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
 
     # Keep one previous generation; mapped readers on this Mac retain their open old files.
     keep = [generation] + ([previous["generation"]] if previous else [])
-    with catalog.sessions.begin() as session:
+    with catalog.db_sessions.begin() as session:
         session.execute(delete(RetrievalMemberRecord).where(
             RetrievalMemberRecord.generation.not_in(keep)
         ))
@@ -317,7 +317,7 @@ class HybridRetriever:
             resources = self._resources()
             if resources:
                 generation = resources[1]["generation"]
-                with self.catalog.sessions() as session:
+                with self.catalog.db_sessions() as session:
                     revision = session.get(RetrievalMetaRecord, "catalog_revision").value
                 with self._lock:
                     if self._count_key != (generation, revision):
@@ -334,7 +334,7 @@ class HybridRetriever:
 
     def _vector_skills(self, keys, agent, excluded):
         ids = []
-        with self.catalog.sessions() as session:
+        with self.catalog.db_sessions() as session:
             for start in range(0, len(keys), 500):
                 batch = [int(key) for key in keys[start:start + 500]]
                 rows = session.execute(select(

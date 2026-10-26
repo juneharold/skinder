@@ -44,7 +44,7 @@ uv run best-effort-full-sync --index-only
 
 The sync starts with public category, occupation, and language lists. It paginates each partition, splits capped searches using remaining filters, also checks recently updated results, and deduplicates skills by repository and path. It checkpoints progress, respects provider limits, and can take hours or longer. Rerunning resumes unfinished work; after a completed pass, the next invocation starts a new refresh. Existing skills and bookmarks are never removed just because a later crawl misses them.
 
-This is **best-effort-full-sync**, not a guarantee that every SkillsMP listing was obtained. Provider caps, undiscovered taxonomy, changing results, and access failures remain visible in the report. A quota/access interruption pauses the crawl. Use `--max-requests 10` for a bounded trial; the budget includes taxonomy requests and retries. A paused run exits with code 2 after indexing available records; Ctrl-C checkpoints and exits with code 130 without starting indexing. Use `--db PATH` or `SKINDER_CATALOG_DB_PATH` to select a catalog database. The website listing endpoint currently permits 48 records per page, which differs from the documented REST search endpoint.
+This is **best-effort-full-sync**, not a guarantee that every SkillsMP listing was obtained. Provider caps, undiscovered taxonomy, changing results, and access failures remain visible in the report. A quota/access interruption pauses the crawl. Use `--max-requests 10` for a bounded trial; the budget includes taxonomy requests and retries. A paused run exits with code 2 after indexing available records; Ctrl-C checkpoints and exits with code 130 without starting indexing. Use `--catalog-db-path PATH` or `SKINDER_CATALOG_DB_PATH` to select a catalog database. The website listing endpoint currently permits 48 records per page, which differs from the documented REST search endpoint.
 
 The first indexing run downloads the pinned multilingual E5-small model (about 470 MB). FastEmbed runs it locally, SQLite FTS5 supplies keyword rankings, and a persistent USearch index supplies vector candidates. Changed metadata is re-embedded; unchanged records reuse their vectors. A failed index build preserves the previous published index. Until an index is ready, matching uses keyword retrieval and the app identifies that reduced mode.
 
@@ -82,22 +82,22 @@ The React frontend runs at **http://127.0.0.1:5174**, with API requests proxied 
 
 The backend uses FastAPI, Pydantic, SQLAlchemy ORM, Alembic, and an asynchronous Codex subprocess. SQLite remains the database engine. The frontend uses React, TypeScript, Vite, and locally bundled fonts.
 
-Database records are mapped in `src/skinder/orm.py`; Pydantic models remain the API contract. Each database operation uses its own SQLAlchemy session. Alembic owns schema creation, indexes, and triggers, with separate migration histories for personal state and the catalog. Startup and catalog commands automatically apply pending migrations. SQLite FTS5 search uses SQLAlchemy expressions and parameterized SQL for its virtual table.
+Database records are mapped in `src/skinder/orm.py`; Pydantic models remain the API contract. `UserStore` in `src/skinder/user.py` manages user data, and `CatalogStore` in `src/skinder/catalog.py` manages catalog data. Both use `db_sessions` to create SQLAlchemy database sessions. Matching sessions are stored in `match_sessions` and accessed through methods such as `get_match_session`. Alembic owns schema creation, indexes, and triggers, with separate migration histories for the user and catalog databases. Startup and catalog commands automatically apply pending migrations. SQLite FTS5 search uses SQLAlchemy expressions and parameterized SQL for its virtual table.
 
 To manage migrations explicitly:
 
 ```sh
-uv run alembic upgrade head
+uv run alembic -n user upgrade head
 uv run alembic -n catalog upgrade head
-uv run alembic check
+uv run alembic -n user check
 uv run alembic -n catalog check
 
 # After changing ORM models, generate and review a migration for the affected database.
-uv run alembic revision --autogenerate -m "Describe personal state change"
+uv run alembic -n user revision --autogenerate -m "Describe user data change"
 uv run alembic -n catalog revision --autogenerate -m "Describe catalog change"
 ```
 
-`SKINDER_DB_PATH` selects the personal database and `SKINDER_CATALOG_DB_PATH` selects the catalog for these commands. Migration files live under `src/skinder/migrations/state/versions` and `src/skinder/migrations/catalog/versions`. This switch starts with fresh databases; the old unversioned schema is not migrated.
+`SKINDER_USER_DB_PATH` selects the user database and `SKINDER_CATALOG_DB_PATH` selects the catalog for these commands. Migration files live under `src/skinder/migrations/user/versions` and `src/skinder/migrations/catalog/versions`. Development uses a fresh user database with the current migration baseline; older user databases are not migrated.
 
 Pydantic models define the API contract. FastAPI serves interactive documentation at **http://127.0.0.1:8742/docs** and the schema at **http://127.0.0.1:8742/openapi.json**. After changing the models, restart the backend (or use development reload), then regenerate the frontend types from the running backend:
 
@@ -119,7 +119,14 @@ The historical [hybrid retrieval results](evaluation/hybrid-retrieval-results.js
 
 ## Data and boundaries
 
-Personal state lives in `.data/skinder.sqlite3`, which is ignored by Git. Set `SKINDER_DB_PATH` to use another database. Catalog data lives in the adjacent `catalog.sqlite3` by default; set `SKINDER_CATALOG_DB_PATH` to override it. CLI imports never open the personal-state database. New catalogs are populated by SkillsMP imports; existing catalog records and bookmarks are preserved. Search indexes and downloaded models are local artifacts beside the catalog database. No application telemetry is sent.
+Skinder uses two separate SQLite database files, each with multiple tables:
+
+| Database | Default file | Path setting | Contents |
+| --- | --- | --- | --- |
+| User | `.data/user.sqlite3` | `SKINDER_USER_DB_PATH` | Profile, matching sessions, feedback, and bookmarks |
+| Catalog | `.data/catalog.sqlite3` | `SKINDER_CATALOG_DB_PATH` | Skills, cached sources, sync progress, and search embeddings |
+
+Both files are ignored by Git. The application defaults to `catalog.sqlite3` beside the selected user database. Catalog commands use `.data/catalog.sqlite3` by default; set `SKINDER_CATALOG_DB_PATH` when they should use another location. CLI imports never open the user database. New catalogs are populated by SkillsMP imports; existing catalog records and bookmarks are preserved. Search indexes and downloaded models are local artifacts beside the catalog database. No application telemetry is sent.
 
 One matching request runs at a time, with cancellation and a three-minute timeout covering retrieval, source enrichment, and Codex. A server restart marks unfinished matching as interrupted rather than automatically retrying. A failed additional batch preserves earlier results. Codex receives only the bounded shortlist in a temporary, read-only workspace with tools and integrations disabled. App startup never downloads an embedding model or contacts SkillsMP.
 

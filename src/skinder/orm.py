@@ -14,7 +14,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-class StateBase(DeclarativeBase):
+class UserBase(DeclarativeBase):
     pass
 
 
@@ -22,7 +22,7 @@ class CatalogBase(DeclarativeBase):
     pass
 
 
-class ProfileRecord(StateBase):
+class ProfileRecord(UserBase):
     __tablename__ = "profile"
     __table_args__ = (CheckConstraint("id=1"),)
 
@@ -30,8 +30,8 @@ class ProfileRecord(StateBase):
     data: Mapped[str] = mapped_column(Text)
 
 
-class MatchSessionRecord(StateBase):
-    __tablename__ = "sessions"
+class MatchSessionRecord(UserBase):
+    __tablename__ = "match_sessions"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     task: Mapped[str] = mapped_column(Text)
@@ -43,28 +43,28 @@ class MatchSessionRecord(StateBase):
     updated_at: Mapped[str] = mapped_column(Text)
 
 
-class SessionSkillRecord(StateBase):
-    __tablename__ = "session_skills"
+class MatchSessionSkillRecord(UserBase):
+    __tablename__ = "match_session_skills"
 
     session_id: Mapped[str] = mapped_column(
-        Text, ForeignKey("sessions.id"), primary_key=True,
+        Text, ForeignKey("match_sessions.id"), primary_key=True,
     )
     skill_id: Mapped[str] = mapped_column(Text, primary_key=True)
 
 
-class FeedbackRecord(StateBase):
+class FeedbackRecord(UserBase):
     __tablename__ = "feedback"
     __table_args__ = (UniqueConstraint("session_id", "skill_id"),)
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
-    session_id: Mapped[str | None] = mapped_column(Text, ForeignKey("sessions.id"))
+    session_id: Mapped[str | None] = mapped_column(Text, ForeignKey("match_sessions.id"))
     skill_id: Mapped[str] = mapped_column(Text)
     action: Mapped[str] = mapped_column(Text)
     reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(Text)
 
 
-class BookmarkRecord(StateBase):
+class BookmarkRecord(UserBase):
     __tablename__ = "bookmarks"
 
     skill_id: Mapped[str] = mapped_column(Text, primary_key=True)

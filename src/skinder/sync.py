@@ -16,7 +16,7 @@ import httpx
 from sqlalchemy import Integer, cast, delete, func, literal_column, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 
-from .catalog import CatalogStore, default_catalog_path, stable_id
+from .catalog import CatalogStore, default_catalog_db_path, stable_id
 from .models import InstallCommands, Skill
 from .orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
 
@@ -32,7 +32,7 @@ def now():
 
 def sync_status(catalog):
     """Read existing state without initializing or mutating a sync run."""
-    with catalog.sessions() as session:
+    with catalog.db_sessions() as session:
         row = session.get(SyncRunRecord, 1)
         if not row:
             return None
@@ -174,7 +174,7 @@ class Sync:
         self.catalog, self.client = catalog, client
         self.max_requests, self.sleep, self.monotonic = max_requests, sleep, monotonic
         self.calls, self.last_call = 0, None
-        with catalog.sessions.begin() as session:
+        with catalog.db_sessions.begin() as session:
             row = session.get(SyncRunRecord, 1)
             self.state = json.loads(row.data) if row else None
             if not self.state or self.state["status"] == "completed":
@@ -191,19 +191,19 @@ class Sync:
 
     def save(self):
         self.state["updated_at"] = now()
-        with self.catalog.sessions.begin() as session:
+        with self.catalog.db_sessions.begin() as session:
             session.merge(SyncRunRecord(id=1, data=json.dumps(self.state)))
 
     def enqueue(self, filters, sort="stars"):
         key = json.dumps({"filters": filters, "sort": sort}, sort_keys=True)
         data = {"filters": filters, "sort": sort, "page": 1, "fingerprints": [], "capped": False}
-        with self.catalog.sessions.begin() as session:
+        with self.catalog.db_sessions.begin() as session:
             session.execute(insert(SyncPartitionRecord).values(
                 key=key, status="pending", data=json.dumps(data),
             ).on_conflict_do_nothing(index_elements=["key"]))
 
     def checkpoint(self, key, data, status="pending"):
-        with self.catalog.sessions.begin() as session:
+        with self.catalog.db_sessions.begin() as session:
             session.execute(update(SyncPartitionRecord).where(
                 SyncPartitionRecord.key == key
             ).values(status=status, data=json.dumps(data)))
@@ -295,14 +295,14 @@ class Sync:
             self.state["discovered"][kind].append(value)
             self.enqueue({kind: value})
             # Newly found filters must also refine capped groups discovered earlier.
-            with self.catalog.sessions() as session:
+            with self.catalog.db_sessions() as session:
                 partitions = session.execute(select(
                     SyncPartitionRecord.key, SyncPartitionRecord.data,
                 ).where(func.json_extract(SyncPartitionRecord.data, "$.capped") == 1)).all()
             for row in partitions:
                 data = json.loads(row.data)
                 if self.expand(data):
-                    with self.catalog.sessions.begin() as session:
+                    with self.catalog.db_sessions.begin() as session:
                         session.execute(update(SyncPartitionRecord).where(
                             SyncPartitionRecord.key == row.key
                         ).values(data=json.dumps(data)))
@@ -402,7 +402,7 @@ class Sync:
             )):
                 self.discover()
             while True:
-                with self.catalog.sessions() as session:
+                with self.catalog.db_sessions() as session:
                     partition = session.execute(select(
                         SyncPartitionRecord.key, SyncPartitionRecord.data,
                     ).where(SyncPartitionRecord.status == "pending").order_by(
@@ -434,7 +434,10 @@ def positive(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", type=str, default=str(default_catalog_path()))
+    parser.add_argument(
+        "--catalog-db-path", type=str, default=str(default_catalog_db_path()),
+        help="Path to the catalog database",
+    )
     parser.add_argument("--max-requests", type=positive, help="remote-call budget for this invocation")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--index-only", action="store_true")
@@ -444,7 +447,7 @@ def main(argv=None):
         logger.addHandler(logging.StreamHandler())
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    catalog = CatalogStore(args.db)
+    catalog = CatalogStore(args.catalog_db_path)
     if args.status:
         print(json.dumps(sync_status(catalog), indent=2))
         return

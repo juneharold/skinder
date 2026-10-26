@@ -5,12 +5,12 @@ from alembic import context
 from sqlalchemy import URL, make_url
 
 from skinder.database import sqlite_engine
-from skinder.orm import CatalogBase, StateBase
+from skinder.orm import CatalogBase, UserBase
 
 
 def run_migrations(kind):
     config = context.config
-    metadata = StateBase.metadata if kind == "state" else CatalogBase.metadata
+    metadata = UserBase.metadata if kind == "user" else CatalogBase.metadata
 
     def include_name(name, type_, _parent_names):
         # SQLite owns the virtual table and its shadow tables; migrations manage FTS explicitly.
@@ -32,7 +32,7 @@ def run_migrations(kind):
         migrate(connection)
         return
 
-    variable = "SKINDER_DB_PATH" if kind == "state" else "SKINDER_CATALOG_DB_PATH"
+    variable = "SKINDER_USER_DB_PATH" if kind == "user" else "SKINDER_CATALOG_DB_PATH"
     path = os.environ.get(variable)
     url = URL.create("sqlite", database=path) if path else make_url(
         config.get_main_option("sqlalchemy.url")

@@ -17,19 +17,19 @@ from skinder.orm import (
     CatalogSkillRecord,
     FeedbackRecord,
     MatchSessionRecord,
+    MatchSessionSkillRecord,
     ProfileRecord,
     RetrievalMemberRecord,
     RetrievalMetaRecord,
-    SessionSkillRecord,
     SkillEmbeddingRecord,
     SourceCacheRecord,
-    StateBase,
     SyncPartitionRecord,
     SyncRunRecord,
+    UserBase,
 )
 
 
-@pytest.mark.parametrize("kind,base", [("state", StateBase), ("catalog", CatalogBase)])
+@pytest.mark.parametrize("kind,base", [("user", UserBase), ("catalog", CatalogBase)])
 def test_fresh_database_matches_models_and_alembic_head(tmp_path, kind, base):
     engine = create_database(tmp_path / f"{kind}.sqlite3", kind)
     try:
@@ -50,9 +50,9 @@ def test_fresh_database_matches_models_and_alembic_head(tmp_path, kind, base):
         engine.dispose()
 
 
-def test_state_reopen_preserves_records_and_foreign_keys_rollback(tmp_path):
-    path = tmp_path / "state.sqlite3"
-    engine = create_database(path, "state")
+def test_user_reopen_preserves_records_and_foreign_keys_rollback(tmp_path):
+    path = tmp_path / "user.sqlite3"
+    engine = create_database(path, "user")
     with Session(engine) as session, session.begin():
         session.add(ProfileRecord(id=1, data='{"language":"ko"}'))
         session.add(MatchSessionRecord(
@@ -60,7 +60,7 @@ def test_state_reopen_preserves_records_and_foreign_keys_rollback(tmp_path):
             created_at="2026-10-27", updated_at="2026-10-27",
         ))
         session.flush()
-        session.add(SessionSkillRecord(session_id="task", skill_id="skill"))
+        session.add(MatchSessionSkillRecord(session_id="task", skill_id="skill"))
         session.add(FeedbackRecord(
             id="feedback", session_id="task", skill_id="skill", action="save",
             created_at="2026-10-27",
@@ -68,7 +68,7 @@ def test_state_reopen_preserves_records_and_foreign_keys_rollback(tmp_path):
         session.add(BookmarkRecord(skill_id="skill", saved_at="2026-10-27", feedback_id=None))
     engine.dispose()
 
-    engine = create_database(path, "state")
+    engine = create_database(path, "user")
     try:
         with Session(engine) as session:
             assert session.get(ProfileRecord, 1).data == '{"language":"ko"}'
@@ -78,10 +78,10 @@ def test_state_reopen_preserves_records_and_foreign_keys_rollback(tmp_path):
         with pytest.raises(IntegrityError), Session(engine) as session, session.begin():
             session.add(BookmarkRecord(skill_id="rolled-back", saved_at="2026-10-27"))
             session.flush()
-            session.add(SessionSkillRecord(session_id="missing-session", skill_id="skill"))
+            session.add(MatchSessionSkillRecord(session_id="missing-session", skill_id="skill"))
         with Session(engine) as session:
             assert session.get(BookmarkRecord, "rolled-back") is None
-            assert session.get(SessionSkillRecord, ("task", "skill")) is not None
+            assert session.get(MatchSessionSkillRecord, ("task", "skill")) is not None
     finally:
         engine.dispose()
 
@@ -175,7 +175,7 @@ def test_failed_migration_rolls_back_schema_and_version(tmp_path):
         connection.execute("CREATE TABLE bookmarks (skill_id TEXT PRIMARY KEY)")
         connection.execute("INSERT INTO bookmarks VALUES ('existing')")
     with pytest.raises(OperationalError):
-        create_database(path, "state")
+        create_database(path, "user")
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == [
             ("bookmarks",),
@@ -184,7 +184,7 @@ def test_failed_migration_rolls_back_schema_and_version(tmp_path):
 
 
 @pytest.mark.parametrize("kind,section,variable", [
-    ("state", "alembic", "SKINDER_DB_PATH"),
+    ("user", "user", "SKINDER_USER_DB_PATH"),
     ("catalog", "catalog", "SKINDER_CATALOG_DB_PATH"),
 ])
 def test_named_alembic_configuration_upgrades_and_downgrades(tmp_path, monkeypatch, kind, section,

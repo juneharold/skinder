@@ -3,7 +3,7 @@
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0001_state"
+revision = "0001_user"
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -17,7 +17,7 @@ def upgrade():
         sa.CheckConstraint("id=1"),
     )
     op.create_table(
-        "sessions",
+        "match_sessions",
         sa.Column("id", sa.Text(), primary_key=True),
         sa.Column("task", sa.Text(), nullable=False),
         sa.Column("agent", sa.Text(), nullable=False),
@@ -28,14 +28,14 @@ def upgrade():
         sa.Column("updated_at", sa.Text(), nullable=False),
     )
     op.create_table(
-        "session_skills",
-        sa.Column("session_id", sa.Text(), sa.ForeignKey("sessions.id"), primary_key=True),
+        "match_session_skills",
+        sa.Column("session_id", sa.Text(), sa.ForeignKey("match_sessions.id"), primary_key=True),
         sa.Column("skill_id", sa.Text(), primary_key=True),
     )
     op.create_table(
         "feedback",
         sa.Column("id", sa.Text(), primary_key=True),
-        sa.Column("session_id", sa.Text(), sa.ForeignKey("sessions.id")),
+        sa.Column("session_id", sa.Text(), sa.ForeignKey("match_sessions.id")),
         sa.Column("skill_id", sa.Text(), nullable=False),
         sa.Column("action", sa.Text(), nullable=False),
         sa.Column("reason", sa.Text()),
@@ -51,5 +51,5 @@ def upgrade():
 
 
 def downgrade():
-    for table in ("bookmarks", "feedback", "session_skills", "sessions", "profile"):
+    for table in ("bookmarks", "feedback", "match_session_skills", "match_sessions", "profile"):
         op.drop_table(table)

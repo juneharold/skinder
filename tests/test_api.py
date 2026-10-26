@@ -248,8 +248,8 @@ async def test_timeout_reaps_child_and_failed_process_does_not_leak_credentials(
 async def test_restart_marks_inflight_failed_without_repeating(backend, status):
     async with backend.client() as client:
         first = await match(client)
-    with sqlite3.connect(backend.db_path) as db:
-        db.execute("UPDATE sessions SET status=? WHERE id=?", (status, first["id"]))
+    with sqlite3.connect(backend.user_db_path) as db:
+        db.execute("UPDATE match_sessions SET status=? WHERE id=?", (status, first["id"]))
     (backend.root / "request.json").unlink()
     async with backend.client() as client:
         restored = (await client.get("/api/matches/current")).json()
@@ -509,8 +509,8 @@ async def test_matching_blocks_only_new_feedback_and_undo_for_that_session(backe
             json={"task": session["task"], "agent": session["agent"], "session_id": session["id"]},
         )
         assert response.status_code == 202
-        with sqlite3.connect(backend.db_path) as db:
-            db.execute("UPDATE sessions SET status=? WHERE id=?", (status, session["id"]))
+        with sqlite3.connect(backend.user_db_path) as db:
+            db.execute("UPDATE match_sessions SET status=? WHERE id=?", (status, session["id"]))
         value = {"session_id": session["id"], "skill_id": "skill-1", "action": "save"}
         assert (await client.post("/api/feedback", json=value)).status_code == 409
         assert (await client.delete(f"/api/feedback/{decision['id']}")).status_code == 409
@@ -528,7 +528,7 @@ async def test_matching_blocks_only_new_feedback_and_undo_for_that_session(backe
         }
         current = (await client.get(f"/api/matches/{session['id']}")).json()
         assert current["feedback"] == [decision]
-        with sqlite3.connect(backend.db_path) as db:
-            db.execute("UPDATE sessions SET status='running' WHERE id=?", (session["id"],))
+        with sqlite3.connect(backend.user_db_path) as db:
+            db.execute("UPDATE match_sessions SET status='running' WHERE id=?", (session["id"],))
         await client.post(f"/api/matches/{session['id']}/cancel")
         assert (await client.delete(f"/api/feedback/{decision['id']}")).status_code == 200

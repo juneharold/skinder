@@ -11,8 +11,8 @@ from .orm import (
     BookmarkRecord,
     FeedbackRecord,
     MatchSessionRecord,
+    MatchSessionSkillRecord,
     ProfileRecord,
-    SessionSkillRecord,
 )
 
 
@@ -20,11 +20,11 @@ def now():
     return datetime.now(UTC).isoformat()
 
 
-class Store:
+class UserStore:
     def __init__(self, path):
-        self.engine = create_database(path, "state")
-        self.sessions = sessionmaker(self.engine, expire_on_commit=False)
-        with self.sessions.begin() as db:
+        self.engine = create_database(path, "user")
+        self.db_sessions = sessionmaker(self.engine, expire_on_commit=False)
+        with self.db_sessions.begin() as db:
             db.execute(
                 update(MatchSessionRecord)
                 .where(MatchSessionRecord.status.in_(("running", "pending")))
@@ -38,18 +38,18 @@ class Store:
     def close(self):
         self.engine.dispose()
 
-    def profile(self):
-        with self.sessions() as db:
+    def get_profile(self):
+        with self.db_sessions() as db:
             row = db.get(ProfileRecord, 1)
             return Profile.model_validate_json(row.data) if row else Profile()
 
     def set_profile(self, profile):
-        with self.sessions.begin() as db:
+        with self.db_sessions.begin() as db:
             db.merge(ProfileRecord(id=1, data=profile.model_dump_json()))
         return profile
 
-    def session(self, session_id):
-        with self.sessions() as db:
+    def get_match_session(self, session_id):
+        with self.db_sessions() as db:
             row = db.get(MatchSessionRecord, session_id)
             if row is None:
                 return None
@@ -65,16 +65,16 @@ class Store:
                 error=row.error, created_at=row.created_at, updated_at=row.updated_at,
             )
 
-    def current(self):
-        with self.sessions() as db:
+    def get_current_match_session(self):
+        with self.db_sessions() as db:
             session_id = db.scalar(
                 select(MatchSessionRecord.id).order_by(MatchSessionRecord.updated_at.desc()).limit(1)
             )
-        return self.session(session_id) if session_id else None
+        return self.get_match_session(session_id) if session_id else None
 
-    def start(self, task, agent, session_id=None):
+    def start_match_session(self, task, agent, session_id=None):
         timestamp = now()
-        with self.sessions.begin() as db:
+        with self.db_sessions.begin() as db:
             if session_id:
                 db.execute(
                     update(MatchSessionRecord)
@@ -87,13 +87,13 @@ class Store:
                     id=session_id, task=task, agent=agent, status="running",
                     recommendations="[]", created_at=timestamp, updated_at=timestamp,
                 ))
-        return self.session(session_id)
+        return self.get_match_session(session_id)
 
-    def finish(self, session_id, status, recommendations=None, error=None):
+    def finish_match_session(self, session_id, status, recommendations=None, error=None):
         values = {"status": status, "error": error, "updated_at": now()}
         if recommendations is not None:
             values["recommendations"] = json.dumps([r.model_dump() for r in recommendations])
-        with self.sessions.begin() as db:
+        with self.db_sessions.begin() as db:
             # Cancellation is authoritative even if a subprocess produces a late result.
             changed = db.execute(
                 update(MatchSessionRecord)
@@ -103,24 +103,24 @@ class Store:
             if not changed.rowcount or recommendations is None:
                 return
             known = set(db.scalars(
-                select(SessionSkillRecord.skill_id).where(
-                    SessionSkillRecord.session_id == session_id
+                select(MatchSessionSkillRecord.skill_id).where(
+                    MatchSessionSkillRecord.session_id == session_id
                 )
             ))
             db.add_all([
-                SessionSkillRecord(session_id=session_id, skill_id=skill_id)
+                MatchSessionSkillRecord(session_id=session_id, skill_id=skill_id)
                 for skill_id in {r.skill_id for r in recommendations} - known
             ])
 
-    def seen(self, session_id):
-        with self.sessions() as db:
+    def get_seen_skill_ids(self, session_id):
+        with self.db_sessions() as db:
             return set(db.scalars(
                 select(FeedbackRecord.skill_id).where(FeedbackRecord.session_id == session_id)
             ))
 
-    def feedback(self, value: FeedbackInput):
-        with self.sessions.begin() as db:
-            if db.get(SessionSkillRecord, (value.session_id, value.skill_id)) is None:
+    def add_feedback(self, value: FeedbackInput):
+        with self.db_sessions.begin() as db:
+            if db.get(MatchSessionSkillRecord, (value.session_id, value.skill_id)) is None:
                 raise ValueError("Feedback requires a skill recommended in this task session.")
             previous = db.scalar(select(FeedbackRecord).where(
                 FeedbackRecord.session_id == value.session_id,
@@ -144,8 +144,8 @@ class Store:
         if session.status in ("pending", "running"):
             raise ValueError("Wait for matching to finish or cancel it before changing feedback.")
 
-    def undo(self, feedback_id):
-        with self.sessions.begin() as db:
+    def undo_feedback(self, feedback_id):
+        with self.db_sessions.begin() as db:
             row = db.get(FeedbackRecord, feedback_id)
             if row is None:
                 return
@@ -169,29 +169,29 @@ class Store:
                 else:
                     db.delete(bookmark)
 
-    def saved(self):
-        with self.sessions() as db:
+    def get_bookmarks(self):
+        with self.db_sessions() as db:
             rows = db.scalars(select(BookmarkRecord).order_by(BookmarkRecord.saved_at.desc()))
             return [
                 {"skill_id": row.skill_id, "saved_at": row.saved_at, "feedback_id": row.feedback_id}
                 for row in rows
             ]
 
-    def save(self, skill_id):
-        with self.sessions.begin() as db:
+    def add_bookmark(self, skill_id):
+        with self.db_sessions.begin() as db:
             bookmark = db.get(BookmarkRecord, skill_id)
             if bookmark:
                 bookmark.feedback_id = None
             else:
                 db.add(BookmarkRecord(skill_id=skill_id, saved_at=now()))
 
-    def unsave(self, skill_id):
-        with self.sessions.begin() as db:
+    def remove_bookmark(self, skill_id):
+        with self.db_sessions.begin() as db:
             db.execute(delete(BookmarkRecord).where(BookmarkRecord.skill_id == skill_id))
 
-    def preference_events(self, agent):
+    def get_preference_events(self, agent):
         # A plain pass and wrong-task reason are local exclusions, never global taste signals.
-        with self.sessions() as db:
+        with self.db_sessions() as db:
             rows = db.execute(
                 select(
                     FeedbackRecord.skill_id, FeedbackRecord.action, FeedbackRecord.reason,

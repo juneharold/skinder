@@ -79,7 +79,7 @@ class SourceEnricher:
         self.timeout = timeout
 
     def cached(self, skill):
-        with self.catalog.sessions() as session:
+        with self.catalog.db_sessions() as session:
             row = session.get(SourceCacheRecord, skill.id)
             current = session.scalar(select(CatalogSkillRecord.source_updated_at).where(
                 CatalogSkillRecord.id == skill.id
@@ -141,7 +141,7 @@ class SourceEnricher:
                 except (httpx.HTTPError, UnicodeError, ValueError):
                     return
                 fetched_at = time.time()
-                with self.catalog.sessions.begin() as session:
+                with self.catalog.db_sessions.begin() as session:
                     statement = insert(SourceCacheRecord).values(
                         skill_id=skill.id, source_url=skill.source_url,
                         source_updated_at=stamp, fetched_at=fetched_at, content=text,

@@ -74,7 +74,7 @@ pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(
     fake.chmod(0o755)
     monkeypatch.setenv("SKINDER_FAKE_CODEX", str(tmp_path))
     monkeypatch.setattr("skinder.matcher.shutil.which", lambda name: str(fake))
-    db_path = tmp_path / "state.sqlite3"
+    user_db_path = tmp_path / "user.sqlite3"
 
     class SessionTestRetriever:
         # Session/feedback tests control ranking; real hybrid behavior has its own tests.
@@ -88,7 +88,7 @@ pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(
     @asynccontextmanager
     async def client(timeout=180, frontend_path=None, retriever=None, enricher=None):
         app = create_app(
-            db_path=db_path,
+            user_db_path=user_db_path,
             catalog_db_path=catalog_db_path,
             matcher=CodexMatcher(timeout=timeout),
             frontend_path=frontend_path,
@@ -107,5 +107,5 @@ pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(
         control.write_text(json.dumps(config))
 
     return SimpleNamespace(
-        client=client, configure=configure, root=tmp_path, db_path=db_path, skills=skills
+        client=client, configure=configure, root=tmp_path, user_db_path=user_db_path, skills=skills
     )

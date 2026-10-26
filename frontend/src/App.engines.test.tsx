@@ -59,6 +59,24 @@ describe("recommendation engines", () => {
     expect(screen.getByRole("button", { name: "Find skills" })).toBeEnabled();
   });
 
+  it("shows the selected engine's upgrade guidance when its installed CLI is unsupported", async () => {
+    const upgradeMessage = "Upgrade Claude Code to support structured recommendations.";
+    installBackend({ session: null, engines: {
+      ...readyEngines,
+      "claude-code": { installed: true, authenticated: true, ready: false, message: upgradeMessage },
+    } });
+    const user = userEvent.setup();
+    render(<App />);
+    await enterTask(user);
+    expect(screen.queryByText(upgradeMessage)).not.toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("Recommendation engine"), "claude-code");
+    expect(screen.getByText(upgradeMessage)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Find skills" })).toBeDisabled();
+    await user.selectOptions(screen.getByLabelText("Recommendation engine"), "codex");
+    expect(screen.queryByText(upgradeMessage)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Find skills" })).toBeEnabled();
+  });
+
   it("restores a session's engine on refresh and edit, and changing it starts a new deck", async () => {
     const original = sessionFor([], { agent: "claude-code", engine: "claude-code" });
     const backend = installBackend({ session: original });

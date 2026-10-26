@@ -67,7 +67,8 @@ export default function App() {
   const { session, matching, starting: matchBusy, canMatch, saved } = matches;
   const activeEngine = editOpen || !session ? engine : session.engine;
   const engineName = activeEngine === "codex" ? "Codex" : "Claude Code";
-  const connected = !!health?.engines[activeEngine].ready;
+  const engineStatus = health?.engines[activeEngine];
+  const connected = !!engineStatus?.ready;
   const writeBusy = saved.busy;
   const actionError = saved.error;
   const cache = useSkillCache();
@@ -322,8 +323,11 @@ export default function App() {
           <div className="setup-notice">
             <div>
               <strong>Connect {engineName} to find matches.</strong>
+              <p>{engineStatus?.message}</p>
               <p>
-                Install the {engineName} CLI and sign in with <code>{activeEngine === "codex" ? "codex login" : "claude auth login"}</code>.
+                {!engineStatus?.installed && <>
+                  Install the {engineName} CLI and sign in with <code>{activeEngine === "codex" ? "codex login" : "claude auth login"}</code>.{" "}
+                </>}
                 You can still explore and save skills.
               </p>
             </div>

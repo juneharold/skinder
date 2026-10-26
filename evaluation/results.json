@@ -1,0 +1,404 @@
+{
+  "run_at": "2026-10-26T16:17:39.685051+00:00",
+  "evaluation_type": "Six developer-authored examples; not an independent benchmark.",
+  "catalog_count": 150,
+  "catalog_sha256": "11058172d997b9bb0e6d5ed05baa942ad6fa0425332b4e4bb834530b6d3cdc59",
+  "catalog_generated_at": "2026-10-27T00:00:00Z",
+  "model": "Codex CLI default with --ignore-user-config; exact model not observed.",
+  "cases": [
+    {
+      "case": {
+        "id": "landing_plan_thorough",
+        "task": "Design and implement a polished responsive landing page for a small independent architecture studio, with project previews, a clear services section, and a contact call to action.",
+        "profile": {
+          "agent": "codex",
+          "planning": "plan-first",
+          "communication": "detailed",
+          "verification": "thorough",
+          "output_style": "First explain the visual direction and layout plan, then provide working code and checks. Prefer restrained editorial design, warm muted colors, serif typography, and generous whitespace."
+        },
+        "acceptable_top3_slugs": [
+          "frontend-design",
+          "anti-ui-slop",
+          "web-artifacts-builder",
+          "web-design-reviewer",
+          "typography-system",
+          "webapp-testing",
+          "design-critique"
+        ],
+        "expect_empty": false
+      },
+      "elapsed_seconds": 13.71,
+      "schema_valid": true,
+      "returned_slugs": [
+        "frontend-design",
+        "typography-system",
+        "web-design-reviewer",
+        "color-palette-builder",
+        "color-accessibility",
+        "copywriting"
+      ],
+      "top3_acceptable_count": 3,
+      "expectation_met": true,
+      "session": {
+        "id": "8c0d066b-fa85-4b4f-9f76-e7a51b445aac",
+        "task": "Design and implement a polished responsive landing page for a small independent architecture studio, with project previews, a clear services section, and a contact call to action.",
+        "agent": "codex",
+        "status": "completed",
+        "recommendations": [
+          {
+            "skill_id": "cd11604209f604729d01",
+            "task_fit": "Directly supports a distinctive architecture-studio website through deliberate palette, typography, and layout choices.",
+            "taste_fit": "Plans and reviews against the brief before building, matching your plan-first approach and subject-specific editorial direction.",
+            "caveat": null
+          },
+          {
+            "skill_id": "24f7d8c34a7b93bfc4b9",
+            "task_fit": "Defines text roles, type scales, line heights, and responsive values for the landing page.",
+            "taste_fit": "A documented type system supports your serif typography preference and careful editorial hierarchy.",
+            "caveat": "Does not prescribe serif fonts; that choice should remain grounded in your brief."
+          },
+          {
+            "skill_id": "74aa43bd89793f446874",
+            "task_fit": "Visually inspects the implemented site, fixes source issues, and verifies multiple viewports.",
+            "taste_fit": "Its inspect–fix–verify loop closely matches your preference for thorough checks.",
+            "caveat": "Requires a running website, source access, and browser automation with screenshot and DOM support."
+          },
+          {
+            "skill_id": "213d970113f5442f91f6",
+            "task_fit": "Creates semantic color tokens and usage rules for a coherent studio identity.",
+            "taste_fit": "Role-based palette planning can translate your warm, muted color preference into consistent implementation choices.",
+            "caveat": "Keep the palette scoped to this landing page rather than building an unnecessarily large token system."
+          },
+          {
+            "skill_id": "7e2eb4115ee932a8fbee",
+            "task_fit": "Checks actual text and interface color pairings and repairs contrast failures.",
+            "taste_fit": "Adds concrete verification to a muted palette, where subtle colors can reduce readability.",
+            "caveat": "Requires contrast calculation and color-vision inspection tools."
+          },
+          {
+            "skill_id": "79f061bf5dbbb2660bf8",
+            "task_fit": "Supports clear services copy, project descriptions, and a purposeful contact call to action.",
+            "taste_fit": "Prefers clear language and concrete benefits over clever phrasing, complementing a restrained presentation.",
+            "caveat": "Studio details and project claims need supplied facts; the skill does not establish them."
+          }
+        ],
+        "feedback": [],
+        "error": null,
+        "created_at": "2026-10-26T16:17:39.777908+00:00",
+        "updated_at": "2026-10-26T16:17:53.403646+00:00"
+      }
+    },
+    {
+      "case": {
+        "id": "landing_act_concise",
+        "task": "Design and implement a polished responsive landing page for a small independent architecture studio, with project previews, a clear services section, and a contact call to action.",
+        "profile": {
+          "agent": "codex",
+          "planning": "act-first",
+          "communication": "concise",
+          "verification": "pragmatic",
+          "output_style": "Start with working code and a brief handoff. Prefer playful geometric shapes, bold sans-serif type, saturated colors, and punchy visual contrast. Keep planning and process narration short."
+        },
+        "acceptable_top3_slugs": [
+          "frontend-design",
+          "anti-ui-slop",
+          "web-artifacts-builder",
+          "typography-system",
+          "theme-factory",
+          "web-design-reviewer"
+        ],
+        "expect_empty": false
+      },
+      "elapsed_seconds": 17.52,
+      "schema_valid": true,
+      "returned_slugs": [
+        "frontend-design",
+        "web-design-reviewer",
+        "copywriting",
+        "typography-system",
+        "color-accessibility"
+      ],
+      "top3_acceptable_count": 2,
+      "expectation_met": true,
+      "session": {
+        "id": "6dc84399-c463-41f1-8995-a4ff432bcd28",
+        "task": "Design and implement a polished responsive landing page for a small independent architecture studio, with project previews, a clear services section, and a contact call to action.",
+        "agent": "codex",
+        "status": "completed",
+        "recommendations": [
+          {
+            "skill_id": "cd11604209f604729d01",
+            "task_fit": "Directly supports a distinctive architecture-studio website through deliberate palette, typography, and layout choices grounded in its audience.",
+            "taste_fit": "Opinionated visual choices suit your bold, saturated, geometric direction; no setup requirements are listed.",
+            "caveat": "Includes planning and critique before completion; keep these brief to match your act-first preference."
+          },
+          {
+            "skill_id": "74aa43bd89793f446874",
+            "task_fit": "Checks the implemented landing page visually and verifies repairs at multiple viewports.",
+            "taste_fit": "Its inspect-fix-recheck workflow matches pragmatic verification of responsive polish.",
+            "caveat": "Requires a running website, browser automation, and source access."
+          },
+          {
+            "skill_id": "79f061bf5dbbb2660bf8",
+            "task_fit": "Helps write clear services copy, project benefits, and a purposeful contact call to action.",
+            "taste_fit": "Clear language and concrete benefits support concise page content without competing with the bold visuals.",
+            "caveat": "Focuses on copy rather than implementation; studio details and supporting proof must be supplied."
+          },
+          {
+            "skill_id": "24f7d8c34a7b93bfc4b9",
+            "task_fit": "Defines responsive typography, text roles, and line heights for project previews and service sections.",
+            "taste_fit": "Provides a coherent framework for your preferred bold sans-serif type without listed dependencies.",
+            "caveat": "Its documented type-system deliverable is more than a brief handoff requires."
+          },
+          {
+            "skill_id": "7e2eb4115ee932a8fbee",
+            "task_fit": "Checks real text, background, and control color pairings so the landing page remains readable.",
+            "taste_fit": "Especially useful for your saturated colors and punchy contrast, with computed checks rather than visual guesses.",
+            "caveat": "Requires contrast calculation and color-vision inspection; its full pairing table adds reporting overhead."
+          }
+        ],
+        "feedback": [],
+        "error": null,
+        "created_at": "2026-10-26T16:17:53.497520+00:00",
+        "updated_at": "2026-10-26T16:18:10.892211+00:00"
+      }
+    },
+    {
+      "case": {
+        "id": "landing_copy",
+        "task": "Write landing-page copy for a scheduling app for independent consultants: headline, short benefits, honest proof placeholders, objections, and a clear call to action. I need persuasive text, not website code.",
+        "profile": {
+          "agent": "codex",
+          "planning": "balanced",
+          "communication": "concise",
+          "verification": "balanced",
+          "output_style": "Direct customer language, concrete benefits, and short sections. Avoid hype and invented testimonials."
+        },
+        "acceptable_top3_slugs": [
+          "copywriting",
+          "copy-editing",
+          "product-marketing",
+          "cro",
+          "customer-research"
+        ],
+        "expect_empty": false
+      },
+      "elapsed_seconds": 9.4,
+      "schema_valid": true,
+      "returned_slugs": [
+        "copywriting",
+        "copy-editing"
+      ],
+      "top3_acceptable_count": 2,
+      "expectation_met": true,
+      "session": {
+        "id": "508a7185-666e-492e-a638-875160360746",
+        "task": "Write landing-page copy for a scheduling app for independent consultants: headline, short benefits, honest proof placeholders, objections, and a clear call to action. I need persuasive text, not website code.",
+        "agent": "codex",
+        "status": "completed",
+        "recommendations": [
+          {
+            "skill_id": "79f061bf5dbbb2660bf8",
+            "task_fit": "Direct match for landing-page copy: customer benefits, supporting proof, and purposeful calls to action, without website code.",
+            "taste_fit": "Explicitly favors clear language and concrete benefits over clever phrasing, matching your direct, concise style.",
+            "caveat": "Product features and proof are not supplied; keep unverified claims as honest placeholders."
+          },
+          {
+            "skill_id": "d04c4fe860eee4995834",
+            "task_fit": "Useful after drafting to check clarity, voice, proof, specificity, and risk, and remove unsupported claims.",
+            "taste_fit": "Favors clear, specific marketing copy with unsupported claims removed, matching your preference against hype and invented testimonials.",
+            "caveat": "Edits existing prose rather than drafting the initial page."
+          }
+        ],
+        "feedback": [],
+        "error": null,
+        "created_at": "2026-10-26T16:18:11.014309+00:00",
+        "updated_at": "2026-10-26T16:18:20.263536+00:00"
+      }
+    },
+    {
+      "case": {
+        "id": "csv_exploration",
+        "task": "Explore a local CSV of monthly online-store orders. Check missing values and duplicates, summarize sales and order-size patterns, and create a few readable charts before deciding whether deeper statistical analysis is useful.",
+        "profile": {
+          "agent": "codex",
+          "planning": "balanced",
+          "communication": "concise",
+          "verification": "thorough",
+          "output_style": "A small reproducible Python analysis, clear charts, data-quality caveats, and a concise account of what the data can and cannot establish."
+        },
+        "acceptable_top3_slugs": [
+          "exploratory-data-analysis",
+          "seaborn",
+          "matplotlib",
+          "polars",
+          "scientific-visualization",
+          "statistical-analysis",
+          "data-story"
+        ],
+        "expect_empty": false
+      },
+      "elapsed_seconds": 12.7,
+      "schema_valid": true,
+      "returned_slugs": [
+        "exploratory-data-analysis",
+        "seaborn",
+        "scientific-visualization",
+        "statistical-analysis"
+      ],
+      "top3_acceptable_count": 3,
+      "expectation_met": true,
+      "session": {
+        "id": "57392711-3a69-4437-8dfa-9011eeb99fb9",
+        "task": "Explore a local CSV of monthly online-store orders. Check missing values and duplicates, summarize sales and order-size patterns, and create a few readable charts before deciding whether deeper statistical analysis is useful.",
+        "agent": "codex",
+        "status": "completed",
+        "recommendations": [
+          {
+            "skill_id": "2e3cc28a9d25770e61e9",
+            "task_fit": "Direct match for inspecting a local CSV and producing bounded exploratory reports before deciding on deeper analysis.",
+            "taste_fit": "Deterministic aggregate reports with stated limits support reproducibility and clear data-quality caveats; manifest-first tool selection keeps scope controlled.",
+            "caveat": "Core tools require Python 3.11+; the full optional environment requires Python 3.12+, uv, and additional libraries."
+          },
+          {
+            "skill_id": "cb7c2463ff9bf1bb24de",
+            "task_fit": "Well suited to readable charts of sales patterns and order-size distributions from tidy tabular data.",
+            "taste_fit": "Question-driven plot selection, consistent variable mappings, and explicit control of statistical estimation fit a small, clear exploratory analysis.",
+            "caveat": "Requires seaborn, pandas, NumPy, and Matplotlib; the tested current dependency stack requires Python 3.12+."
+          },
+          {
+            "skill_id": "d7411137f28be1c58e36",
+            "task_fit": "Adds checks that exploratory charts use honest encodings and remain readable after export.",
+            "taste_fit": "Accessible encodings, recorded provenance, and inspection of exported figures match thorough verification and reproducible charts.",
+            "caveat": "Pinned examples require Python 3.11+ and uv; keep the workflow limited to a few figures rather than a publication-sized package."
+          },
+          {
+            "skill_id": "1b65034a1a51b2631ddb",
+            "task_fit": "Useful conditionally after exploration to assess whether further statistical analysis has defensible assumptions and a meaningful question.",
+            "taste_fit": "Assumption checks and effect estimates with uncertainty support a clear account of what the data can and cannot establish.",
+            "caveat": "Defer tests and models until exploration justifies them. Requires Python 3.12+ and the documented isolated scientific environment."
+          }
+        ],
+        "feedback": [],
+        "error": null,
+        "created_at": "2026-10-26T16:18:20.414957+00:00",
+        "updated_at": "2026-10-26T16:18:32.911909+00:00"
+      }
+    },
+    {
+      "case": {
+        "id": "cited_research",
+        "task": "Prepare a cited literature review of how urban tree cover affects summer heat exposure. Find and verify relevant papers, distinguish observational from causal evidence, explain disagreements, and produce a short synthesis with source links and a reproducible search record.",
+        "profile": {
+          "agent": "codex",
+          "planning": "plan-first",
+          "communication": "detailed",
+          "verification": "thorough",
+          "output_style": "A structured evidence synthesis with checked citations, uncertainty, and a transparent search method. Do not invent sources or claim a complete systematic review."
+        },
+        "acceptable_top3_slugs": [
+          "literature-review",
+          "research-lookup",
+          "citation-management",
+          "research-synthesis",
+          "scientific-critical-thinking",
+          "build-evidence-map"
+        ],
+        "expect_empty": false
+      },
+      "elapsed_seconds": 18.54,
+      "schema_valid": true,
+      "returned_slugs": [
+        "literature-review",
+        "scientific-critical-thinking",
+        "citation-management",
+        "research-synthesis",
+        "scientific-writing",
+        "build-evidence-map"
+      ],
+      "top3_acceptable_count": 3,
+      "expectation_met": true,
+      "session": {
+        "id": "7a77f5f7-01eb-40de-a600-f7309c8e39af",
+        "task": "Prepare a cited literature review of how urban tree cover affects summer heat exposure. Find and verify relevant papers, distinguish observational from causal evidence, explain disagreements, and produce a short synthesis with source links and a reproducible search record.",
+        "agent": "codex",
+        "status": "completed",
+        "recommendations": [
+          {
+            "skill_id": "d0e838bb4058754e98da",
+            "task_fit": "Directly covers reproducible searches, record screening, thematic synthesis, and checked citations.",
+            "taste_fit": "Multiple-database searches and distinctions between records, reports, and studies support a transparent, carefully bounded review.",
+            "caveat": "Requires Python 3.10+, requests, and network access. A reproducible search does not establish that coverage is complete."
+          },
+          {
+            "skill_id": "4602134e8dc657b89a69",
+            "task_fit": "Supports appraisal of methods and scientific claims when separating observational associations from causal evidence.",
+            "taste_fit": "Its explicit critique workflow and appropriately applied risk-of-bias tools match thorough verification and attention to uncertainty.",
+            "caveat": "Appraisal guidance does not replace retrieving and checking each paper's methods."
+          },
+          {
+            "skill_id": "a83f8398fe114580161f",
+            "task_fit": "Finds scholarly references and verifies bibliographic metadata before producing citations.",
+            "taste_fit": "Metadata validation directly supports checked citations rather than invented or unchecked references.",
+            "caveat": "Requires Python, requests, and access to scholarly services; bibliographic validation alone does not verify a paper's findings."
+          },
+          {
+            "skill_id": "02b9fd4a9f7ca3c59164",
+            "task_fit": "Organizes sources into themes, disagreements, and evidence gaps for the short synthesis.",
+            "taste_fit": "Clustering atomic claims and exposing tensions supports a structured account with explicit source confidence.",
+            "caveat": "Does not supply literature searching or citation verification; use with checked source material."
+          },
+          {
+            "skill_id": "fa10bfa4f9a62b0ab614",
+            "task_fit": "Turns the evidence record into scientific prose without inventing evidence or concealing uncertainty.",
+            "taste_fit": "An evidence outline and claim verification fit plan-first drafting and an uncertainty-aware final synthesis.",
+            "caveat": "Core guidance needs no special setup, but it does not retrieve papers; final approval remains human."
+          },
+          {
+            "skill_id": "a61fa47be7fed3e6dd2f",
+            "task_fit": "Makes disagreements traceable through linked claims, supporting evidence, contradictions, and unknowns.",
+            "taste_fit": "Bounded source regions and typed evidence relationships support transparent, checkable reasoning.",
+            "caveat": "An optional supporting artifact rather than the literature review itself; keep it small enough to serve the requested short synthesis."
+          }
+        ],
+        "feedback": [],
+        "error": null,
+        "created_at": "2026-10-26T16:18:33.121862+00:00",
+        "updated_at": "2026-10-26T16:18:51.560974+00:00"
+      }
+    },
+    {
+      "case": {
+        "id": "physical_no_fit",
+        "task": "Physically carry my heavy sofa from the living room downstairs and load it into a moving truck today. I need someone who can actually lift and transport it, not planning, instructions, research, documents, or software.",
+        "profile": {
+          "agent": "codex",
+          "planning": "balanced",
+          "communication": "concise",
+          "verification": "balanced",
+          "output_style": "Only actual physical lifting and transportation would satisfy this task."
+        },
+        "acceptable_top3_slugs": [],
+        "expect_empty": true
+      },
+      "elapsed_seconds": 180.2,
+      "schema_valid": true,
+      "returned_slugs": [],
+      "top3_acceptable_count": 0,
+      "expectation_met": false,
+      "session": {
+        "id": "0380ebe8-089a-4fb1-bb38-3f72b7e10e72",
+        "task": "Physically carry my heavy sofa from the living room downstairs and load it into a moving truck today. I need someone who can actually lift and transport it, not planning, instructions, research, documents, or software.",
+        "agent": "codex",
+        "status": "failed",
+        "recommendations": [],
+        "feedback": [],
+        "error": "Matching timed out after 180 seconds. Try again.",
+        "created_at": "2026-10-26T16:18:51.670182+00:00",
+        "updated_at": "2026-10-26T16:21:51.688500+00:00"
+      }
+    }
+  ],
+  "codex_version": "codex-cli 0.164.0"
+}

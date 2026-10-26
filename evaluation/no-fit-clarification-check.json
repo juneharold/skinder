@@ -1,0 +1,11 @@
+{
+  "status": "completed",
+  "result": {
+    "recommendations": []
+  },
+  "elapsed_seconds": 4.65,
+  "catalog_count": 2,
+  "case_id": "physical_no_fit",
+  "timeout_seconds": 45,
+  "prompt_clarified": true
+}

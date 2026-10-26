@@ -1,0 +1,42 @@
+{
+  "run_at": "2026-10-26T16:22:32.383627+00:00",
+  "evaluation_type": "Six developer-authored examples; not an independent benchmark.",
+  "catalog_count": 150,
+  "catalog_sha256": "11058172d997b9bb0e6d5ed05baa942ad6fa0425332b4e4bb834530b6d3cdc59",
+  "catalog_generated_at": "2026-10-27T00:00:00Z",
+  "model": "Codex CLI default with --ignore-user-config; exact model not observed.",
+  "cases": [
+    {
+      "case": {
+        "id": "physical_no_fit",
+        "task": "Physically carry my heavy sofa from the living room downstairs and load it into a moving truck today. I need someone who can actually lift and transport it, not planning, instructions, research, documents, or software.",
+        "profile": {
+          "agent": "codex",
+          "planning": "balanced",
+          "communication": "concise",
+          "verification": "balanced",
+          "output_style": "Only actual physical lifting and transportation would satisfy this task."
+        },
+        "acceptable_top3_slugs": [],
+        "expect_empty": true
+      },
+      "elapsed_seconds": 180.14,
+      "schema_valid": true,
+      "returned_slugs": [],
+      "top3_acceptable_count": 0,
+      "expectation_met": false,
+      "session": {
+        "id": "36a7f4dd-dd51-440d-b304-bbd11f48e0e6",
+        "task": "Physically carry my heavy sofa from the living room downstairs and load it into a moving truck today. I need someone who can actually lift and transport it, not planning, instructions, research, documents, or software.",
+        "agent": "codex",
+        "status": "failed",
+        "recommendations": [],
+        "feedback": [],
+        "error": "Matching timed out after 180 seconds. Try again.",
+        "created_at": "2026-10-26T16:22:32.479340+00:00",
+        "updated_at": "2026-10-26T16:25:32.495002+00:00"
+      }
+    }
+  ],
+  "codex_version": "codex-cli 0.164.0"
+}

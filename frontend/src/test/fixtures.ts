@@ -4,7 +4,6 @@ import {
   defaultProfile,
   type Agent,
   type Feedback,
-  type Health,
   type MatchSession,
   type Profile,
   type Saved,
@@ -100,6 +99,16 @@ export function installBackend(options: BackendOptions = {}) {
     action: "save" | "pass",
     reason: Feedback["reason"] = null,
   ) => {
+    const existing = session?.id === sessionId
+      ? session.feedback.find(
+          (item) =>
+            item.session_id === sessionId &&
+            item.skill_id === skillId &&
+            item.action === action,
+        )
+      : undefined;
+    if (existing) return { feedback: existing, saved: savedResponse() };
+
     const feedback: Feedback = {
       id: `feedback-${sessionId}-${skillId}-${action}`,
       session_id: sessionId,
@@ -160,8 +169,8 @@ export function installBackend(options: BackendOptions = {}) {
     catalog_count: skills.length,
     indexed_count: skills.length,
     retrieval_mode: "hybrid",
-    codex: { installed: true, authenticated: true, available: true, message: "Ready." },
-  } as Health);
+    codex: { installed: true, authenticated: true, message: "Ready." },
+  });
   vi.spyOn(api, "feedback").mockImplementation(async (...args) =>
     persistFeedback(...args),
   );
@@ -187,16 +196,25 @@ export function installBackend(options: BackendOptions = {}) {
   });
   vi.spyOn(api, "unsave").mockImplementation(async (id) => {
     directSaved.delete(id);
-    removeIfUnowned(id);
+    feedbackSaved.delete(id);
+    saved = saved.filter((item) => item.skill.id !== id);
     return savedResponse();
   });
   vi.spyOn(api, "match").mockImplementation(async (task, agent, session_id) => {
     matchRequests.push({ task, agent, ...(session_id ? { session_id } : {}) });
-    const next = sessionFor(skills, {
+    const previous = session_id && session?.id === session_id ? session : null;
+    const previouslyRecommended = new Set(
+      previous?.recommendations.map((item) => item.skill_id) ?? [],
+    );
+    const batch = previous
+      ? skills.filter((item) => !previouslyRecommended.has(item.id))
+      : skills.slice(0, 2);
+    const next = sessionFor(batch, {
       id: session_id ?? `session-${matchRequests.length + 1}`,
       task,
       agent,
       status: "completed",
+      feedback: previous?.feedback ?? [],
     });
     session = next;
     return structuredClone(next);

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import App from "./App";
@@ -143,11 +143,31 @@ describe("skill discovery", () => {
     expect(await screen.findByText(/Search is using keywords only/)).toBeVisible();
   });
 
-  it("retries a failed save for the same skill without starting a new match", async () => {
+  it("keeps catalog bookmarks usable when Codex is unavailable", async () => {
+    const backend = installBackend({ session: null });
+    vi.mocked(api.health).mockResolvedValue({
+      status: "ok", catalog_count: backend.skills.length,
+      codex: { installed: false, authenticated: false, message: "Install Codex." },
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByRole("textbox", { name: "What are you working on?" }), "Build a portfolio");
+    expect(screen.getByRole("button", { name: "Find skills" })).toBeDisabled();
+    await user.click(screen.getByRole("link", { name: "Explore" }));
+    await user.click(await screen.findByRole("button", { name: "Save Thoughtful Design" }));
+    await screen.findByRole("button", { name: "Remove Thoughtful Design from saved" });
+    expect(backend.getSaved().map(item => item.skill.id)).toEqual(["design"]);
+    expect(backend.getSession()).toBeNull();
+    expect(backend.getMatchRequests()).toEqual([]);
+  });
+
+  it("retries a lost save response idempotently without starting a new match", async () => {
     const backend = installBackend();
-    vi.mocked(api.feedback).mockRejectedValueOnce(
-      new Error("The local database is unavailable."),
-    );
+    const feedback = vi.mocked(api.feedback).getMockImplementation()!;
+    vi.mocked(api.feedback).mockImplementationOnce(async (...args) => {
+      await feedback(...args);
+      throw new Error("The response was interrupted.");
+    });
     const user = userEvent.setup();
     render(<App />);
 
@@ -224,6 +244,29 @@ describe("skill discovery", () => {
     expect(backend.getSession()?.feedback).toEqual([]);
     expect(backend.getSaved().map((item) => item.skill.id)).toEqual(["design"]);
     expect(screen.getByRole("button", { name: "Keep saved" })).toBeVisible();
+  });
+
+  it("does not restore a deck bookmark removed from Saved before undo", async () => {
+    const backend = installBackend();
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Thoughtful Design" });
+    await user.click(screen.getByRole("button", { name: "Save this skill" }));
+    await screen.findByRole("heading", { name: "Clear Writing" });
+    await user.click(screen.getByRole("link", { name: /^Saved/ }));
+    await user.click(
+      screen.getByRole("button", { name: "Remove Thoughtful Design from saved" }),
+    );
+    expect(backend.getSaved()).toEqual([]);
+
+    await user.click(screen.getByRole("link", { name: "Discover" }));
+    await user.click(screen.getByRole("button", { name: "Undo last choice" }));
+    await screen.findByRole("heading", { name: "Thoughtful Design" });
+
+    expect(backend.getSession()?.feedback).toEqual([]);
+    expect(backend.getSaved()).toEqual([]);
+    expect(screen.getByRole("button", { name: "Save this skill" })).toBeVisible();
   });
 
   it("retries a lost direct-bookmark response idempotently without changing the deck", async () => {
@@ -336,16 +379,49 @@ describe("skill discovery", () => {
     await user.click(screen.getByRole("button", { name: "Save this skill" }));
     await screen.findByRole("heading", { name: "Clear Writing" });
     await user.click(screen.getByRole("button", { name: "Save this skill" }));
-    await screen.findByRole("heading", { name: "Careful Research" });
-    await user.click(screen.getByRole("button", { name: "Save this skill" }));
     await screen.findByRole("heading", { name: "Batch reviewed." });
     await user.click(screen.getByRole("button", { name: "Find more for this task" }));
-    await screen.findByRole("button", { name: "Keep saved" });
+    await screen.findByRole("heading", { name: "Careful Research" });
     expect(api.match).toHaveBeenLastCalledWith(
       "Review interviews for checkout problems",
       "codex",
       "session-2",
     );
+  });
+
+  it("continues card review with the keyboard after a save", async () => {
+    const backend = installBackend();
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Thoughtful Design" });
+    await user.click(screen.getByRole("button", { name: "Save this skill" }));
+    await screen.findByRole("heading", { name: "Clear Writing" });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Save this skill" })).toBeEnabled(),
+    );
+    const deck = screen.getByRole("region", { name: "Skill deck" });
+    expect(deck).toHaveFocus();
+    fireEvent.keyDown(deck, { key: "ArrowRight" });
+    expect(api.feedback).toHaveBeenCalledTimes(2);
+
+    await screen.findByRole("heading", { name: "Careful Research" });
+    expect(backend.getSession()?.feedback.map((item) => item.skill_id)).toEqual([
+      "design",
+      "writing",
+    ]);
+  });
+
+  it("offers a new task after a no-fit result without starting another match", async () => {
+    const backend = installBackend({ session: sessionFor([], { status: "completed" }) });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "No matching skills yet." });
+    expect(screen.getByRole("button", { name: "Change task" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Change task" }));
+    expect(screen.getByRole("dialog", { name: "Edit task" })).toBeVisible();
+    expect(backend.getMatchRequests()).toEqual([]);
   });
 
   it("locks task submission while a match request is pending", async () => {

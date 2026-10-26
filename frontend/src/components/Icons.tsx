@@ -29,12 +29,3 @@ export function SkillIcon({
   const Icon = categoryIcons[category] ?? Sparkles;
   return <Icon size={size} strokeWidth={1.7} aria-hidden="true" />;
 }
-export function BrandMark({ small = false }: { small?: boolean }) {
-  return (
-    <span className={`brand-mark ${small ? "small" : ""}`} aria-hidden="true">
-      <span />
-      <span />
-      <span />
-    </span>
-  );
-}

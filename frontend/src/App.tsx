@@ -125,8 +125,8 @@ export default function App() {
   const [pollError, setPollError] = useState("");
   const [toast, setToast] = useState("");
   const [showPassReasons, setShowPassReasons] = useState(false);
-  const [hadBatch, setHadBatch] = useState(false);
   const deckRef = useRef<HTMLDivElement>(null);
+  const focusAfterMatching = useRef(false);
   const matching = isMatching(session);
   const connected = !!health?.codex.installed && !!health?.codex.authenticated;
   const adoptSession = useCallback((next: MatchSession | null) => {
@@ -301,6 +301,12 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [matching, session?.id, adoptSession]);
+  useEffect(() => {
+    if (!focusAfterMatching.current || matching || matchBusy) return;
+    focusAfterMatching.current = false;
+    if (view === "discover" && !detail && !preferencesOpen && !editOpen)
+      deckRef.current?.focus({ preventScroll: true });
+  }, [matching, matchBusy, view, detail, preferencesOpen, editOpen]);
 
   function url(next: typeof location) {
     const params = new URLSearchParams(window.location.search);
@@ -320,6 +326,7 @@ export default function App() {
     loads.profile === "ready" &&
     loads.session === "ready" &&
     loads.health === "ready" &&
+    !profileBusy &&
     connected;
   async function reconcile(request: MatchRequest) {
     const next = request.sessionId
@@ -365,9 +372,7 @@ export default function App() {
         }
       }
       if (generation === sessionVersion.current) {
-        setHadBatch(
-          !!request.sessionId && !!request.baseline?.recommendations.length,
-        );
+        focusAfterMatching.current = true;
         adoptSession(next);
         setPollError("");
         setEditOpen(false);
@@ -398,6 +403,12 @@ export default function App() {
         sessionId: session.id,
         baseline: session,
       });
+  }
+  function editTask() {
+    if (!session || matchGuard.current || matching || writeGuard.current) return;
+    setTask(session.task);
+    setAgent(session.agent);
+    setEditOpen(true);
   }
   async function mutate(
     label: string,
@@ -455,6 +466,7 @@ export default function App() {
       setToast(
         action === "save" ? `${skill.name} saved.` : `${skill.name} passed.`,
       );
+      deckRef.current?.focus({ preventScroll: true });
     });
   }
   function undo() {
@@ -478,6 +490,7 @@ export default function App() {
           ),
         });
       setToast("Last choice undone.");
+      deckRef.current?.focus({ preventScroll: true });
     });
   }
   function bookmark(skill: Skill) {
@@ -561,6 +574,19 @@ export default function App() {
     : undefined;
   const total = session?.recommendations.length ?? 0;
   const reviewed = total - remaining.length;
+  const knownSkills = Object.values(skillsById);
+  const catalogSize = health?.catalog_count ?? (
+    !q && category === "All skills" && loads.catalog === "ready" ? catalogTotal : undefined
+  );
+  const hasMoreCandidates = catalogSize === undefined || catalogSize > knownSkills.length || knownSkills.some(
+    (skill) =>
+      session &&
+      (skill.compatibility === null || skill.compatibility.includes(session.agent)) &&
+      !reviewedIds.has(skill.id),
+  );
+  const retryMatching =
+    session?.status === "failed" || session?.status === "cancelled";
+  const canContinue = total > 0 && hasMoreCandidates;
   const savedIds = new Set(saved.map((item) => item.skill.id));
   const categories = view === "saved"
     ? [...new Set(saved.map((item) => item.skill.category))].sort()
@@ -616,7 +642,7 @@ export default function App() {
       <select
         id="target-agent"
         value={agent}
-        disabled={matchBusy}
+        disabled={matchBusy || loads.profile !== "ready"}
         onChange={(event) => setAgent(event.target.value as Agent)}
       >
         <option value="codex">Codex</option>
@@ -819,7 +845,17 @@ export default function App() {
               <div className="discover-layout">
                 <aside className="task-sidebar">
                   <span className="eyebrow">Current task</span>
-                  <h1>{session.task}</h1>
+                  <h1 className={session.task.length > 80 ? "long-task" : undefined}>
+                    {session.task.length > 120
+                      ? `${session.task.slice(0, 120).trimEnd()}…`
+                      : session.task}
+                  </h1>
+                  {session.task.length > 120 && (
+                    <details className="full-task" key={session.id}>
+                      <summary>Read full task</summary>
+                      <p>{session.task}</p>
+                    </details>
+                  )}
                   <div className="sidebar-section">
                     <span className="eyebrow">Target</span>
                     <strong>
@@ -839,11 +875,7 @@ export default function App() {
                     </button>
                     <button
                       disabled={matchBusy || matching || writeBusy}
-                      onClick={() => {
-                        setTask(session.task);
-                        setAgent(session.agent);
-                        setEditOpen(true);
-                      }}
+                      onClick={editTask}
                     >
                       <Pencil size={18} />
                       Edit task
@@ -922,12 +954,14 @@ export default function App() {
                       {session.status === "failed" && (
                         <div className="error-notice" role="alert">
                           <p>Matching failed. {session.error}</p>
-                          <button
-                            disabled={!canMatch || writeBusy}
-                            onClick={more}
-                          >
-                            Retry matching
-                          </button>
+                          {currentSkill && (
+                            <button
+                              disabled={!canMatch || writeBusy}
+                              onClick={more}
+                            >
+                              Retry matching
+                            </button>
+                          )}
                         </div>
                       )}
                       {session.status === "cancelled" && (
@@ -1046,23 +1080,43 @@ export default function App() {
                                 : session.status === "failed"
                                   ? "We couldn’t finish this hand."
                                   : total
-                                    ? "Batch reviewed."
-                                    : hadBatch
+                                    ? hasMoreCandidates
+                                      ? "Batch reviewed."
+                                      : "All available skills reviewed."
+                                    : session.feedback.length > 0
                                       ? "No further matches."
                                       : "No matching skills yet."}
                             </h2>
                             <p>
-                              {total
-                                ? "Your saved skills are ready whenever you need them. Find another batch for this task, or edit your brief."
-                                : "Try a more specific task, adjust your preferences, or browse the catalog."}
+                              {retryMatching
+                                ? "Retry matching for this task, or change your brief. Your saved skills are still in your collection."
+                                : canContinue
+                                  ? "Your saved skills are ready whenever you need them. Find another batch for this task, or edit your brief."
+                                  : "Try a more specific task, adjust your preferences, or browse the catalog."}
                             </p>
                             <button
                               className="primary-button"
-                              disabled={!canMatch || writeBusy}
-                              onClick={more}
+                              disabled={
+                                writeBusy ||
+                                ((retryMatching || canContinue) && !canMatch)
+                              }
+                              onClick={retryMatching || canContinue ? more : editTask}
                             >
-                              Find more for this task
+                              {retryMatching
+                                ? "Retry matching"
+                                : canContinue
+                                  ? "Find more for this task"
+                                  : "Change task"}
                               <ArrowRight size={18} />
+                            </button>
+                            <button
+                              className="text-button"
+                              onClick={() => navigate({ view: total ? "saved" : "explore" })}
+                            >
+                              {total
+                                ? "View saved skills"
+                                : "Explore the catalog"}
+                              <ArrowUpRight size={16} />
                             </button>
                             {lastChoice && (
                               <button
@@ -1085,7 +1139,11 @@ export default function App() {
                   <div>
                     <span className="eyebrow">Deck progress</span>
                     <p className="progress-count">
-                      {reviewed} <span>of {total} reviewed</span>
+                      {matching && !total ? (
+                        <span>Preparing your deck</span>
+                      ) : (
+                        <>{reviewed} <span>of {total} reviewed</span></>
+                      )}
                     </p>
                     <div className="progress-dots" aria-hidden="true">
                       {Array.from({ length: total }, (_, index) => (
@@ -1297,6 +1355,7 @@ export default function App() {
       {editOpen && (
         <Dialog
           title="Edit task"
+          closeDisabled={matchBusy}
           onClose={() => {
             if (!matchGuard.current) setEditOpen(false);
           }}

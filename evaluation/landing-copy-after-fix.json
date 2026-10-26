@@ -1,0 +1,64 @@
+{
+  "run_at": "2026-10-26T16:32:07.470851+00:00",
+  "evaluation_type": "Six developer-authored examples; not an independent benchmark.",
+  "catalog_count": 150,
+  "catalog_sha256": "11058172d997b9bb0e6d5ed05baa942ad6fa0425332b4e4bb834530b6d3cdc59",
+  "catalog_generated_at": "2026-10-27T00:00:00Z",
+  "model": "Codex CLI default with --ignore-user-config; exact model not observed.",
+  "cases": [
+    {
+      "case": {
+        "id": "landing_copy",
+        "task": "Write landing-page copy for a scheduling app for independent consultants: headline, short benefits, honest proof placeholders, objections, and a clear call to action. I need persuasive text, not website code.",
+        "profile": {
+          "agent": "codex",
+          "planning": "balanced",
+          "communication": "concise",
+          "verification": "balanced",
+          "output_style": "Direct customer language, concrete benefits, and short sections. Avoid hype and invented testimonials."
+        },
+        "acceptable_top3_slugs": [
+          "copywriting",
+          "copy-editing",
+          "product-marketing",
+          "cro",
+          "customer-research"
+        ],
+        "expect_empty": false
+      },
+      "elapsed_seconds": 7.58,
+      "schema_valid": true,
+      "returned_slugs": [
+        "copywriting",
+        "copy-editing"
+      ],
+      "top3_acceptable_count": 2,
+      "expectation_met": true,
+      "session": {
+        "id": "e2b3789e-335e-436a-92ab-86b0d58a6b95",
+        "task": "Write landing-page copy for a scheduling app for independent consultants: headline, short benefits, honest proof placeholders, objections, and a clear call to action. I need persuasive text, not website code.",
+        "agent": "codex",
+        "status": "completed",
+        "recommendations": [
+          {
+            "skill_id": "79f061bf5dbbb2660bf8",
+            "task_fit": "Directly drafts marketing pages with benefits, customer language, supporting proof, and purposeful calls to action—not website code.",
+            "taste_fit": "Explicitly favors clear language and concrete benefits over clever phrasing, matching your direct, low-hype style.",
+            "caveat": "Product details and real evidence still need confirmation; keep unsupported proof as labeled placeholders."
+          },
+          {
+            "skill_id": "d04c4fe860eee4995834",
+            "task_fit": "Useful after drafting to check clarity, voice, proof, specificity, and risk in the landing-page copy.",
+            "taste_fit": "Favors clear, specific prose and removes unsupported claims, aligning with your preference against hype and invented testimonials.",
+            "caveat": "Edits existing marketing prose rather than creating the initial page."
+          }
+        ],
+        "feedback": [],
+        "error": null,
+        "created_at": "2026-10-26T16:32:07.556456+00:00",
+        "updated_at": "2026-10-26T16:32:14.911746+00:00"
+      }
+    }
+  ],
+  "codex_version": "codex-cli 0.164.0"
+}

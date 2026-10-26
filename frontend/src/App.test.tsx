@@ -324,7 +324,7 @@ describe("skill discovery", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByRole("heading", { name: "Deal me in." });
+    await screen.findByRole("textbox", { name: "What are you working on?" });
     await user.click(screen.getByRole("link", { name: /^Saved/ }));
     await user.click(
       screen.getByRole("button", { name: "Remove Thoughtful Design from saved" }),
@@ -357,7 +357,7 @@ describe("skill discovery", () => {
     expect(screen.getByRole("heading", { name: "Clear Writing" })).toBeVisible();
 
     await user.click(screen.getByRole("link", { name: /^Saved/ }));
-    await screen.findByRole("heading", { name: "A hand worth keeping." });
+    expect(screen.getByRole("link", { name: /^Saved/ })).toHaveAttribute("aria-current", "page");
     await act(async () => window.history.back());
     await screen.findByRole("heading", { name: "Clear Writing" });
     expect(screen.getByRole("link", { name: "Explore" })).toHaveAttribute("aria-current", "page");

@@ -1,4 +1,4 @@
-import { ArrowRight, ArrowUpRight, Bookmark, Check, Search } from "lucide-react";
+import { Bookmark, Check, Search } from "lucide-react";
 import LoadNotice from "../components/LoadNotice";
 import type { Skill } from "../lib/types";
 import type { CatalogController } from "../hooks/useCatalog";
@@ -33,31 +33,23 @@ export default function LibraryView({
       `${skill.name} ${skill.description} ${skill.author} ${skill.tags.join(" ")}`
         .toLowerCase().includes(q.toLowerCase()),
   );
+  const hasFilters = Boolean(q) || category !== "All skills";
+  const emptySaved = view === "saved" && loadState === "ready" && saved.items.length === 0 && !hasFilters;
   return (
     <section className="library">
       <div className="library-heading">
         <div>
-          <span className="eyebrow">
-            {view === "saved" ? "Your collection" : "The skill catalog"}
-          </span>
-          <h1>
-            {view === "saved"
-              ? "A hand worth keeping."
-              : "Find your next advantage."}
-          </h1>
+          <h1>{view === "saved" ? "Saved skills" : "Explore skills"}</h1>
           <p>
             {view === "saved"
               ? "Skills you’ve saved, ready for your next project."
-              : "Browse the source. Save what fits. Make it yours."}
+              : "Browse skills and save the ones that fit your work."}
           </p>
         </div>
-        <span className="library-diamond" aria-hidden="true">
-          ♦
-        </span>
       </div>
-      <div className="library-filters">
+      <div className="library-filters" hidden={emptySaved}>
         <label className="search-field">
-          <Search size={18} />
+          <Search size={18} aria-hidden="true" />
           <span className="sr-only">Search skills</span>
           <input
             value={q}
@@ -92,32 +84,30 @@ export default function LibraryView({
       ) : (
         loadState === "ready" && (
           <>
-            <p className="result-count" role="status">
+            {!emptySaved && <p className="result-count" role="status">
               {view === "explore" ? catalogTotal : visibleSkills.length}{" "}
               {(view === "explore" ? catalogTotal : visibleSkills.length) === 1 ? "skill" : "skills"}
               {category !== "All skills" ? ` in ${category}` : ""}
               {q ? ` matching “${q}”` : ""}
-            </p>
-            <div className="skill-grid">
-              {visibleSkills.map((skill, index) => (
-                <article className="catalog-card" key={skill.id}>
-                  <div className="catalog-top">
-                    <span className="small-index">
-                      {String(index + 1).padStart(2, "0")} ♦
-                    </span>
-                    <span className="eyebrow">{skill.category}</span>
+            </p>}
+            <div className="skill-list">
+              {visibleSkills.map((skill) => (
+                <article className="catalog-row" key={skill.id}>
+                  <div className="catalog-identity">
+                    <h2>
+                      <button
+                        className="title-button"
+                        title={skill.name}
+                        onClick={() => onOpenSkill(skill)}
+                      >
+                        {skill.name}
+                      </button>
+                    </h2>
+                    <span className="small muted">by {skill.author}</span>
                   </div>
-                  <h2>
-                    <button
-                      className="title-button"
-                      onClick={() => onOpenSkill(skill)}
-                    >
-                      {skill.name}
-                    </button>
-                  </h2>
-                  <span className="small muted">by {skill.author}</span>
-                  <p>{skill.description}</p>
-                  <div className="tag-row">
+                  <p className="catalog-description">{skill.description}</p>
+                  <div className="catalog-meta">
+                    {skill.category !== "Uncategorized" && <span>{skill.category}</span>}
                     {skill.tags.slice(0, 3).map((tag) => (
                       <span key={tag}>{tag}</span>
                     ))}
@@ -128,7 +118,6 @@ export default function LibraryView({
                       onClick={() => onOpenSkill(skill)}
                     >
                       View details
-                      <ArrowUpRight size={16} />
                     </button>
                     <button
                       className={
@@ -147,9 +136,9 @@ export default function LibraryView({
                       onClick={() => saved.bookmark(skill)}
                     >
                       {savedIds.has(skill.id) ? (
-                        <Check size={17} />
+                        <Check size={17} aria-hidden="true" />
                       ) : (
-                        <Bookmark size={17} />
+                        <Bookmark size={17} aria-hidden="true" />
                       )}
                       <span>
                         {savedIds.has(skill.id) ? "Saved" : "Save"}
@@ -169,18 +158,17 @@ export default function LibraryView({
             )}
             {visibleSkills.length === 0 && (
               <div className="empty-state">
-                <span className="diamond">♦</span>
                 <h2>
-                  {q || category !== "All skills"
+                  {hasFilters
                     ? "No skills match these filters."
-                    : "Your collection starts here."}
+                    : view === "saved" ? "No saved skills yet." : "No skills in the catalog yet."}
                 </h2>
                 <p>
-                  {q || category !== "All skills"
+                  {hasFilters
                     ? "Try another search or category."
-                    : "Explore the catalog or review a deck to save your first skill."}
+                    : view === "saved" ? "Save skills from the catalog to find them here." : "Skills will appear here when they are available."}
                 </p>
-                {q || category !== "All skills" ? (
+                {hasFilters ? (
                   <button
                     onClick={() =>
                       onFilters({ q: "", category: "All skills" })
@@ -188,10 +176,9 @@ export default function LibraryView({
                   >
                     Clear filters
                   </button>
-                ) : (
+                ) : view === "saved" && (
                   <button onClick={() => onExplore()}>
                     Explore skills
-                    <ArrowRight size={16} />
                   </button>
                 )}
               </div>

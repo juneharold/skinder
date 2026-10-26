@@ -1,5 +1,4 @@
 import { useRef, useState, type CSSProperties } from "react";
-import { ArrowUpRight } from "lucide-react";
 import type { Recommendation, Skill } from "../lib/types";
 
 export default function SkillCard({
@@ -86,17 +85,12 @@ export default function SkillCard({
         if (start.current?.pointerId === event.pointerId) reset();
       }}
     >
-      <div className="card-topline">
-        <span className="card-index" aria-hidden="true">
-          K<br />♦
-        </span>
-        <span>{skill.category}</span>
-      </div>
       <div className="card-content">
         <h2>{skill.name}</h2>
         <p className="card-author">
           by <strong>{skill.author}</strong>
         </p>
+        {skill.category !== "Uncategorized" && <p className="category-label">{skill.category}</p>}
         <p className="card-description">{skill.description}</p>
         <div className="fit-section">
           <h3>Fits your task</h3>
@@ -112,23 +106,20 @@ export default function SkillCard({
         <div className="card-source">
           <span className="small muted">
             {skill.compatibility?.length
-              ? skill.compatibility.map((agent) => (agent === "codex" ? "Codex" : "Claude Code")).join(" · ")
+              ? skill.compatibility.map((agent) => (agent === "codex" ? "Codex" : "Claude Code")).join(", ")
               : "Compatibility not verified"}
           </span>
           <button className="text-button" onClick={onOpen}>
-            View skill &amp; source <ArrowUpRight size={17} />
+            View skill &amp; source
           </button>
         </div>
       </div>
-      <span className="card-index card-index-bottom" aria-hidden="true">
-        K<br />♦
-      </span>
       {Math.abs(drag) > 35 && (
         <span
           className={`swipe-stamp ${drag > 0 ? "save" : "pass"}`}
           aria-hidden="true"
         >
-          {drag > 0 ? "SAVE" : "PASS"}
+          {drag > 0 ? "Save" : "Pass"}
         </span>
       )}
     </article>

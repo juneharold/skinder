@@ -55,14 +55,14 @@ export default function Dialog({
       }}
     >
       <div className="dialog-heading">
-        <span className="eyebrow">{title}</span>
+        <h2 className="dialog-title">{title}</h2>
         <button
           className="icon-button"
           onClick={onClose}
           disabled={closeDisabled}
           aria-label="Close dialog"
         >
-          <X size={21} />
+          <X size={21} aria-hidden="true" />
         </button>
       </div>
       {children}

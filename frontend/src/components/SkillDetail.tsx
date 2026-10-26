@@ -10,8 +10,8 @@ import {
   Bookmark,
 } from "lucide-react";
 import type { Agent, Recommendation, Skill } from "../lib/types";
-import { SkillIcon } from "./Icons";
 import Dialog from "./Dialog";
+import { SkillIcon } from "./Icons";
 
 export default function SkillDetail({
   skill,
@@ -56,15 +56,13 @@ export default function SkillDetail({
   }
   return (
     <Dialog title="Skill details" onClose={onClose} className="detail-dialog">
-      <div className="detail-identity">
-        <div className="skill-symbol" data-category={skill.category}>
-          <SkillIcon category={skill.category} size={34} />
+      <h3>{skill.name}</h3>
+      {skill.category !== "Uncategorized" && (
+        <div className="detail-meta">
+          <SkillIcon category={skill.category} size={16} />
+          <span>{skill.category}</span>
         </div>
-        <span className="category-label" data-category={skill.category}>
-          {skill.category}
-        </span>
-      </div>
-      <h2>{skill.name}</h2>
+      )}
       <p className="detail-description">{skill.description}</p>
       <button
         className="primary-button detail-save"
@@ -74,7 +72,11 @@ export default function SkillDetail({
           saved ? `Remove ${skill.name} from saved` : `Save ${skill.name}`
         }
       >
-        {saved ? <Check size={18} /> : <Bookmark size={18} />}{" "}
+        {saved ? (
+          <Check size={18} aria-hidden="true" />
+        ) : (
+          <Bookmark size={18} aria-hidden="true" />
+        )}{" "}
         {saved ? "Remove from saved" : "Save skill"}
       </button>
       {saveError && (
@@ -92,7 +94,7 @@ export default function SkillDetail({
         rel="noreferrer"
       >
         {skill.repository || "Original source"}
-        <ArrowUpRight size={15} />
+        <ArrowUpRight size={15} aria-hidden="true" />
       </a>
       {recommendation && (
         <div className="detail-match">
@@ -116,7 +118,7 @@ export default function SkillDetail({
           {skill.workflow.length ? <ul>
             {skill.workflow.map((item) => (
               <li key={item}>
-                <CircleCheck size={14} />
+                <CircleCheck size={14} aria-hidden="true" />
                 {item}
               </li>
             ))}
@@ -128,7 +130,7 @@ export default function SkillDetail({
             <ul>
               {skill.output_style.map((item) => (
                 <li key={item}>
-                  <CircleCheck size={14} />
+                  <CircleCheck size={14} aria-hidden="true" />
                   {item}
                 </li>
               ))}
@@ -158,7 +160,7 @@ export default function SkillDetail({
       <section className="install-section">
         <div className="section-line">
           <h3>
-            <Terminal size={17} />
+            <Terminal size={17} aria-hidden="true" />
             Installation command
           </h3>
           {skill.compatibility?.length ? <div className="mini-segment">
@@ -191,7 +193,11 @@ export default function SkillDetail({
                 onClick={copy}
                 aria-label="Copy installation command"
               >
-                {copied ? <Check size={18} /> : <Copy size={18} />}
+                {copied ? (
+                  <Check size={18} aria-hidden="true" />
+                ) : (
+                  <Copy size={18} aria-hidden="true" />
+                )}
               </button>
             </div>
             <span className="copy-status" role="status">
@@ -210,7 +216,7 @@ export default function SkillDetail({
       {skill.evidence.length > 0 && (
         <details className="evidence">
           <summary>
-            <Quote size={15} />
+            <Quote size={15} aria-hidden="true" />
             What the source says<span>Style traits are inferred</span>
           </summary>
           {skill.evidence.map((item, index) => (
@@ -224,15 +230,15 @@ export default function SkillDetail({
         <p className="small muted">No reviewed working-style traits are recorded.</p>
       )}
       <div className="detail-footer">
-        <span>
-          {skill.license || "License unknown"} · {skill.revision ? `Source ${skill.revision.slice(0, 7)}` : "Source revision unknown"}
+        <span className="detail-meta">
+          {skill.license || "License unknown"}. {skill.revision ? `Source ${skill.revision.slice(0, 7)}` : "Source revision unknown"}
         </span>
         <a href={skill.source_url} target="_blank" rel="noreferrer">
           Read the skill
-          <ExternalLink size={14} />
+          <ExternalLink size={14} aria-hidden="true" />
         </a>
         {skill.provider_url && (
-          <a href={skill.provider_url} target="_blank" rel="noreferrer">View on SkillsMP <ExternalLink size={14} /></a>
+          <a href={skill.provider_url} target="_blank" rel="noreferrer">View on SkillsMP <ExternalLink size={14} aria-hidden="true" /></a>
         )}
       </div>
     </Dialog>

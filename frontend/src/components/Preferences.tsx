@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, Check } from "lucide-react";
+import { Check } from "lucide-react";
 import type { Profile } from "../lib/types";
 import Dialog from "./Dialog";
 
@@ -80,10 +80,8 @@ export default function Preferences({
       onClose={onClose}
       className="preferences-dialog"
     >
-      <h2>Make it your kind of work.</h2>
       <p className="muted">
-        The right skill should fit how you like to work, too. Everything here is
-        optional.
+        These optional choices help tailor recommendations to how you work.
       </p>
       <form onSubmit={submit}>
         {groups.map((group) => (
@@ -104,7 +102,9 @@ export default function Preferences({
                   }
                   onClick={() => setDraft({ ...draft, [group.field]: value })}
                 >
-                  {draft[group.field] === value && <Check size={13} />}
+                  {draft[group.field] === value && (
+                    <Check size={13} aria-hidden="true" />
+                  )}
                   {label}
                 </button>
               ))}
@@ -124,7 +124,7 @@ export default function Preferences({
           onChange={(event) =>
             setDraft({ ...draft, output_style: event.target.value })
           }
-          placeholder="Minimal, thoughtful design. Plain language. Small changes over big rewrites. Whatever feels like you."
+          placeholder="For example, preferred tone, level of detail, or format."
         />
         <p className="small muted">
           Your choices guide future batches. Saves and optional pass reasons
@@ -137,7 +137,6 @@ export default function Preferences({
         )}
         <button className="primary-button" disabled={saving} type="submit">
           {saving ? "Saving…" : "Save preferences"}
-          <ArrowRight size={18} />
         </button>
       </form>
     </Dialog>

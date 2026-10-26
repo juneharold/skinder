@@ -1,5 +1,5 @@
 import type { ReactNode, RefObject } from "react";
-import { ArrowLeft, ArrowRight, ArrowUpRight, Pencil, RotateCcw, SlidersHorizontal } from "lucide-react";
+import { Pencil, RotateCcw, SlidersHorizontal } from "lucide-react";
 import SkillCard from "../components/SkillCard";
 import LoadNotice from "../components/LoadNotice";
 import type { PassReason, Skill } from "../lib/types";
@@ -56,7 +56,7 @@ export default function DiscoverView({
   if (session?.status === "cancelled") {
     emptyHeading = "Matching cancelled.";
   } else if (session?.status === "failed") {
-    emptyHeading = "We couldn’t finish this hand.";
+    emptyHeading = "Matching could not finish.";
   } else if (total && hasMoreCandidates) {
     emptyHeading = "Batch reviewed.";
   } else if (total) {
@@ -73,8 +73,7 @@ export default function DiscoverView({
       <LoadNotice label="your current task" retryLabel="session" state={matches.loadState} error={matches.loadError} onRetry={matches.reload} />
       {matches.loadState === "loading" ? (
         <div className="empty-state" role="status">
-          <span className="diamond">♦</span>
-          <h1>Loading your table…</h1>
+          <h1>Loading your task…</h1>
         </div>
       ) : matches.loadState === "error" ? (
         <div className="empty-state">
@@ -87,51 +86,29 @@ export default function DiscoverView({
       ) : !session ? (
         <section className="welcome-layout">
           <div className="welcome-intro">
-            <span className="eyebrow">
-              A good skill changes the game.
-            </span>
-            <h1>
-              Your task.
-              <br />A better hand.
-            </h1>
+            <h1>Find skills for your task</h1>
             <p>
-              Find agent skills that fit what you’re doing and how you
-              like to work.
+              Describe your task, then review skills that fit how you work.
             </p>
-            <div className="how-it-works">
-              <span>
-                <b>01</b> Describe your task.
-              </span>
-              <span>
-                <b>02</b> Review one skill at a time.
-              </span>
-              <span>
-                <b>03</b> Save a fit. Pass on the rest.
-              </span>
-            </div>
-            <a
-              href={exploreHref}
-              onClick={(event) => {
-                event.preventDefault();
-                onNavigate("explore");
-              }}
-            >
-              Or explore the catalog <ArrowUpRight size={16} />
-            </a>
           </div>
           <div className="task-entry">
-            <span className="card-index">
-              A<br />♦
-            </span>
-            <h2>Deal me in.</h2>
             {taskForm}
             {matchNotice}
           </div>
+          <a
+            className="explore-link"
+            href={exploreHref}
+            onClick={(event) => {
+              event.preventDefault();
+              onNavigate("explore");
+            }}
+          >
+            Explore the catalog
+          </a>
         </section>
       ) : (
         <div className="discover-layout">
           <aside className="task-sidebar">
-            <span className="eyebrow">Current task</span>
             <h1 className={session.task.length > 80 ? "long-task" : undefined}>
               {session.task.length > 120
                 ? `${session.task.slice(0, 120).trimEnd()}…`
@@ -144,7 +121,7 @@ export default function DiscoverView({
               </details>
             )}
             <div className="sidebar-section">
-              <span className="eyebrow">Target</span>
+              <span className="field-label">Target agent</span>
               <strong>
                 {session.agent === "codex" ? "Codex" : "Claude Code"}
               </strong>
@@ -154,14 +131,14 @@ export default function DiscoverView({
                 disabled={preferencesDisabled}
                 onClick={onPreferences}
               >
-                <SlidersHorizontal size={18} />
+                <SlidersHorizontal size={18} aria-hidden="true" />
                 Preferences
               </button>
               <button
                 disabled={matchBusy || matching || writeBusy}
                 onClick={onEditTask}
               >
-                <Pencil size={18} />
+                <Pencil size={18} aria-hidden="true" />
                 Edit task
               </button>
             </div>
@@ -218,9 +195,7 @@ export default function DiscoverView({
             )}
             {matching || matchBusy ? (
               <div className="empty-state matching-state" role="status">
-                <span className="diamond">♦</span>
-                <span className="eyebrow">Finding your next hand</span>
-                <h2>Looking for a good fit.</h2>
+                <h2>Finding skills…</h2>
                 <p>
                   Matching skills to your task and preferences. This can
                   take a little while.
@@ -279,7 +254,7 @@ export default function DiscoverView({
                         disabled={!lastChoice || writeBusy}
                         onClick={undo}
                       >
-                        <RotateCcw size={18} />
+                        <RotateCcw size={18} aria-hidden="true" />
                         <span>Undo</span>
                       </button>
                       <button
@@ -287,7 +262,6 @@ export default function DiscoverView({
                         disabled={writeBusy}
                         onClick={() => choose("pass")}
                       >
-                        <ArrowLeft size={18} />
                         <span>Pass</span>
                       </button>
                       <button
@@ -305,7 +279,6 @@ export default function DiscoverView({
                             ? "Keep saved"
                             : "Save"}
                         </span>
-                        <ArrowRight size={18} />
                       </button>
                     </div>
                     <div className="pass-reasons">
@@ -350,12 +323,6 @@ export default function DiscoverView({
                   </div>
                 ) : (
                   <div className="empty-state" role="status">
-                    <span className="diamond">♦</span>
-                    <span className="eyebrow">
-                      {total
-                        ? "All cards considered"
-                        : "The search is complete"}
-                    </span>
                     <h2>{emptyHeading}</h2>
                     <p>
                       {retryMatching
@@ -377,7 +344,6 @@ export default function DiscoverView({
                         : canContinue
                           ? "Find more for this task"
                           : "Change task"}
-                      <ArrowRight size={18} />
                     </button>
                     <button
                       className="text-button"
@@ -386,7 +352,6 @@ export default function DiscoverView({
                       {total
                         ? "View saved skills"
                         : "Explore the catalog"}
-                      <ArrowUpRight size={16} />
                     </button>
                     {lastChoice && (
                       <button
@@ -395,7 +360,7 @@ export default function DiscoverView({
                         disabled={writeBusy}
                         onClick={undo}
                       >
-                        <RotateCcw size={16} />
+                        <RotateCcw size={16} aria-hidden="true" />
                         Undo last choice
                       </button>
                     )}
@@ -406,7 +371,6 @@ export default function DiscoverView({
           </section>
           <aside className="progress-sidebar">
             <div>
-              <span className="eyebrow">Deck progress</span>
               <p className="progress-count">
                 {matching && !total ? (
                   <span>Preparing your deck</span>
@@ -414,17 +378,9 @@ export default function DiscoverView({
                   <>{reviewed} <span>of {total} reviewed</span></>
                 )}
               </p>
-              <div className="progress-dots" aria-hidden="true">
-                {Array.from({ length: total }, (_, index) => (
-                  <span
-                    key={index}
-                    className={index < reviewed ? "done" : ""}
-                  />
-                ))}
-              </div>
             </div>
             <div className="shortcuts">
-              <span className="eyebrow">Keyboard shortcuts</span>
+              <h2>Keyboard shortcuts</h2>
               <p>
                 <kbd>←</kbd>Pass
               </p>

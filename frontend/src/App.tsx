@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowRight, SlidersHorizontal } from "lucide-react";
+import { Diamond, SlidersHorizontal } from "lucide-react";
 import { api } from "./lib/api";
 import { defaultProfile, type Agent, type Health, type Profile, type Skill } from "./lib/types";
 import { errorMessage as message, type LoadState } from "./lib/async";
@@ -187,7 +187,7 @@ export default function App() {
     }
   }
   const resourceNotice = (resource: Resource) => (
-    <LoadNotice label={resource} state={loads[resource]} error={loadErrors[resource] ?? ""} onRetry={() => void load(resource)} />
+    <LoadNotice label={resource === "health" ? "the Codex connection" : "preferences"} retryLabel={resource === "health" ? "connection" : "preferences"} state={loads[resource]} error={loadErrors[resource] ?? ""} onRetry={() => void load(resource)} />
   );
   const matchNotice = matches.matchError && (
     <div className="error-notice" role="alert">
@@ -207,14 +207,14 @@ export default function App() {
       </label>
       <textarea
         id="task"
-        rows={5}
+        rows={4}
         minLength={3}
         maxLength={4000}
         required
         value={task}
         disabled={matchBusy}
         onChange={(event) => setTask(event.target.value)}
-        placeholder="Describe your task and the result you have in mind."
+        placeholder="For example, review the accessibility of my app."
       />
       <label className="field-label" htmlFor="target-agent">
         Target agent
@@ -239,7 +239,6 @@ export default function App() {
         }
       >
         {matchBusy ? "Starting matching…" : "Find skills"}
-        <ArrowRight size={18} />
       </button>
     </form>
   );
@@ -256,7 +255,7 @@ export default function App() {
           }}
           aria-label="Skinder home"
         >
-          skinder<span className="brand-diamond">♦</span>
+          skinder<Diamond className="brand-mark" size={14} fill="currentColor" strokeWidth={0} aria-hidden="true" />
         </a>
         <nav aria-label="Main navigation">
           {(["discover", "explore", "saved"] as View[]).map((item) => (
@@ -279,12 +278,7 @@ export default function App() {
             </a>
           ))}
         </nav>
-        <span className="connection">
-          <span
-            className={
-              connected ? "connection-dot connected" : "connection-dot"
-            }
-          />
+        <span className="connection" role="status">
           {loads.health === "loading"
             ? "Checking Codex"
             : connected
@@ -297,7 +291,7 @@ export default function App() {
           disabled={loads.profile !== "ready" || profileBusy}
           onClick={openPreferences}
         >
-          <SlidersHorizontal size={20} />
+          <SlidersHorizontal size={20} aria-hidden="true" />
         </button>
       </header>
       <main>
@@ -394,10 +388,7 @@ export default function App() {
         )}
       </main>
       <footer className="site-footer">
-        <span>
-          SKINDER <span className="red">♦</span> Pick your skills. Make your
-          move.
-        </span>
+        <span>Skinder</span>
         <span>Real skills. Original sources.</span>
       </footer>
       <div className="toast" role="status" aria-live="polite">
@@ -411,7 +402,6 @@ export default function App() {
             if (!matches.isStarting()) setEditOpen(false);
           }}
         >
-          <h2>A new task. A new hand.</h2>
           <p className="muted">
             Starting a new task replaces this deck. Your saved skills stay in
             your collection.

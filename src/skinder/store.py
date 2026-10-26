@@ -1,10 +1,19 @@
 import json
-import sqlite3
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import uuid4
 
+from sqlalchemy import delete, or_, select, update
+from sqlalchemy.orm import sessionmaker
+
+from .database import create_database
 from .models import Feedback, FeedbackInput, MatchSession, Profile
+from .orm import (
+    BookmarkRecord,
+    FeedbackRecord,
+    MatchSessionRecord,
+    ProfileRecord,
+    SessionSkillRecord,
+)
 
 
 def now():
@@ -12,217 +21,188 @@ def now():
 
 
 class Store:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript("""
-            PRAGMA journal_mode=WAL;
-            PRAGMA foreign_keys=ON;
-            CREATE TABLE IF NOT EXISTS profile (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL,
-                status TEXT NOT NULL, recommendations TEXT NOT NULL DEFAULT '[]',
-                error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS session_skills (
-                session_id TEXT REFERENCES sessions(id), skill_id TEXT NOT NULL,
-                PRIMARY KEY(session_id, skill_id)
-            );
-            CREATE TABLE IF NOT EXISTS feedback (
-                id TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id), skill_id TEXT NOT NULL,
-                action TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL,
-                UNIQUE(session_id, skill_id)
-            );
-            CREATE TABLE IF NOT EXISTS bookmarks (
-                skill_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, feedback_id TEXT
-            );
-        """)
-        columns = self.db.execute("PRAGMA table_info(bookmarks)").fetchall()
-        if any(column["name"] == "feedback_id" and column["notnull"] for column in columns):
-            with self.db:
-                self.db.execute("BEGIN")
-                self.db.execute(
-                    "CREATE TABLE bookmarks_new ("
-                    "skill_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, feedback_id TEXT)"
+    def __init__(self, path):
+        self.engine = create_database(path, "state")
+        self.sessions = sessionmaker(self.engine, expire_on_commit=False)
+        with self.sessions.begin() as db:
+            db.execute(
+                update(MatchSessionRecord)
+                .where(MatchSessionRecord.status.in_(("running", "pending")))
+                .values(
+                    status="failed",
+                    error="Matching was interrupted by a server restart. Try again when ready.",
+                    updated_at=now(),
                 )
-                self.db.execute(
-                    "INSERT INTO bookmarks_new SELECT skill_id, saved_at, feedback_id FROM bookmarks"
-                )
-                self.db.execute("DROP TABLE bookmarks")
-                self.db.execute("ALTER TABLE bookmarks_new RENAME TO bookmarks")
-        with self.db:
-            self.db.execute(
-                "UPDATE sessions SET status='failed', error=?, updated_at=? "
-                "WHERE status IN ('running', 'pending')",
-                ("Matching was interrupted by a server restart. Try again when ready.", now()),
             )
 
     def close(self):
-        self.db.close()
+        self.engine.dispose()
 
     def profile(self):
-        row = self.db.execute("SELECT data FROM profile WHERE id=1").fetchone()
-        return Profile.model_validate_json(row[0]) if row else Profile()
+        with self.sessions() as db:
+            row = db.get(ProfileRecord, 1)
+            return Profile.model_validate_json(row.data) if row else Profile()
 
     def set_profile(self, profile):
-        with self.db:
-            self.db.execute(
-                "INSERT OR REPLACE INTO profile VALUES (1, ?)", (profile.model_dump_json(),)
-            )
+        with self.sessions.begin() as db:
+            db.merge(ProfileRecord(id=1, data=profile.model_dump_json()))
         return profile
 
     def session(self, session_id):
-        row = self.db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-        if not row:
-            return None
-        data = dict(row)
-        data["recommendations"] = json.loads(data["recommendations"])
-        data["feedback"] = [
-            dict(r)
-            for r in self.db.execute(
-                "SELECT * FROM feedback WHERE session_id=? ORDER BY created_at", (session_id,)
+        with self.sessions() as db:
+            row = db.get(MatchSessionRecord, session_id)
+            if row is None:
+                return None
+            feedback = db.scalars(
+                select(FeedbackRecord)
+                .where(FeedbackRecord.session_id == session_id)
+                .order_by(FeedbackRecord.created_at)
             )
-        ]
-        return MatchSession.model_validate(data)
+            return MatchSession(
+                id=row.id, task=row.task, agent=row.agent, status=row.status,
+                recommendations=json.loads(row.recommendations),
+                feedback=[Feedback.model_validate(item, from_attributes=True) for item in feedback],
+                error=row.error, created_at=row.created_at, updated_at=row.updated_at,
+            )
 
     def current(self):
-        row = self.db.execute("SELECT id FROM sessions ORDER BY updated_at DESC LIMIT 1").fetchone()
-        return self.session(row[0]) if row else None
+        with self.sessions() as db:
+            session_id = db.scalar(
+                select(MatchSessionRecord.id).order_by(MatchSessionRecord.updated_at.desc()).limit(1)
+            )
+        return self.session(session_id) if session_id else None
 
     def start(self, task, agent, session_id=None):
         timestamp = now()
-        with self.db:
+        with self.sessions.begin() as db:
             if session_id:
-                self.db.execute(
-                    "UPDATE sessions SET status='running', error=NULL, updated_at=? WHERE id=?",
-                    (timestamp, session_id),
+                db.execute(
+                    update(MatchSessionRecord)
+                    .where(MatchSessionRecord.id == session_id)
+                    .values(status="running", error=None, updated_at=timestamp)
                 )
             else:
                 session_id = str(uuid4())
-                self.db.execute(
-                    "INSERT INTO sessions (id,task,agent,status,created_at,updated_at) "
-                    "VALUES (?,?,?,'running',?,?)",
-                    (session_id, task, agent, timestamp, timestamp),
-                )
+                db.add(MatchSessionRecord(
+                    id=session_id, task=task, agent=agent, status="running",
+                    recommendations="[]", created_at=timestamp, updated_at=timestamp,
+                ))
         return self.session(session_id)
 
     def finish(self, session_id, status, recommendations=None, error=None):
-        # Cancellation is authoritative even if a subprocess produces a late result.
-        if self.session(session_id).status != "running":
-            return
-        with self.db:
-            self.db.execute(
-                "UPDATE sessions SET status=?,error=?,updated_at=? WHERE id=?",
-                (status, error, now(), session_id),
+        values = {"status": status, "error": error, "updated_at": now()}
+        if recommendations is not None:
+            values["recommendations"] = json.dumps([r.model_dump() for r in recommendations])
+        with self.sessions.begin() as db:
+            # Cancellation is authoritative even if a subprocess produces a late result.
+            changed = db.execute(
+                update(MatchSessionRecord)
+                .where(MatchSessionRecord.id == session_id, MatchSessionRecord.status == "running")
+                .values(**values)
             )
-            if recommendations is not None:
-                self.db.execute(
-                    "UPDATE sessions SET recommendations=? WHERE id=?",
-                    (
-                        json.dumps([r.model_dump() for r in recommendations]),
-                        session_id,
-                    ),
+            if not changed.rowcount or recommendations is None:
+                return
+            known = set(db.scalars(
+                select(SessionSkillRecord.skill_id).where(
+                    SessionSkillRecord.session_id == session_id
                 )
-                self.db.executemany(
-                    "INSERT OR IGNORE INTO session_skills VALUES (?,?)",
-                    [(session_id, r.skill_id) for r in recommendations],
-                )
+            ))
+            db.add_all([
+                SessionSkillRecord(session_id=session_id, skill_id=skill_id)
+                for skill_id in {r.skill_id for r in recommendations} - known
+            ])
 
     def seen(self, session_id):
-        return {
-            r[0]
-            for r in self.db.execute(
-                "SELECT skill_id FROM feedback WHERE session_id=?", (session_id,)
-            )
-        }
+        with self.sessions() as db:
+            return set(db.scalars(
+                select(FeedbackRecord.skill_id).where(FeedbackRecord.session_id == session_id)
+            ))
 
     def feedback(self, value: FeedbackInput):
-        known = self.db.execute(
-            "SELECT 1 FROM session_skills WHERE session_id=? AND skill_id=?",
-            (value.session_id, value.skill_id),
-        ).fetchone()
-        if not known:
-            raise ValueError("Feedback requires a skill recommended in this task session.")
-        previous = self.db.execute(
-            "SELECT * FROM feedback WHERE session_id=? AND skill_id=?",
-            (value.session_id, value.skill_id),
-        ).fetchone()
-        if previous:
-            if previous["action"] == value.action and previous["reason"] == value.reason:
-                return Feedback.model_validate(dict(previous))
-            raise ValueError("Undo the existing feedback before changing it.")
-        self.require_feedback_idle(value.session_id)
-        result = Feedback(**value.model_dump(), id=str(uuid4()), created_at=now())
-        with self.db:
-            self.db.execute(
-                "INSERT INTO feedback VALUES (?,?,?,?,?,?)",
-                (
-                    result.id,
-                    result.session_id,
-                    result.skill_id,
-                    result.action,
-                    result.reason,
-                    result.created_at,
-                ),
-            )
-            if value.action == "save":
-                self.db.execute(
-                    "INSERT OR IGNORE INTO bookmarks VALUES (?,?,?)",
-                    (value.skill_id, result.created_at, result.id),
-                )
+        with self.sessions.begin() as db:
+            if db.get(SessionSkillRecord, (value.session_id, value.skill_id)) is None:
+                raise ValueError("Feedback requires a skill recommended in this task session.")
+            previous = db.scalar(select(FeedbackRecord).where(
+                FeedbackRecord.session_id == value.session_id,
+                FeedbackRecord.skill_id == value.skill_id,
+            ))
+            if previous:
+                if previous.action == value.action and previous.reason == value.reason:
+                    return Feedback.model_validate(previous, from_attributes=True)
+                raise ValueError("Undo the existing feedback before changing it.")
+            self._require_feedback_idle(db.get(MatchSessionRecord, value.session_id))
+            result = Feedback(**value.model_dump(), id=str(uuid4()), created_at=now())
+            db.add(FeedbackRecord(**result.model_dump()))
+            if value.action == "save" and db.get(BookmarkRecord, value.skill_id) is None:
+                db.add(BookmarkRecord(
+                    skill_id=value.skill_id, saved_at=result.created_at, feedback_id=result.id,
+                ))
         return result
 
-    def require_feedback_idle(self, session_id):
-        if self.session(session_id).status in ("pending", "running"):
+    @staticmethod
+    def _require_feedback_idle(session):
+        if session.status in ("pending", "running"):
             raise ValueError("Wait for matching to finish or cancel it before changing feedback.")
 
     def undo(self, feedback_id):
-        with self.db:
-            row = self.db.execute("SELECT * FROM feedback WHERE id=?", (feedback_id,)).fetchone()
-            if not row:
+        with self.sessions.begin() as db:
+            row = db.get(FeedbackRecord, feedback_id)
+            if row is None:
                 return
-            self.require_feedback_idle(row["session_id"])
-            self.db.execute("DELETE FROM feedback WHERE id=?", (feedback_id,))
-            bookmark = self.db.execute(
-                "SELECT * FROM bookmarks WHERE feedback_id=?", (feedback_id,)
-            ).fetchone()
+            self._require_feedback_idle(db.get(MatchSessionRecord, row.session_id))
+            db.delete(row)
+            bookmark = db.scalar(
+                select(BookmarkRecord).where(BookmarkRecord.feedback_id == feedback_id)
+            )
             if bookmark:
-                other = self.db.execute(
-                    "SELECT id FROM feedback WHERE skill_id=? AND action='save' "
-                    "AND created_at>=? ORDER BY created_at DESC LIMIT 1",
-                    (row["skill_id"], bookmark["saved_at"]),
-                ).fetchone()
-                if other:
-                    self.db.execute(
-                        "UPDATE bookmarks SET feedback_id=? WHERE skill_id=?",
-                        (other[0], row["skill_id"]),
+                other = db.scalar(
+                    select(FeedbackRecord.id)
+                    .where(
+                        FeedbackRecord.skill_id == row.skill_id,
+                        FeedbackRecord.action == "save",
+                        FeedbackRecord.created_at >= bookmark.saved_at,
                     )
+                    .order_by(FeedbackRecord.created_at.desc()).limit(1)
+                )
+                if other:
+                    bookmark.feedback_id = other
                 else:
-                    self.db.execute("DELETE FROM bookmarks WHERE feedback_id=?", (feedback_id,))
+                    db.delete(bookmark)
 
     def saved(self):
-        return self.db.execute("SELECT * FROM bookmarks ORDER BY saved_at DESC").fetchall()
+        with self.sessions() as db:
+            rows = db.scalars(select(BookmarkRecord).order_by(BookmarkRecord.saved_at.desc()))
+            return [
+                {"skill_id": row.skill_id, "saved_at": row.saved_at, "feedback_id": row.feedback_id}
+                for row in rows
+            ]
 
     def save(self, skill_id):
-        with self.db:
-            self.db.execute(
-                "INSERT INTO bookmarks VALUES (?,?,NULL) "
-                "ON CONFLICT(skill_id) DO UPDATE SET feedback_id=NULL",
-                (skill_id, now()),
-            )
+        with self.sessions.begin() as db:
+            bookmark = db.get(BookmarkRecord, skill_id)
+            if bookmark:
+                bookmark.feedback_id = None
+            else:
+                db.add(BookmarkRecord(skill_id=skill_id, saved_at=now()))
 
     def unsave(self, skill_id):
-        with self.db:
-            self.db.execute("DELETE FROM bookmarks WHERE skill_id=?", (skill_id,))
+        with self.sessions.begin() as db:
+            db.execute(delete(BookmarkRecord).where(BookmarkRecord.skill_id == skill_id))
 
     def preference_events(self, agent):
         # A plain pass and wrong-task reason are local exclusions, never global taste signals.
-        rows = self.db.execute(
-            "SELECT f.skill_id, f.action, f.reason, s.task, s.agent FROM feedback f "
-            "JOIN sessions s ON s.id=f.session_id WHERE s.agent=? AND "
-            "(f.action='save' OR f.reason IN ('wrong-style','too-much-setup')) "
-            "ORDER BY f.created_at DESC LIMIT 30",
-            (agent,),
-        )
-        return [dict(row) for row in rows]
+        with self.sessions() as db:
+            rows = db.execute(
+                select(
+                    FeedbackRecord.skill_id, FeedbackRecord.action, FeedbackRecord.reason,
+                    MatchSessionRecord.task, MatchSessionRecord.agent,
+                )
+                .join(MatchSessionRecord, MatchSessionRecord.id == FeedbackRecord.session_id)
+                .where(
+                    MatchSessionRecord.agent == agent,
+                    or_(FeedbackRecord.action == "save",
+                        FeedbackRecord.reason.in_(("wrong-style", "too-much-setup"))),
+                )
+                .order_by(FeedbackRecord.created_at.desc()).limit(30)
+            ).mappings()
+            return [dict(row) for row in rows]

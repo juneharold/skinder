@@ -10,7 +10,16 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
+from sqlalchemy import and_, delete, func, select
+from sqlalchemy.dialects.sqlite import insert
 from usearch.index import Index
+
+from .orm import (
+    CatalogSkillRecord,
+    RetrievalMemberRecord,
+    RetrievalMetaRecord,
+    SkillEmbeddingRecord,
+)
 
 MODEL = "intfloat/multilingual-e5-small"
 # Pinned from the model publisher's Hugging Face revision and artifact metadata.
@@ -36,30 +45,9 @@ def _paths(catalog):
     return catalog.path.with_name(catalog.path.stem + "-search")
 
 
-def _initialize(catalog):
-    with catalog.connect() as db:
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS retrieval_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS skill_embeddings (
-                vector_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                skill_id TEXT NOT NULL, text_hash TEXT NOT NULL,
-                model_fingerprint TEXT NOT NULL, vector BLOB NOT NULL,
-                UNIQUE(skill_id, text_hash, model_fingerprint)
-            );
-            CREATE TABLE IF NOT EXISTS retrieval_members (
-                generation TEXT NOT NULL, vector_id INTEGER NOT NULL,
-                PRIMARY KEY(generation, vector_id)
-            ) WITHOUT ROWID;
-        """)
-        db.execute("INSERT OR IGNORE INTO retrieval_meta VALUES ('catalog_revision','0')")
-        for event in ("INSERT", "UPDATE OF text_hash", "DELETE"):
-            trigger = event.split()[0].lower()
-            db.execute(f"CREATE TRIGGER IF NOT EXISTS retrieval_catalog_{trigger} "
-                       f"AFTER {event} ON catalog_skills BEGIN "
-                       "UPDATE retrieval_meta SET value=CAST(value AS INTEGER)+1 "
-                       "WHERE key='catalog_revision'; END")
-        db.execute("INSERT OR IGNORE INTO retrieval_meta VALUES ('identity',?)", (str(uuid4()),))
-        return db.execute("SELECT value FROM retrieval_meta WHERE key='identity'").fetchone()[0]
+def _identity(catalog):
+    with catalog.sessions() as session:
+        return session.get(RetrievalMetaRecord, "identity").value
 
 
 def _sha256(path):
@@ -164,14 +152,17 @@ def _manifest(root, identity):
 
 
 def _indexed_count(catalog, generation):
-    with catalog.connect() as db:
-        return db.execute(
-            "SELECT count(*) FROM retrieval_members m "
-            "JOIN skill_embeddings e ON e.vector_id=m.vector_id "
-            "JOIN catalog_skills s ON s.id=e.skill_id AND s.text_hash=e.text_hash "
-            "WHERE m.generation=? AND e.model_fingerprint=?",
-            (generation, MODEL_FINGERPRINT),
-        ).fetchone()[0]
+    with catalog.sessions() as session:
+        return session.scalar(select(func.count()).select_from(RetrievalMemberRecord).join(
+            SkillEmbeddingRecord,
+            SkillEmbeddingRecord.vector_id == RetrievalMemberRecord.vector_id,
+        ).join(CatalogSkillRecord, and_(
+            CatalogSkillRecord.id == SkillEmbeddingRecord.skill_id,
+            CatalogSkillRecord.text_hash == SkillEmbeddingRecord.text_hash,
+        )).where(
+            RetrievalMemberRecord.generation == generation,
+            SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT,
+        ))
 
 
 def _publish(root, manifest):
@@ -191,7 +182,7 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
 
     Tests may supply an embedder with an ``embed(texts)`` method; production uses pinned E5.
     """
-    identity = _initialize(catalog)
+    identity = _identity(catalog)
     root = _paths(catalog)
     root.mkdir(parents=True, exist_ok=True)
     if not catalog.count():
@@ -209,24 +200,28 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
     # Keyset pagination bounds memory and resumes from persisted embeddings after interruption.
     last_id = ""
     while True:
-        with catalog.connect() as db:
-            rows = db.execute(
-                "SELECT s.id,s.text_hash,s.retrieval_text FROM catalog_skills s "
-                "WHERE s.id>? AND NOT EXISTS (SELECT 1 FROM skill_embeddings e "
-                "WHERE e.skill_id=s.id AND e.text_hash=s.text_hash AND e.model_fingerprint=?) "
-                "ORDER BY s.id LIMIT 64", (last_id, MODEL_FINGERPRINT),
-            ).fetchall()
+        with catalog.sessions() as session:
+            rows = session.execute(select(
+                CatalogSkillRecord.id, CatalogSkillRecord.text_hash,
+                CatalogSkillRecord.retrieval_text,
+            ).where(
+                CatalogSkillRecord.id > last_id,
+                ~select(SkillEmbeddingRecord.vector_id).where(
+                    SkillEmbeddingRecord.skill_id == CatalogSkillRecord.id,
+                    SkillEmbeddingRecord.text_hash == CatalogSkillRecord.text_hash,
+                    SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT,
+                ).exists(),
+            ).order_by(CatalogSkillRecord.id).limit(64)).all()
         if not rows:
             break
-        vectors = _embed(embedder, ["passage: " + row["retrieval_text"] for row in rows])
-        with catalog.connect() as db:
-            db.executemany(
-                "INSERT OR IGNORE INTO skill_embeddings "
-                "(skill_id,text_hash,model_fingerprint,vector) VALUES (?,?,?,?)",
-                [(row["id"], row["text_hash"], MODEL_FINGERPRINT, vector.tobytes())
-                 for row, vector in zip(rows, vectors, strict=True)],
-            )
-        last_id = rows[-1]["id"]
+        vectors = _embed(embedder, ["passage: " + row.retrieval_text for row in rows])
+        with catalog.sessions.begin() as session:
+            session.execute(insert(SkillEmbeddingRecord).on_conflict_do_nothing(
+                index_elements=["skill_id", "text_hash", "model_fingerprint"],
+            ), [{"skill_id": row.id, "text_hash": row.text_hash,
+                 "model_fingerprint": MODEL_FINGERPRINT, "vector": vector.tobytes()}
+                for row, vector in zip(rows, vectors, strict=True)])
+        last_id = rows[-1].id
 
     generation = uuid4().hex
     filename = f"{generation}.usearch"
@@ -235,21 +230,24 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
     try:
         last_id = 0
         while True:
-            with catalog.connect() as db:
-                rows = db.execute(
-                    "SELECT e.vector_id,e.vector FROM skill_embeddings e JOIN catalog_skills s "
-                    "ON s.id=e.skill_id AND s.text_hash=e.text_hash "
-                    "WHERE e.model_fingerprint=? AND e.vector_id>? ORDER BY e.vector_id LIMIT 1024",
-                    (MODEL_FINGERPRINT, last_id),
-                ).fetchall()
+            with catalog.sessions() as session:
+                rows = session.execute(select(
+                    SkillEmbeddingRecord.vector_id, SkillEmbeddingRecord.vector,
+                ).join(CatalogSkillRecord, and_(
+                    CatalogSkillRecord.id == SkillEmbeddingRecord.skill_id,
+                    CatalogSkillRecord.text_hash == SkillEmbeddingRecord.text_hash,
+                )).where(
+                    SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT,
+                    SkillEmbeddingRecord.vector_id > last_id,
+                ).order_by(SkillEmbeddingRecord.vector_id).limit(1024)).all()
             if not rows:
                 break
-            keys = np.array([row["vector_id"] for row in rows], dtype=np.uint64)
-            vectors = np.stack([np.frombuffer(row["vector"], dtype=np.float32) for row in rows])
+            keys = np.array([row.vector_id for row in rows], dtype=np.uint64)
+            vectors = np.stack([np.frombuffer(row.vector, dtype=np.float32) for row in rows])
             index.add(keys, vectors, threads=4)
-            with catalog.connect() as db:
-                db.executemany("INSERT INTO retrieval_members VALUES (?,?)",
-                               [(generation, int(key)) for key in keys])
+            with catalog.sessions.begin() as session:
+                session.add_all(RetrievalMemberRecord(generation=generation, vector_id=int(key))
+                                for key in keys)
             last_id = int(keys[-1])
         index.save(root / filename)
         with (root / filename).open("rb") as stream:
@@ -262,15 +260,18 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
         _publish(root, manifest)
     except BaseException:
         (root / filename).unlink(missing_ok=True)
-        with catalog.connect() as db:
-            db.execute("DELETE FROM retrieval_members WHERE generation=?", (generation,))
+        with catalog.sessions.begin() as session:
+            session.execute(delete(RetrievalMemberRecord).where(
+                RetrievalMemberRecord.generation == generation
+            ))
         raise
 
     # Keep one previous generation; mapped readers on this Mac retain their open old files.
     keep = [generation] + ([previous["generation"]] if previous else [])
-    with catalog.connect() as db:
-        db.execute("DELETE FROM retrieval_members WHERE generation NOT IN ("
-                   + ",".join("?" for _ in keep) + ")", keep)
+    with catalog.sessions.begin() as session:
+        session.execute(delete(RetrievalMemberRecord).where(
+            RetrievalMemberRecord.generation.not_in(keep)
+        ))
     for path in root.glob("*.usearch"):
         if path.stem not in keep:
             try:
@@ -284,7 +285,7 @@ class HybridRetriever:
     def __init__(self, catalog, *, embedder=None):
         self.catalog = catalog
         self.root = _paths(catalog)
-        self.identity = _initialize(catalog)
+        self.identity = _identity(catalog)
         self._embedder = embedder
         self._injected = embedder is not None
         self._index = None
@@ -316,10 +317,8 @@ class HybridRetriever:
             resources = self._resources()
             if resources:
                 generation = resources[1]["generation"]
-                with self.catalog.connect() as db:
-                    revision = db.execute(
-                        "SELECT value FROM retrieval_meta WHERE key='catalog_revision'"
-                    ).fetchone()[0]
+                with self.catalog.sessions() as session:
+                    revision = session.get(RetrievalMetaRecord, "catalog_revision").value
                 with self._lock:
                     if self._count_key != (generation, revision):
                         self._count = _indexed_count(self.catalog, generation)
@@ -335,16 +334,19 @@ class HybridRetriever:
 
     def _vector_skills(self, keys, agent, excluded):
         ids = []
-        with self.catalog.connect() as db:
+        with self.catalog.sessions() as session:
             for start in range(0, len(keys), 500):
                 batch = [int(key) for key in keys[start:start + 500]]
-                rows = db.execute(
-                    "SELECT e.vector_id,e.skill_id FROM skill_embeddings e JOIN catalog_skills s "
-                    "ON s.id=e.skill_id AND s.text_hash=e.text_hash WHERE e.model_fingerprint=? "
-                    "AND e.vector_id IN (" + ",".join("?" for _ in batch) + ")",
-                    [MODEL_FINGERPRINT, *batch],
-                ).fetchall()
-                found = {row["vector_id"]: row["skill_id"] for row in rows}
+                rows = session.execute(select(
+                    SkillEmbeddingRecord.vector_id, SkillEmbeddingRecord.skill_id,
+                ).join(CatalogSkillRecord, and_(
+                    CatalogSkillRecord.id == SkillEmbeddingRecord.skill_id,
+                    CatalogSkillRecord.text_hash == SkillEmbeddingRecord.text_hash,
+                )).where(
+                    SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT,
+                    SkillEmbeddingRecord.vector_id.in_(batch),
+                )).all()
+                found = {row.vector_id: row.skill_id for row in rows}
                 ids.extend(found[key] for key in batch if key in found)
         return self.catalog.eligible(ids, agent=agent, excluded=excluded)
 

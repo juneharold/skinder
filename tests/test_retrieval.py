@@ -3,10 +3,12 @@ import math
 
 import numpy as np
 import pytest
+from sqlalchemy import and_, func, select
 
 from skinder import retrieval
 from skinder.catalog import CatalogStore
 from skinder.models import Skill
+from skinder.orm import CatalogSkillRecord, SkillEmbeddingRecord
 from skinder.retrieval import HybridRetriever, index_catalog
 
 
@@ -85,8 +87,10 @@ def test_stale_vectors_are_excluded_and_changed_records_get_new_ids(catalog):
     index_catalog(catalog, embedder=TestEmbedder())
     retriever = HybridRetriever(catalog, embedder=TestEmbedder())
     assert retriever.status()["indexed_count"] == 2
-    with catalog.connect() as db:
-        original = dict(db.execute("SELECT skill_id,vector_id FROM skill_embeddings"))
+    with catalog.sessions() as session:
+        original = dict(session.execute(select(
+            SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
+        )).all())
     catalog.upsert(skill("changed", "Accounting"))
 
     assert ids(retriever.search("stellar", "codex", [])) == ["unchanged"]
@@ -94,11 +98,13 @@ def test_stale_vectors_are_excluded_and_changed_records_get_new_ids(catalog):
     index_catalog(catalog, embedder=TestEmbedder())
 
     assert retriever.status()["indexed_count"] == 2
-    with catalog.connect() as db:
-        current = dict(db.execute(
-            "SELECT e.skill_id,e.vector_id FROM skill_embeddings e JOIN catalog_skills s "
-            "ON s.id=e.skill_id AND s.text_hash=e.text_hash"
-        ))
+    with catalog.sessions() as session:
+        current = dict(session.execute(select(
+            SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
+        ).join(CatalogSkillRecord, and_(
+            CatalogSkillRecord.id == SkillEmbeddingRecord.skill_id,
+            CatalogSkillRecord.text_hash == SkillEmbeddingRecord.text_hash,
+        ))).all())
     assert current["changed"] != original["changed"]
     assert current["unchanged"] == original["unchanged"]
     published = manifest(catalog)
@@ -123,12 +129,16 @@ def test_failed_publication_preserves_old_index_and_resumes(catalog, monkeypatch
     assert ids(HybridRetriever(catalog, embedder=TestEmbedder()).search(
         "stellar", "codex", []
     )) == ["original"]
-    with catalog.connect() as db:
-        persisted = dict(db.execute("SELECT skill_id,vector_id FROM skill_embeddings"))
+    with catalog.sessions() as session:
+        persisted = dict(session.execute(select(
+            SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
+        )).all())
     monkeypatch.setattr(retrieval, "_publish", publish)
     index_catalog(catalog, embedder=TestEmbedder())
-    with catalog.connect() as db:
-        assert dict(db.execute("SELECT skill_id,vector_id FROM skill_embeddings")) == persisted
+    with catalog.sessions() as session:
+        assert dict(session.execute(select(
+            SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
+        )).all()) == persisted
     assert set(ids(HybridRetriever(catalog, embedder=TestEmbedder()).search(
         "stellar", "codex", []
     ))) == {"original", "added"}
@@ -166,8 +176,8 @@ def test_model_change_reembeds_and_publishes_new_generation(catalog, monkeypatch
 
     assert manifest(catalog)["generation"] != previous["generation"]
     assert HybridRetriever(catalog, embedder=TestEmbedder()).status()["indexed_count"] == 1
-    with catalog.connect() as db:
-        assert db.execute("SELECT count(*) FROM skill_embeddings").fetchone()[0] == 2
+    with catalog.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(SkillEmbeddingRecord)) == 2
 
 
 def test_restart_without_model_never_downloads_and_retains_index_count(catalog, monkeypatch):

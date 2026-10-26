@@ -6,6 +6,10 @@ import time
 from urllib.parse import quote, unquote, urlsplit
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert
+
+from .orm import CatalogSkillRecord, SourceCacheRecord
 
 MAX_FILE_BYTES = 256 * 1024
 MAX_EXCERPT = 4000
@@ -73,21 +77,19 @@ class SourceEnricher:
         self.catalog = catalog
         self.transport = transport
         self.timeout = timeout
-        with catalog.connect() as db:
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS source_cache (
-                    skill_id TEXT PRIMARY KEY, source_url TEXT NOT NULL,
-                    source_updated_at TEXT, fetched_at REAL NOT NULL, content TEXT NOT NULL
-                )
-            """)
 
     def cached(self, skill):
-        with self.catalog.connect() as db:
-            row = db.execute("SELECT * FROM source_cache WHERE skill_id=?", (skill.id,)).fetchone()
-            current = db.execute(
-                "SELECT source_updated_at FROM catalog_skills WHERE id=?", (skill.id,)
-            ).fetchone()
-        return (dict(row) if row else None), (current[0] if current else None)
+        with self.catalog.sessions() as session:
+            row = session.get(SourceCacheRecord, skill.id)
+            current = session.scalar(select(CatalogSkillRecord.source_updated_at).where(
+                CatalogSkillRecord.id == skill.id
+            ))
+            cached = ({
+                "skill_id": row.skill_id, "source_url": row.source_url,
+                "source_updated_at": row.source_updated_at,
+                "fetched_at": row.fetched_at, "content": row.content,
+            } if row else None)
+        return cached, current
 
     @staticmethod
     def with_content(item, row, status):
@@ -139,14 +141,17 @@ class SourceEnricher:
                 except (httpx.HTTPError, UnicodeError, ValueError):
                     return
                 fetched_at = time.time()
-                with self.catalog.connect() as db:
-                    db.execute(
-                        "INSERT INTO source_cache VALUES (?,?,?,?,?) ON CONFLICT(skill_id) "
-                        "DO UPDATE SET source_url=excluded.source_url,"
-                        "source_updated_at=excluded.source_updated_at,fetched_at=excluded.fetched_at,"
-                        "content=excluded.content",
-                        (skill.id, skill.source_url, stamp, fetched_at, text),
+                with self.catalog.sessions.begin() as session:
+                    statement = insert(SourceCacheRecord).values(
+                        skill_id=skill.id, source_url=skill.source_url,
+                        source_updated_at=stamp, fetched_at=fetched_at, content=text,
                     )
+                    session.execute(statement.on_conflict_do_update(
+                        index_elements=["skill_id"],
+                        set_={key: getattr(statement.excluded, key) for key in (
+                            "source_url", "source_updated_at", "fetched_at", "content",
+                        )},
+                    ))
                 results[index] = self.with_content(
                     item, {"content": text, "fetched_at": fetched_at}, "fetched"
                 )

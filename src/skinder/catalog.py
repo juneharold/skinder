@@ -4,14 +4,17 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
-from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
+from sqlalchemy import column, func, literal_column, or_, select, table, text
+from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.orm import sessionmaker
+
+from .database import create_database
 from .models import Catalog, Skill
+from .orm import CatalogAliasRecord, CatalogSkillRecord
 
 ROOT = Path(__file__).resolve().parents[2]
-BUNDLED_CATALOG = Path(__file__).parent / "data" / "catalog.json"
 
 
 def default_catalog_path():
@@ -36,150 +39,113 @@ def keyword_query(query):
     return " OR ".join(f'"{token}"' for token in tokens)
 
 
+# FTS5 virtual tables have no ORM mapping; MATCH, ranking, and FTS writes use
+# SQLite expressions while catalog records are read and written through the ORM.
+skills_fts = table("skills_fts", column("skill_id"))
+
+
 class CatalogStore:
     def __init__(self, path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS catalog_skills (
-                    id TEXT PRIMARY KEY, data TEXT NOT NULL, provenance TEXT NOT NULL,
-                    name TEXT NOT NULL, category TEXT NOT NULL, compatibility TEXT,
-                    retrieval_text TEXT NOT NULL, text_hash TEXT NOT NULL,
-                    source_updated_at TEXT
-                );
-                CREATE INDEX IF NOT EXISTS catalog_category ON catalog_skills(category);
-                CREATE INDEX IF NOT EXISTS catalog_name ON catalog_skills(name COLLATE NOCASE, id);
-                CREATE TABLE IF NOT EXISTS catalog_aliases (
-                    provider TEXT NOT NULL, external_id TEXT NOT NULL, skill_id TEXT NOT NULL,
-                    payload TEXT, PRIMARY KEY (provider, external_id)
-                );
-                CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
-                    skill_id UNINDEXED, name, description, tags, author, tokenize='unicode61'
-                );
-            """)
-            if "author" not in {row["name"] for row in db.execute("PRAGMA table_info(skills_fts)")}:
-                db.execute("BEGIN IMMEDIATE")
-                db.execute("DROP TABLE skills_fts")
-                db.execute("CREATE VIRTUAL TABLE skills_fts USING fts5("
-                           "skill_id UNINDEXED,name,description,tags,author,tokenize='unicode61')")
-                db.execute(
-                    "INSERT INTO skills_fts SELECT id,name,json_extract(data,'$.description'),"
-                    "(SELECT group_concat(value,' ') FROM json_each(data,'$.tags')),"
-                    "json_extract(data,'$.author') FROM catalog_skills"
-                )
+        self.engine = create_database(self.path, "catalog")
+        # Each operation owns its session, including worker-thread searches.
+        self.sessions = sessionmaker(self.engine, expire_on_commit=False)
 
-    @contextmanager
-    def connect(self):
-        # Every operation owns its connection, including worker-thread searches.
-        db = sqlite3.connect(self.path, timeout=30)
-        db.row_factory = sqlite3.Row
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
-
-    def seed(self, path=BUNDLED_CATALOG):
-        path = Path(path)
-        if not path.exists():
-            return
-        skills = [Skill.model_validate(row) for row in json.loads(path.read_text())["skills"]]
-        if len({skill.id for skill in skills}) != len(skills):
-            raise ValueError("Catalog has duplicate skill IDs.")
-        for skill in skills:
-            self.upsert(skill)
+    def close(self):
+        self.engine.dispose()
 
     def upsert(self, skill, *, provider_id=None, raw=None, source_updated_at=None):
-        text = retrieval_text(skill)
-        text_hash = hashlib.sha256(text.encode()).hexdigest()
+        content = retrieval_text(skill)
+        text_hash = hashlib.sha256(content.encode()).hexdigest()
         payload = skill.model_dump_json(by_alias=True)
         source_updated_at = str(source_updated_at) if source_updated_at is not None else None
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            previous = db.execute(
-                "SELECT * FROM catalog_skills WHERE id=?", (skill.id,)
-            ).fetchone()
+        with self.sessions.begin() as session:
+            # Serialize the read/modify/write decision and its FTS update across writers.
+            session.connection(execution_options={"sqlite_begin_mode": "IMMEDIATE"})
+            previous = session.get(CatalogSkillRecord, skill.id)
             if provider_id is not None:
-                db.execute(
-                    "INSERT INTO catalog_aliases VALUES (?,?,?,?) "
-                    "ON CONFLICT(provider, external_id) DO UPDATE SET "
-                    "skill_id=excluded.skill_id,payload=excluded.payload",
-                    ("skillsmp", provider_id, skill.id, json.dumps(raw, ensure_ascii=False)),
+                statement = insert(CatalogAliasRecord).values(
+                    provider="skillsmp", external_id=provider_id, skill_id=skill.id,
+                    payload=json.dumps(raw, ensure_ascii=False),
                 )
-            if previous and previous["provenance"] == "bundled" and skill.provenance != "bundled":
+                session.execute(statement.on_conflict_do_update(
+                    index_elements=["provider", "external_id"],
+                    set_={"skill_id": statement.excluded.skill_id,
+                          "payload": statement.excluded.payload},
+                ))
+            if previous and previous.provenance == "bundled" and skill.provenance != "bundled":
                 return "unchanged"
-            if previous and previous["data"] == payload and previous["source_updated_at"] == source_updated_at:
+            if previous and previous.data == payload and previous.source_updated_at == source_updated_at:
                 return "unchanged"
-            db.execute(
-                "INSERT INTO catalog_skills VALUES (?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET data=excluded.data,provenance=excluded.provenance,"
-                "name=excluded.name,category=excluded.category,compatibility=excluded.compatibility,"
-                "retrieval_text=excluded.retrieval_text,text_hash=excluded.text_hash,"
-                "source_updated_at=excluded.source_updated_at",
-                (skill.id, payload, skill.provenance, skill.name, skill.category,
-                 json.dumps(skill.compatibility) if skill.compatibility is not None else None,
-                 text, text_hash, source_updated_at),
+            record = previous or CatalogSkillRecord(id=skill.id)
+            record.data = payload
+            record.provenance = skill.provenance
+            record.name = skill.name
+            record.category = skill.category
+            record.compatibility = (
+                json.dumps(skill.compatibility) if skill.compatibility is not None else None
             )
-            db.execute("DELETE FROM skills_fts WHERE skill_id=?", (skill.id,))
-            db.execute(
-                "INSERT INTO skills_fts VALUES (?,?,?,?,?)",
-                (skill.id, skill.name, skill.description, " ".join(skill.tags), skill.author),
-            )
+            record.retrieval_text = content
+            record.text_hash = text_hash
+            record.source_updated_at = source_updated_at
+            session.add(record)
+            session.flush()
+            session.execute(text("DELETE FROM skills_fts WHERE skill_id=:id"), {"id": skill.id})
+            session.execute(text(
+                "INSERT INTO skills_fts (skill_id,name,description,tags,author) "
+                "VALUES (:id,:name,:description,:tags,:author)"
+            ), {"id": skill.id, "name": skill.name, "description": skill.description,
+                "tags": " ".join(skill.tags), "author": skill.author})
         return "updated" if previous else "added"
 
     def get(self, skill_id):
-        with self.connect() as db:
-            row = db.execute("SELECT data FROM catalog_skills WHERE id=?", (skill_id,)).fetchone()
-        return Skill.model_validate_json(row[0]) if row else None
+        with self.sessions() as session:
+            row = session.get(CatalogSkillRecord, skill_id)
+            return Skill.model_validate_json(row.data) if row else None
 
     def get_many(self, ids):
         ids = list(dict.fromkeys(ids))
         found = {}
-        with self.connect() as db:
+        with self.sessions() as session:
             for start in range(0, len(ids), 500):
                 batch = ids[start:start + 500]
-                rows = db.execute(
-                    "SELECT id,data FROM catalog_skills WHERE id IN ("
-                    + ",".join("?" for _ in batch) + ")", batch,
-                )
-                found.update((row["id"], Skill.model_validate_json(row["data"])) for row in rows)
+                rows = session.execute(select(CatalogSkillRecord.id, CatalogSkillRecord.data).where(
+                    CatalogSkillRecord.id.in_(batch)
+                ))
+                found.update((row.id, Skill.model_validate_json(row.data)) for row in rows)
         return [found[skill_id] for skill_id in ids if skill_id in found]
 
     def count(self):
-        with self.connect() as db:
-            return db.execute("SELECT count(*) FROM catalog_skills").fetchone()[0]
+        with self.sessions() as session:
+            return session.scalar(select(func.count()).select_from(CatalogSkillRecord))
 
     def page(self, *, q="", category=None, offset=0, limit=50):
         match = keyword_query(q)
-        clauses, params = [], []
-        join, order = "", "s.name COLLATE NOCASE,s.id"
+        statement = select(CatalogSkillRecord.data)
+        order = (CatalogSkillRecord.name.collate("NOCASE"), CatalogSkillRecord.id)
+        params = {}
         if q.strip():
             if not match:
-                clauses.append("0")
+                statement = statement.where(False)
             else:
-                join = " JOIN skills_fts ON skills_fts.skill_id=s.id"
-                clauses.append("skills_fts MATCH ?")
-                params.append(match)
-                order = "bm25(skills_fts,0,4,1,2,2),s.rowid"
+                statement = statement.join(
+                    skills_fts, skills_fts.c.skill_id == CatalogSkillRecord.id,
+                ).where(text("skills_fts MATCH :match"))
+                params["match"] = match
+                order = (literal_column("bm25(skills_fts,0,4,1,2,2)"),
+                         literal_column("catalog_skills.rowid"))
         if category:
-            clauses.append("s.category=?")
-            params.append(category)
-        base = " FROM catalog_skills s" + join
-        if clauses:
-            base += " WHERE " + " AND ".join(clauses)
-        with self.connect() as db:
-            total = db.execute("SELECT count(*)" + base, params).fetchone()[0]
-            rows = db.execute(
-                "SELECT s.data" + base + " ORDER BY " + order + " LIMIT ? OFFSET ?",
-                [*params, limit, offset],
-            ).fetchall()
-            categories = [row[0] for row in db.execute(
-                "SELECT DISTINCT category FROM catalog_skills ORDER BY category"
-            )]
+            statement = statement.where(CatalogSkillRecord.category == category)
+        with self.sessions() as session:
+            total = session.scalar(select(func.count()).select_from(statement.subquery()), params)
+            rows = session.scalars(
+                statement.order_by(*order).limit(limit).offset(offset), params,
+            ).all()
+            categories = session.scalars(select(CatalogSkillRecord.category).distinct().order_by(
+                CatalogSkillRecord.category
+            )).all()
         return Catalog(
-            skills=[Skill.model_validate_json(row[0]) for row in rows], categories=categories,
+            skills=[Skill.model_validate_json(row) for row in rows], categories=categories,
             total=total, has_more=offset + len(rows) < total,
         )
 
@@ -187,18 +153,26 @@ class CatalogStore:
         match = keyword_query(query)
         if not match:
             return []
-        with self.connect() as db:
-            db.execute("CREATE TEMP TABLE exclusions(id TEXT PRIMARY KEY)")
-            db.executemany("INSERT OR IGNORE INTO exclusions VALUES (?)", ((x,) for x in excluded))
-            rows = db.execute(
-                "SELECT s.data FROM skills_fts JOIN catalog_skills s ON s.id=skills_fts.skill_id "
-                "WHERE skills_fts MATCH ? AND NOT EXISTS (SELECT 1 FROM exclusions e WHERE e.id=s.id) "
-                "AND (? IS NULL OR s.compatibility IS NULL OR EXISTS "
-                "(SELECT 1 FROM json_each(s.compatibility) WHERE value=?)) "
-                "ORDER BY bm25(skills_fts,0,4,1,2,2),s.rowid LIMIT ?",
-                (match, agent, agent, limit),
-            ).fetchall()
-        return [Skill.model_validate_json(row[0]) for row in rows]
+        statement = select(CatalogSkillRecord.data).join(
+            skills_fts, skills_fts.c.skill_id == CatalogSkillRecord.id,
+        ).where(text("skills_fts MATCH :match"))
+        excluded = list(excluded)
+        if excluded:
+            # One JSON parameter avoids SQLite's parameter limit and connection-local temp state.
+            exclusions = func.json_each(json.dumps(excluded)).table_valued("value")
+            statement = statement.where(CatalogSkillRecord.id.not_in(select(exclusions.c.value)))
+        if agent is not None:
+            compatibility = func.json_each(CatalogSkillRecord.compatibility).table_valued("value")
+            statement = statement.where(or_(
+                CatalogSkillRecord.compatibility.is_(None),
+                select(compatibility.c.value).where(compatibility.c.value == agent).exists(),
+            ))
+        with self.sessions() as session:
+            rows = session.scalars(statement.order_by(
+                literal_column("bm25(skills_fts,0,4,1,2,2)"),
+                literal_column("catalog_skills.rowid"),
+            ).limit(limit), {"match": match}).all()
+        return [Skill.model_validate_json(row) for row in rows]
 
     def eligible(self, ids, *, agent=None, excluded=()):
         excluded = set(excluded)

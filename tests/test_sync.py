@@ -5,8 +5,10 @@ from itertools import pairwise
 
 import httpx
 import pytest
+from sqlalchemy import func, select
 
 from skinder.catalog import CatalogStore, stable_id
+from skinder.orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
 from skinder.sync import Sync, import_skill, sync_status
 
 
@@ -54,8 +56,9 @@ def catalog(tmp_path):
 
 def test_status_read_does_not_create_sync_state(catalog):
     assert sync_status(catalog) is None
-    with catalog.connect() as db:
-        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_run'").fetchone()
+    with catalog.sessions() as session:
+        assert session.get(SyncRunRecord, 1) is None
+        assert session.scalar(select(func.count()).select_from(SyncPartitionRecord)) == 0
 
 
 def test_overlapping_partitions_preserve_id_metadata_and_category(catalog):
@@ -169,10 +172,10 @@ def test_bundled_data_wins_and_alias_is_recorded(catalog):
     catalog.upsert(bundled)
     run(catalog, Provider(lambda _: page([skill_row()])))
     assert catalog.get(bundled.id) == bundled
-    with catalog.connect() as db:
-        alias = db.execute("SELECT skill_id,payload FROM catalog_aliases WHERE external_id='one'").fetchone()
-    assert alias["skill_id"] == bundled.id
-    assert json.loads(alias["payload"])["description"] == skill_row()["description"]
+    with catalog.sessions() as session:
+        alias = session.get(CatalogAliasRecord, ("skillsmp", "one"))
+        assert alias.skill_id == bundled.id
+        assert json.loads(alias.payload)["description"] == skill_row()["description"]
 
 
 @pytest.mark.parametrize("path", ["SKILL.md", "skills/one/SKILL.md", "skills/one"])
@@ -228,8 +231,8 @@ def test_capped_expansion_only_enqueues_newly_discovered_values(catalog):
     sync = Sync(catalog, provider.client, sleep=lambda _: None)
     sync.state["discovered"]["language"] = ["en"]
     key = json.dumps({"filters": {}, "sort": "stars"}, sort_keys=True)
-    with catalog.connect() as db:
-        data = json.loads(db.execute("SELECT data FROM sync_partitions WHERE key=?", (key,)).fetchone()[0])
+    with catalog.sessions() as session:
+        data = json.loads(session.get(SyncPartitionRecord, key).data)
     sync.page(key, data)
     # An unchanged expansion must do no queue writes, even on subsequent capped pages.
     original = sync.enqueue
@@ -239,8 +242,8 @@ def test_capped_expansion_only_enqueues_newly_discovered_values(catalog):
     assert sync.expand(data) is False
     sync.enqueue = original
     sync.add_filter("language", "ko")
-    with catalog.connect() as db:
-        queued = [json.loads(row[0]) for row in db.execute("SELECT data FROM sync_partitions")]
+    with catalog.sessions() as session:
+        queued = [json.loads(data) for data in session.scalars(select(SyncPartitionRecord.data))]
     assert any(row["filters"] == {"language": "ko"} for row in queued)
     root = next(row for row in queued if row["filters"] == {} and row["sort"] == "stars")
     assert root["expanded_values"] == 2
@@ -283,7 +286,6 @@ def test_cli_exit_codes_and_indexing_after_pause(catalog, monkeypatch, tmp_path,
         assert "Skinder" in kwargs["headers"]["User-Agent"]
         return provider.client
     monkeypatch.setattr(module.httpx, "Client", client)
-    monkeypatch.setattr(CatalogStore, "seed", lambda _: None)
     marker = tmp_path / "indexed"
     def index(catalog, *, allow_download):
         marker.write_text(str(catalog.count()))

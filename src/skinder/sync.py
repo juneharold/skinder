@@ -13,9 +13,12 @@ from html.parser import HTMLParser
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
+from sqlalchemy import Integer, cast, delete, func, literal_column, or_, select, update
+from sqlalchemy.dialects.sqlite import insert
 
 from .catalog import CatalogStore, default_catalog_path, stable_id
 from .models import InstallCommands, Skill
+from .orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
 
 BASE = "https://skillsmp.com"
 TAXONOMY_LIMIT = 1000
@@ -28,29 +31,31 @@ def now():
 
 
 def sync_status(catalog):
-    """Read existing state without initializing or mutating sync tables."""
-    with catalog.connect() as db:
-        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='sync_run'").fetchone():
-            return None
-        row = db.execute("SELECT data FROM sync_run WHERE id=1").fetchone()
+    """Read existing state without initializing or mutating a sync run."""
+    with catalog.sessions() as session:
+        row = session.get(SyncRunRecord, 1)
         if not row:
             return None
-        state = json.loads(row[0])
-        imported_unique = db.execute(
-            "SELECT count(DISTINCT skill_id) FROM catalog_aliases WHERE provider='skillsmp'"
-        ).fetchone()[0]
-        rows = db.execute("SELECT status,count(*) AS n FROM sync_partitions GROUP BY status").fetchall()
-        diagnostics = [json.loads(row[0]) for row in db.execute(
-            "SELECT data FROM sync_partitions WHERE status='unresolved' "
-            "OR json_extract(data,'$.capped')=1 OR json_extract(data,'$.error') IS NOT NULL "
-            "ORDER BY rowid LIMIT 50"
-        )]
-        capped, failed = db.execute(
-            "SELECT coalesce(sum(json_extract(data,'$.capped')),0),"
-            "coalesce(sum(json_extract(data,'$.error') IS NOT NULL),0) FROM sync_partitions"
-        ).fetchone()
+        state = json.loads(row.data)
+        imported_unique = session.scalar(select(func.count(
+            CatalogAliasRecord.skill_id.distinct()
+        )).where(CatalogAliasRecord.provider == "skillsmp"))
+        rows = session.execute(select(
+            SyncPartitionRecord.status, func.count().label("n"),
+        ).group_by(SyncPartitionRecord.status)).all()
+        capped_value = func.json_extract(SyncPartitionRecord.data, "$.capped")
+        has_error = func.json_extract(SyncPartitionRecord.data, "$.error").is_not(None)
+        diagnostics = [json.loads(data) for data in session.scalars(select(
+            SyncPartitionRecord.data,
+        ).where(or_(
+            SyncPartitionRecord.status == "unresolved", capped_value == 1, has_error,
+        )).order_by(literal_column("sync_partitions.rowid")).limit(50))]
+        capped, failed = session.execute(select(
+            func.coalesce(func.sum(capped_value), 0),
+            func.coalesce(func.sum(cast(has_error, Integer)), 0),
+        )).one()
     counts = {key: 0 for key in ("pending", "completed", "unresolved", "failed", "capped")}
-    counts.update((row["status"], row["n"]) for row in rows)
+    counts.update((row.status, row.n) for row in rows)
     counts.update(capped=capped, failed=failed)
     return {key: value for key, value in state.items() if key not in (
         "discovery_pending", "discovery_seen", "discovered",
@@ -169,17 +174,11 @@ class Sync:
         self.catalog, self.client = catalog, client
         self.max_requests, self.sleep, self.monotonic = max_requests, sleep, monotonic
         self.calls, self.last_call = 0, None
-        with catalog.connect() as db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS sync_run (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS sync_partitions (
-                    key TEXT PRIMARY KEY, status TEXT NOT NULL, data TEXT NOT NULL
-                );
-            """)
-            row = db.execute("SELECT data FROM sync_run WHERE id=1").fetchone()
-            self.state = json.loads(row[0]) if row else None
+        with catalog.sessions.begin() as session:
+            row = session.get(SyncRunRecord, 1)
+            self.state = json.loads(row.data) if row else None
             if not self.state or self.state["status"] == "completed":
-                db.execute("DELETE FROM sync_partitions")
+                session.execute(delete(SyncPartitionRecord))
                 self.state = {
                     "status": "running", "started_at": now(), "updated_at": now(),
                     "requests": 0, "added": 0, "updated": 0, "duplicates": 0, "invalid": 0,
@@ -192,20 +191,22 @@ class Sync:
 
     def save(self):
         self.state["updated_at"] = now()
-        with self.catalog.connect() as db:
-            db.execute("INSERT OR REPLACE INTO sync_run VALUES (1,?)", (json.dumps(self.state),))
+        with self.catalog.sessions.begin() as session:
+            session.merge(SyncRunRecord(id=1, data=json.dumps(self.state)))
 
     def enqueue(self, filters, sort="stars"):
         key = json.dumps({"filters": filters, "sort": sort}, sort_keys=True)
         data = {"filters": filters, "sort": sort, "page": 1, "fingerprints": [], "capped": False}
-        with self.catalog.connect() as db:
-            db.execute("INSERT OR IGNORE INTO sync_partitions VALUES (?, 'pending', ?)",
-                       (key, json.dumps(data)))
+        with self.catalog.sessions.begin() as session:
+            session.execute(insert(SyncPartitionRecord).values(
+                key=key, status="pending", data=json.dumps(data),
+            ).on_conflict_do_nothing(index_elements=["key"]))
 
     def checkpoint(self, key, data, status="pending"):
-        with self.catalog.connect() as db:
-            db.execute("UPDATE sync_partitions SET status=?,data=? WHERE key=?",
-                       (status, json.dumps(data), key))
+        with self.catalog.sessions.begin() as session:
+            session.execute(update(SyncPartitionRecord).where(
+                SyncPartitionRecord.key == key
+            ).values(status=status, data=json.dumps(data)))
         self.save()
 
     def request(self, path, params=None):
@@ -294,16 +295,17 @@ class Sync:
             self.state["discovered"][kind].append(value)
             self.enqueue({kind: value})
             # Newly found filters must also refine capped groups discovered earlier.
-            with self.catalog.connect() as db:
-                partitions = db.execute(
-                    "SELECT key,data FROM sync_partitions WHERE json_extract(data,'$.capped')=1"
-                ).fetchall()
+            with self.catalog.sessions() as session:
+                partitions = session.execute(select(
+                    SyncPartitionRecord.key, SyncPartitionRecord.data,
+                ).where(func.json_extract(SyncPartitionRecord.data, "$.capped") == 1)).all()
             for row in partitions:
-                data = json.loads(row["data"])
+                data = json.loads(row.data)
                 if self.expand(data):
-                    with self.catalog.connect() as db:
-                        db.execute("UPDATE sync_partitions SET data=? WHERE key=?",
-                                   (json.dumps(data), row["key"]))
+                    with self.catalog.sessions.begin() as session:
+                        session.execute(update(SyncPartitionRecord).where(
+                            SyncPartitionRecord.key == row.key
+                        ).values(data=json.dumps(data)))
 
     def warn(self, message):
         if message not in self.state["warnings"]:
@@ -400,10 +402,14 @@ class Sync:
             )):
                 self.discover()
             while True:
-                with self.catalog.connect() as db:
-                    partition = db.execute("SELECT key,data FROM sync_partitions WHERE status='pending' ORDER BY rowid LIMIT 1").fetchone()
+                with self.catalog.sessions() as session:
+                    partition = session.execute(select(
+                        SyncPartitionRecord.key, SyncPartitionRecord.data,
+                    ).where(SyncPartitionRecord.status == "pending").order_by(
+                        literal_column("sync_partitions.rowid")
+                    ).limit(1)).first()
                 if partition:
-                    self.page(partition["key"], json.loads(partition["data"]))
+                    self.page(partition.key, json.loads(partition.data))
                 if self.state["discovery_pending"]:
                     self.discover()
                 elif not partition:
@@ -448,7 +454,6 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             parser.exit(1, "Another catalog sync/index writer is active.\n")
-        catalog.seed()
         result = {}
         if not args.index_only:
             try:

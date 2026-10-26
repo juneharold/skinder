@@ -1,5 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
+from sqlalchemy import func, select
+
 from skinder.catalog import CatalogStore, stable_id
 from skinder.models import Skill
+from skinder.orm import CatalogAliasRecord
 
 
 def example_skill(number, **changes):
@@ -56,8 +62,8 @@ def test_repeat_import_updates_search_and_preserves_bundled_evidence(tmp_path):
     store.upsert(original, provider_id="upstream", raw={"description": "Apple orchards"})
     assert store.get(original.id).workflow == ["Reviewed method"]
     assert store.get(original.id).description == "Orange orchards"
-    with store.connect() as db:
-        assert db.execute("SELECT count(*) FROM catalog_aliases").fetchone()[0] == 1
+    with store.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(CatalogAliasRecord)) == 1
 
 
 def test_ids_match_bundled_directory_identity_and_survive_revision():
@@ -69,13 +75,33 @@ def test_ids_match_bundled_directory_identity_and_survive_revision():
     )
 
 
-def test_existing_keyword_index_is_migrated_without_losing_catalog(tmp_path):
+def test_keyword_exclusions_are_bounded_and_do_not_leak_between_sessions(tmp_path):
     store = CatalogStore(tmp_path / "catalog.sqlite3")
-    store.upsert(example_skill(1, author="MaintainerAlice", description="Database backups"))
-    with store.connect() as db:
-        db.execute("DROP TABLE skills_fts")
-        db.execute("CREATE VIRTUAL TABLE skills_fts USING fts5(skill_id UNINDEXED,name,description,tags)")
+    store.upsert(example_skill(1, description="Database backups"))
+    excluded = [f"missing-{number}" for number in range(40_000)] + ["example-1"]
+    assert store.keyword_search("backups", excluded=excluded) == []
+    assert [skill.id for skill in store.keyword_search("backups")] == ["example-1"]
+    store.close()
     reopened = CatalogStore(store.path)
-    assert reopened.count() == 1
-    assert [s.id for s in reopened.page(q="MaintainerAlice").skills] == ["example-1"]
-    assert [s.id for s in reopened.keyword_search("backups")] == ["example-1"]
+    assert reopened.get("example-1").description == "Database backups"
+    assert [skill.id for skill in reopened.keyword_search("backups")] == ["example-1"]
+
+
+def test_concurrent_imports_keep_one_skill_and_all_aliases(tmp_path):
+    store = CatalogStore(tmp_path / "catalog.sqlite3")
+    skill = example_skill(1, description="Database backups")
+    ready = Barrier(8)
+
+    def import_alias(number):
+        ready.wait()
+        return store.upsert(skill, provider_id=f"provider-{number}")
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        outcomes = list(workers.map(import_alias, range(8)))
+
+    assert outcomes.count("added") == 1
+    assert outcomes.count("unchanged") == 7
+    assert store.count() == 1
+    assert [result.id for result in store.keyword_search("backups")] == [skill.id]
+    with store.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(CatalogAliasRecord)) == 8

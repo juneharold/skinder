@@ -152,6 +152,18 @@ def recommendation(skill_id):
     return {"skill_id": skill_id, "task_fit": "Task fit", "taste_fit": "Style fit", "caveat": None}
 
 
+async def test_feedback_accepts_recommendations_from_an_earlier_batch(backend):
+    async with backend.client() as client:
+        first = await match(client)
+        backend.configure(result={"recommendations": [recommendation("skill-3")]})
+        continued = await match(client, session_id=first["id"])
+        assert [item["skill_id"] for item in continued["recommendations"]] == ["skill-3"]
+        decision = await feedback(client, continued, "skill-0")
+        restored = (await client.get(f"/api/matches/{first['id']}")).json()
+        assert restored["feedback"] == [decision]
+        assert (await client.get("/api/saved")).json()["items"][0]["skill"]["id"] == "skill-0"
+
+
 @pytest.mark.parametrize(
     "result",
     [
@@ -232,11 +244,12 @@ async def test_timeout_reaps_child_and_failed_process_does_not_leak_credentials(
         assert "secret-that-must-not-leak" not in json.dumps(failed)
 
 
-async def test_restart_marks_inflight_failed_without_repeating(backend):
+@pytest.mark.parametrize("status", ["pending", "running"])
+async def test_restart_marks_inflight_failed_without_repeating(backend, status):
     async with backend.client() as client:
         first = await match(client)
     with sqlite3.connect(backend.db_path) as db:
-        db.execute("UPDATE sessions SET status='running' WHERE id=?", (first["id"],))
+        db.execute("UPDATE sessions SET status=? WHERE id=?", (status, first["id"]))
     (backend.root / "request.json").unlink()
     async with backend.client() as client:
         restored = (await client.get("/api/matches/current")).json()
@@ -519,42 +532,3 @@ async def test_matching_blocks_only_new_feedback_and_undo_for_that_session(backe
             db.execute("UPDATE sessions SET status='running' WHERE id=?", (session["id"],))
         await client.post(f"/api/matches/{session['id']}/cancel")
         assert (await client.delete(f"/api/feedback/{decision['id']}")).status_code == 200
-
-
-async def test_populated_legacy_bookmarks_migrate_without_changing_other_data(backend):
-    async with backend.client() as client:
-        session = await match(client)
-        first = await feedback(client, session)
-        second = await feedback(client, session, "skill-1")
-        profile = (await client.get("/api/profile")).json()
-        profile["communication"] = "concise"
-        await client.put("/api/profile", json=profile)
-        saved = (await client.get("/api/saved")).json()
-    with sqlite3.connect(backend.db_path) as db:
-        db.executescript("""
-            BEGIN;
-            ALTER TABLE bookmarks RENAME TO bookmarks_nullable;
-            CREATE TABLE bookmarks (
-                skill_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, feedback_id TEXT NOT NULL
-            );
-            INSERT INTO bookmarks SELECT * FROM bookmarks_nullable;
-            DROP TABLE bookmarks_nullable;
-            COMMIT;
-        """)
-        tables = ["profile", "sessions", "session_skills", "feedback", "bookmarks"]
-        before = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
-    async with backend.client() as client:
-        assert (await client.get("/api/saved")).json() == saved
-        assert (await client.get("/api/profile")).json() == profile
-        with sqlite3.connect(backend.db_path) as db:
-            after = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
-        assert after == before
-        # A migrated deck bookmark can become independent without changing its timestamp.
-        assert (await client.put("/api/saved/skill-0")).json() == saved
-        await client.delete(f"/api/feedback/{first['id']}")
-        remaining = (await client.delete(f"/api/feedback/{second['id']}")).json()
-        assert remaining == {
-            "items": [item for item in saved["items"] if item["skill"]["id"] == "skill-0"]
-        }
-    async with backend.client() as client:
-        assert (await client.get("/api/saved")).json() == remaining

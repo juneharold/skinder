@@ -1,9 +1,11 @@
 import json
 
+import httpx
 import pytest
 from test_api import match
 from test_catalog_store import example_skill
 
+from skinder.app import create_app
 from skinder.catalog import CatalogStore
 from skinder.retrieval import HybridRetriever
 from skinder.sources import match_metadata
@@ -12,6 +14,27 @@ from skinder.sources import match_metadata
 class MetadataOnly:
     async def enrich(self, skills):
         return [match_metadata(skill) for skill in skills]
+
+
+@pytest.mark.asyncio
+async def test_fresh_catalog_can_be_browsed_and_matched_before_import(tmp_path, monkeypatch):
+    monkeypatch.setattr("skinder.matcher.shutil.which", lambda name: None)
+    app = create_app(
+        db_path=tmp_path / "state.sqlite3", catalog_db_path=tmp_path / "catalog.sqlite3"
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8742"
+        ) as client,
+    ):
+        response = await client.get("/api/catalog")
+        assert response.status_code == 200
+        assert response.json() == {"skills": [], "categories": [], "total": 0, "has_more": False}
+        session = await match(client)
+        assert session["status"] == "completed"
+        assert session["recommendations"] == []
+        assert session["error"] is None
 
 
 @pytest.mark.asyncio

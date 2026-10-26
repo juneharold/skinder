@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, Check, SlidersHorizontal } from "lucide-react";
+import { ArrowRight, Check } from "lucide-react";
 import type { Profile } from "../lib/types";
 import Dialog from "./Dialog";
 
@@ -78,9 +78,6 @@ export default function Preferences({
       onClose={onClose}
       className="preferences-dialog"
     >
-      <div className="dialog-title-icon">
-        <SlidersHorizontal size={25} />
-      </div>
       <h2>Make it your kind of work.</h2>
       <p className="muted">
         The right skill should fit how you like to work, too. Everything here is

@@ -34,13 +34,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def create_app(
-    *, db_path=None, catalog_path=None, catalog_db_path=None, matcher=None,
+    *, db_path=None, catalog_db_path=None, matcher=None,
     frontend_path=None, retriever=None, enricher=None,
 ):
     db_path = Path(
         db_path or os.environ.get("SKINDER_DB_PATH", str(ROOT / ".data" / "skinder.sqlite3"))
     )
-    catalog_path = Path(catalog_path or Path(__file__).parent / "data" / "catalog.json")
     catalog_db_path = Path(catalog_db_path or os.environ.get(
         "SKINDER_CATALOG_DB_PATH", db_path.with_name("catalog.sqlite3")
     ))
@@ -58,7 +57,6 @@ def create_app(
         nonlocal store, catalog, search, sources
         store = Store(db_path)
         catalog = CatalogStore(catalog_db_path)
-        catalog.seed(catalog_path)
         search = retriever or HybridRetriever(catalog)
         sources = enricher or SourceEnricher(catalog)
         app.state.store = store
@@ -74,6 +72,7 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError):
                     await active_task
             store.close()
+            catalog.close()
 
     app = FastAPI(
         title="Skinder API",

@@ -3,9 +3,11 @@ import json
 
 import httpx
 import pytest
+from sqlalchemy import func, select
 from test_catalog_store import example_skill
 
 from skinder.catalog import CatalogStore
+from skinder.orm import SourceCacheRecord
 from skinder.sources import MAX_FILE_BYTES, MAX_PROMPT_CHARS, SourceEnricher, bounded_request
 
 
@@ -27,8 +29,8 @@ async def test_sources_are_cached_and_invalidated_by_provider_update(tmp_path):
     transport = httpx.MockTransport(lambda request: httpx.Response(200, text=new_content))
     result = await SourceEnricher(store, transport=transport).enrich([skill])
     assert result[0]["source_excerpt"] == new_content
-    with store.connect() as db:
-        assert db.execute("SELECT source_updated_at FROM source_cache").fetchone()[0] == "200"
+    with store.sessions() as session:
+        assert session.scalar(select(SourceCacheRecord.source_updated_at)) == "200"
 
 
 @pytest.mark.asyncio
@@ -51,8 +53,8 @@ async def test_source_failures_oversize_and_redirects_keep_metadata_without_inve
     assert [row["id"] for row in result] == [skill.id for skill in skills]
     assert all(row["source_status"] == "unavailable" for row in result)
     assert all(row["compatibility"] is None and not row["evidence"] for row in result)
-    with store.connect() as db:
-        assert db.execute("SELECT count(*) FROM source_cache").fetchone()[0] == 0
+    with store.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(SourceCacheRecord)) == 0
 
 
 @pytest.mark.asyncio

@@ -915,9 +915,6 @@ kbd {
   font-size: 15px;
   line-height: 1.65;
 }
-.dialog-title-icon {
-  display: none;
-}
 .preference-group {
   margin: 27px 0;
   padding: 0;
@@ -1631,12 +1628,6 @@ kbd {
   font-size: 12px;
   padding: 9px 11px;
 }
-.progress-sidebar .eyebrow,
-.catalog-top .eyebrow,
-.tag-row span,
-.welcome-intro .eyebrow,
-.fit-section h3,
-.site-footer,
 .connection {
   font-size: 12px;
 }

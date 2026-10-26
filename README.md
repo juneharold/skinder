@@ -13,14 +13,19 @@ codex login status
 # If needed:
 codex login
 
-bash scripts/start.sh
+uv sync --frozen
+npm --prefix frontend ci
+npm --prefix frontend run build
+uv run skinder
 ```
 
-Open **http://127.0.0.1:8742**. The start script installs locked dependencies, builds the frontend, and runs the Python backend. After the first build, start again with:
+Open **http://127.0.0.1:8742**. These commands install locked dependencies, build the frontend, and run the Python backend. After the first build, start again with:
 
 ```sh
 uv run skinder
 ```
+
+A fresh catalog starts empty. Run `uv run best-effort-full-sync` in another terminal to import skills, as described below.
 
 Catalog browsing, source inspection, and saved skills work without a Codex login. New recommendations use your existing Codex allowance. Skinder does not collect your login credentials or require an API key. Retrieval and embeddings run locally; matching sends only the shortlisted descriptions, source excerpts, task, preferences, and relevant feedback to Codex's model provider.
 
@@ -47,7 +52,7 @@ Each match combines keyword and vector rankings into at most 40 candidates. Impo
 
 ## What is included
 
-- A pinned catalog of real skills from multiple maintainers, across development, design, writing, research, documents, data, productivity, and marketing.
+- A persistent local catalog of skills imported from SkillsMP, with search and category filters.
 - Separate explanations for task fit and working-style fit, with setup and style caveats when relevant.
 - Swipe gestures, labeled pass/save buttons, keyboard controls while reviewing the deck (left/right arrows, Z to undo), and an optional reason for passing.
 - Bookmarks from the deck, catalog, or skill details, with search, category filters, source evidence, and copyable installation instructions.
@@ -61,18 +66,42 @@ Style descriptions are interpretations of source instructions, not measured perf
 
 ## Development
 
+After installing dependencies as above, start the backend from the project root:
+
 ```sh
-bash scripts/dev.sh
+uv run uvicorn skinder.app:create_app --factory --host 127.0.0.1 --port 8742 --reload
+```
+
+In another terminal, start the frontend:
+
+```sh
+npm --prefix frontend run dev
 ```
 
 The React frontend runs at **http://127.0.0.1:5174**, with API requests proxied to FastAPI on port 8742. The backend reloads when Python files change. Do not run the production and development backends on the same port at once.
 
-The backend uses FastAPI, Pydantic, Python's `sqlite3`, and an asynchronous Codex subprocess. The frontend uses React, TypeScript, Vite, and locally bundled fonts. There is no runtime dependency on Agentinder.
+The backend uses FastAPI, Pydantic, SQLAlchemy ORM, Alembic, and an asynchronous Codex subprocess. SQLite remains the database engine. The frontend uses React, TypeScript, Vite, and locally bundled fonts.
 
-Pydantic models define the API contract. After changing them, regenerate the frontend types:
+Database records are mapped in `src/skinder/orm.py`; Pydantic models remain the API contract. Each database operation uses its own SQLAlchemy session. Alembic owns schema creation, indexes, and triggers, with separate migration histories for personal state and the catalog. Startup and catalog commands automatically apply pending migrations. SQLite FTS5 search uses SQLAlchemy expressions and parameterized SQL for its virtual table.
+
+To manage migrations explicitly:
 
 ```sh
-uv run python scripts/export_openapi.py docs/openapi.json
+uv run alembic upgrade head
+uv run alembic -n catalog upgrade head
+uv run alembic check
+uv run alembic -n catalog check
+
+# After changing ORM models, generate and review a migration for the affected database.
+uv run alembic revision --autogenerate -m "Describe personal state change"
+uv run alembic -n catalog revision --autogenerate -m "Describe catalog change"
+```
+
+`SKINDER_DB_PATH` selects the personal database and `SKINDER_CATALOG_DB_PATH` selects the catalog for these commands. Migration files live under `src/skinder/migrations/state/versions` and `src/skinder/migrations/catalog/versions`. This switch starts with fresh databases; the old unversioned schema is not migrated.
+
+Pydantic models define the API contract. FastAPI serves interactive documentation at **http://127.0.0.1:8742/docs** and the schema at **http://127.0.0.1:8742/openapi.json**. After changing the models, restart the backend (or use development reload), then regenerate the frontend types from the running backend:
+
+```sh
 npm --prefix frontend run api:types
 ```
 
@@ -84,38 +113,14 @@ npm --prefix frontend test
 npm --prefix frontend run build
 ```
 
-Backend tests use real temporary SQLite databases and subprocesses that simulate the external Codex boundary. Automated checks do not consume model usage. Frontend tests exercise user interactions. Live evaluation is separate and uses your signed-in Codex allowance.
+Backend tests use real temporary SQLite databases and subprocesses that simulate the external Codex boundary. Automated checks do not consume model usage. Frontend tests exercise user interactions.
 
-The [hybrid retrieval results](evaluation/hybrid-retrieval-results.json) record a bounded live import of 96 distinct SkillsMP entries, cached source retrieval, a real Codex recommendation, and a 100,000-vector synthetic benchmark. This validates the implemented flow, not complete provider coverage or general recommendation quality. To repeat the index benchmark without model or provider calls:
-
-```sh
-uv run python scripts/benchmark_retrieval.py --count 100000 --queries 100 --output .data/retrieval-benchmark.json
-```
-
-The [live evaluation report](evaluation/REPORT.md) records six authored scenarios, their actual results, a no-match timeout that led to a prompt correction, and the successful checks afterward. These examples are not an independent benchmark. To repeat them without replacing the recorded results:
-
-```sh
-uv run python scripts/evaluate_matches.py --live --output .data/evaluation-results.json
-```
+The historical [hybrid retrieval results](evaluation/hybrid-retrieval-results.json) record a bounded live import of 96 distinct SkillsMP entries, cached source retrieval, a real Codex recommendation, and a 100,000-vector synthetic benchmark. That run also included the former bundled catalog. It validates the implemented flow, not complete provider coverage or general recommendation quality.
 
 ## Data and boundaries
 
-Personal state lives in `.data/skinder.sqlite3`, which is ignored by Git. Set `SKINDER_DB_PATH` to use another database. Catalog data lives in the adjacent `catalog.sqlite3` by default; set `SKINDER_CATALOG_DB_PATH` to override it. CLI imports never open the personal-state database. The 150 bundled skills seed the catalog without a network request. Search indexes and downloaded models are local artifacts beside the catalog database. No application telemetry is sent.
+Personal state lives in `.data/skinder.sqlite3`, which is ignored by Git. Set `SKINDER_DB_PATH` to use another database. Catalog data lives in the adjacent `catalog.sqlite3` by default; set `SKINDER_CATALOG_DB_PATH` to override it. CLI imports never open the personal-state database. New catalogs are populated by SkillsMP imports; existing catalog records and bookmarks are preserved. Search indexes and downloaded models are local artifacts beside the catalog database. No application telemetry is sent.
 
 One matching request runs at a time, with cancellation and a three-minute timeout covering retrieval, source enrichment, and Codex. A server restart marks unfinished matching as interrupted rather than automatically retrying. A failed additional batch preserves earlier results. Codex receives only the bounded shortlist in a temporary, read-only workspace with tools and integrations disabled. App startup never downloads an embedding model or contacts SkillsMP.
 
 The app binds to loopback and rejects foreign hosts and browser origins. It is intended for personal localhost use. Accounts, hosted deployment, automatic installation, and task execution are outside this version.
-
-## Catalog maintenance
-
-The snapshot contains **150 skills from seven maintainers**. Source revisions, selected paths, editorial descriptions, evidence, and available license notices are recorded in `src/skinder/data/sources.json`. There are 135 direct installation commands; fifteen skills with companion dependencies instead point to the author's setup instructions. Compatibility is based on reviewing the instructions, not executing every skill.
-
-```sh
-# Validate the checked-in snapshot without network access.
-uv run python scripts/refresh_catalog.py --check
-
-# Explicitly refetch the recorded source revisions and verify evidence.
-uv run python scripts/refresh_catalog.py --refresh
-```
-
-To adopt a new upstream revision, update its commit in the source manifest and review the selected skills before refreshing. Changed evidence or license declarations fail validation. A refresh never installs or executes source code, and it never changes the selected revisions automatically.

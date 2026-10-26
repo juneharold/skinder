@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from skinder.app import create_app
+from skinder.catalog import CatalogStore
 from skinder.matcher import CodexMatcher
 from skinder.models import Skill
 
@@ -36,8 +37,10 @@ def backend(tmp_path, monkeypatch):
                 "install_commands": {"codex": "echo copy-only", "claude-code": "echo copy-only"},
             }
         )
-    catalog_path = tmp_path / "catalog.json"
-    catalog_path.write_text(json.dumps({"version": 1, "skills": skills}))
+    catalog_db_path = tmp_path / "catalog.sqlite3"
+    catalog = CatalogStore(catalog_db_path)
+    for skill in skills:
+        catalog.upsert(Skill.model_validate(skill))
     control = tmp_path / "control.json"
     control.write_text("{}")
     fake = tmp_path / "codex"
@@ -86,7 +89,7 @@ pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(
     async def client(timeout=180, frontend_path=None, retriever=None, enricher=None):
         app = create_app(
             db_path=db_path,
-            catalog_path=catalog_path,
+            catalog_db_path=catalog_db_path,
             matcher=CodexMatcher(timeout=timeout),
             frontend_path=frontend_path,
             retriever=retriever or SessionTestRetriever(),

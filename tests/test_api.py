@@ -53,7 +53,7 @@ async def test_catalog_health_and_profile_persist_without_matching(backend):
         assert (await client.get("/api/skills/skill-0")).json()["name"] == "Skill 0"
         assert (await client.get("/api/skills/missing")).status_code == 404
         health = (await client.get("/api/health")).json()
-        assert health["codex"]["authenticated"] is True
+        assert health["engines"]["codex"]["authenticated"] is True
         profile = {
             "agent": "claude-code",
             "planning": "plan-first",
@@ -65,7 +65,7 @@ async def test_catalog_health_and_profile_persist_without_matching(backend):
     async with backend.client() as client:
         assert (await client.get("/api/profile")).json() == profile
         backend.configure(login_exit=1)
-        assert (await client.get("/api/health")).json()["codex"]["authenticated"] is False
+        assert (await client.get("/api/health")).json()["engines"]["codex"]["authenticated"] is False
         assert (await client.get("/api/saved")).json() == {"items": []}
 
 
@@ -179,14 +179,15 @@ async def test_feedback_accepts_recommendations_from_an_earlier_batch(backend):
         {"recommendations": [], "unexpected": "field"},
     ],
 )
-async def test_invalid_model_output_never_replaces_previous_batch(backend, result):
+@pytest.mark.parametrize("engine", ["codex", "claude-code"])
+async def test_invalid_model_output_never_replaces_previous_batch(backend, result, engine):
     async with backend.client() as client:
-        first = await match(client)
-        backend.configure(result=result)
-        failed = await match(client, session_id=first["id"])
+        first = await match(client, engine=engine)
+        backend.configure(engine=engine, result=result)
+        failed = await match(client, engine=engine, session_id=first["id"])
         assert failed["status"] == "failed"
         assert failed["recommendations"] == first["recommendations"]
-        assert failed["error"]
+        assert ("Codex" if engine == "codex" else "Claude") in failed["error"]
 
 
 async def test_reviewed_skill_rejected_and_legitimate_no_fit_committed(backend):
@@ -204,24 +205,29 @@ async def test_reviewed_skill_rejected_and_legitimate_no_fit_committed(backend):
         assert len(no_fit["feedback"]) == 1
 
 
-async def wait_for_process(backend):
+async def wait_for_process(backend, engine="codex"):
+    filename = "pid" if engine == "codex" else "claude-pid"
     for _ in range(100):
-        if (backend.root / "pid").exists():
-            return int((backend.root / "pid").read_text())
+        if (backend.root / filename).exists():
+            return int((backend.root / filename).read_text())
         await asyncio.sleep(0.01)
-    pytest.fail("Fake Codex did not start")
+    pytest.fail(f"Fake {engine} did not start")
 
 
-async def test_cancel_reaps_child_and_prevents_overlapping_jobs(backend):
-    backend.configure(sleep=30)
+@pytest.mark.parametrize("engine", ["codex", "claude-code"])
+async def test_cancel_reaps_child_and_prevents_overlapping_jobs(backend, engine):
+    backend.configure(engine=engine, sleep=30)
     async with backend.client() as client:
         response = await client.post(
-            "/api/matches", json={"task": "Review changes", "agent": "codex"}
+            "/api/matches", json={"task": "Review changes", "agent": "codex", "engine": engine}
         )
         session_id = response.json()["id"]
-        pid = await wait_for_process(backend)
+        pid = await wait_for_process(backend, engine)
+        other_engine = "claude-code" if engine == "codex" else "codex"
         assert (
-            await client.post("/api/matches", json={"task": "Another task", "agent": "codex"})
+            await client.post("/api/matches", json={
+                "task": "Another task", "agent": "codex", "engine": other_engine,
+            })
         ).status_code == 409
         cancelled = (await client.post(f"/api/matches/{session_id}/cancel")).json()
         assert cancelled["status"] == "cancelled"
@@ -229,20 +235,21 @@ async def test_cancel_reaps_child_and_prevents_overlapping_jobs(backend):
             os.kill(pid, 0)
         await asyncio.sleep(0.02)
         assert (await client.get(f"/api/matches/{session_id}")).json()["status"] == "cancelled"
-        backend.configure()
-        assert (await match(client))["status"] == "completed"
+        backend.configure(engine=engine)
+        assert (await match(client, engine=engine))["status"] == "completed"
 
 
-async def test_timeout_reaps_child_and_failed_process_does_not_leak_credentials(backend):
-    backend.configure(sleep=30)
+@pytest.mark.parametrize("engine", ["codex", "claude-code"])
+async def test_timeout_reaps_child_and_failed_process_does_not_leak_credentials(backend, engine):
+    backend.configure(engine=engine, sleep=30)
     async with backend.client(timeout=1) as client:
-        failed = await match(client)
+        failed = await match(client, engine=engine)
         assert failed["status"] == "failed"
         assert "timed out" in failed["error"]
         with pytest.raises(ProcessLookupError):
-            os.kill(int((backend.root / "pid").read_text()), 0)
-        backend.configure(exit=1)
-        failed = await match(client)
+            os.kill(int((backend.root / ("pid" if engine == "codex" else "claude-pid")).read_text()), 0)
+        backend.configure(engine=engine, exit=1)
+        failed = await match(client, engine=engine)
         assert failed["status"] == "failed"
         assert "secret-that-must-not-leak" not in json.dumps(failed)
 
@@ -360,14 +367,15 @@ async def test_recent_preference_history_is_bounded_and_agent_specific(backend):
         assert json.loads((backend.root / "request.json").read_text())["recent_feedback"] == []
 
 
-async def test_shutdown_reaps_running_child_and_keeps_interrupted_session(backend):
-    backend.configure(sleep=30)
+@pytest.mark.parametrize("engine", ["codex", "claude-code"])
+async def test_shutdown_reaps_running_child_and_keeps_interrupted_session(backend, engine):
+    backend.configure(engine=engine, sleep=30)
     async with backend.client() as client:
         response = await client.post(
-            "/api/matches", json={"task": "Review changes", "agent": "codex"}
+            "/api/matches", json={"task": "Review changes", "agent": "codex", "engine": engine}
         )
         session_id = response.json()["id"]
-        pid = await wait_for_process(backend)
+        pid = await wait_for_process(backend, engine)
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
     async with backend.client() as client:
@@ -410,7 +418,7 @@ async def test_missing_codex_leaves_browsing_and_profile_usable(backend, monkeyp
     monkeypatch.setattr("skinder.matcher.shutil.which", lambda name: None)
     async with backend.client() as client:
         health = (await client.get("/api/health")).json()
-        assert health["codex"]["installed"] is False
+        assert health["engines"]["codex"]["installed"] is False
         assert (await match(client))["status"] == "failed"
         assert len((await client.get("/api/catalog")).json()["skills"]) == 16
         assert (await client.get("/api/profile")).json()["agent"] == "codex"

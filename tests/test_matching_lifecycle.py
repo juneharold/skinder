@@ -15,7 +15,7 @@ from skinder.app import create_app
 from skinder.catalog import CatalogStore
 from skinder.matcher import terminate
 from skinder.matching import MatchServiceError
-from skinder.models import CodexStatus, MatchInput
+from skinder.models import EngineStatus, MatchInput
 from skinder.ownership import DatabaseOwnership
 from skinder.sources import SourceEnricher
 from skinder.work import run_sync
@@ -29,7 +29,7 @@ class WaitingMatcher:
         self.calls = 0
 
     async def health(self):
-        return CodexStatus(installed=True, authenticated=True, message="Ready")
+        return EngineStatus(installed=True, authenticated=True, ready=True, message="Ready")
 
     async def match(self, request):
         self.calls += 1
@@ -85,7 +85,7 @@ async def wait_until_finished(service, session_id):
 
 async def test_simultaneous_start_and_lost_response_leave_one_owned_job(backend, monkeypatch):
     matcher = WaitingMatcher()
-    async with running_app(backend, matcher=matcher) as app:
+    async with running_app(backend, matchers={"codex": matcher}) as app:
         service = app.state.match_service
         entered, release = threading.Event(), threading.Event()
         original = app.state.user_store.get_profile
@@ -123,7 +123,7 @@ async def test_simultaneous_start_and_lost_response_leave_one_owned_job(backend,
 
 async def test_cancelled_caller_still_finishes_cancellation(backend, monkeypatch):
     matcher = WaitingMatcher()
-    async with running_app(backend, matcher=matcher) as app:
+    async with running_app(backend, matchers={"codex": matcher}) as app:
         service = app.state.match_service
         session = await service.start(MatchInput(task="Review changes", agent="codex"))
         await asyncio.wait_for(matcher.entered.wait(), 2)
@@ -205,7 +205,7 @@ async def test_failure_diagnostics_keep_context_without_sensitive_values(
         async def enrich(self, skills):
             fail()
 
-    options = {"matcher": BrokenMatcher()}
+    options = {"matchers": {"codex": BrokenMatcher()}}
     if stage == "retrieval":
         options["retriever"] = BrokenRetriever()
     if stage == "enrichment":
@@ -240,7 +240,7 @@ async def test_source_cache_failure_logs_underlying_error_without_sensitive_valu
     transport = httpx.MockTransport(lambda request: httpx.Response(200, text="private-source-text"))
     try:
         async with running_app(
-            backend, matcher=WaitingMatcher(), retriever=SingleSkillRetriever(),
+            backend, matchers={"codex": WaitingMatcher()}, retriever=SingleSkillRetriever(),
             enricher=SourceEnricher(catalog, transport=transport),
         ) as app:
             service = app.state.match_service
@@ -259,7 +259,7 @@ async def test_source_cache_failure_logs_underlying_error_without_sensitive_valu
 
 async def test_database_contention_does_not_block_other_requests(backend):
     async with (
-        running_app(backend, matcher=WaitingMatcher()) as app,
+        running_app(backend, matchers={"codex": WaitingMatcher()}) as app,
         httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8742",
         ) as client,
@@ -324,7 +324,7 @@ def test_process_lock_resolves_symlinks_and_can_be_reacquired(tmp_path):
 
 async def test_second_app_cannot_recover_active_job_and_startup_failure_releases_lock(backend, monkeypatch):
     matcher = WaitingMatcher()
-    async with running_app(backend, matcher=matcher) as app:
+    async with running_app(backend, matchers={"codex": matcher}) as app:
         session = await app.state.match_service.start(MatchInput(task="Review changes", agent="codex"))
         with pytest.raises(RuntimeError, match="already using"):
             async with running_app(backend):
@@ -354,7 +354,7 @@ async def test_late_match_result_cannot_overwrite_cancellation(backend):
                 return '{"recommendations": []}'
 
     matcher = LateMatcher()
-    async with running_app(backend, matcher=matcher) as app:
+    async with running_app(backend, matchers={"codex": matcher}) as app:
         service = app.state.match_service
         session = await service.start(MatchInput(task="Review changes", agent="codex"))
         await asyncio.wait_for(matcher.entered.wait(), 2)
@@ -399,3 +399,36 @@ async def test_shutdown_waits_for_cancelled_request_write(backend, monkeypatch):
     assert closed.is_set()
     with sqlite3.connect(backend.user_db_path) as db:
         assert '"output_style":"brief"' in db.execute("SELECT data FROM profile").fetchone()[0]
+
+
+@pytest.mark.parametrize("engine", ["codex", "claude-code"])
+async def test_selected_engine_controls_budget_for_enrichment(backend, engine):
+    class ImmediateMatcher(WaitingMatcher):
+        timeout = 1
+
+        async def match(self, request):
+            self.calls += 1
+            return '{"recommendations": []}'
+
+    class SlowEnricher(MetadataOnly):
+        async def enrich(self, skills):
+            await asyncio.sleep(0.05)
+            return await super().enrich(skills)
+
+    selected, other = ImmediateMatcher(), ImmediateMatcher()
+    selected.timeout = 0.01
+    other_engine = "claude-code" if engine == "codex" else "codex"
+    async with running_app(
+        backend, matchers={engine: selected, other_engine: other}, enricher=SlowEnricher(),
+    ) as app:
+        service = app.state.match_service
+        session = await service.start(MatchInput(task="Review changes", agent="codex", engine=engine))
+        failed = await wait_until_finished(service, session.id)
+        assert failed.status == "failed" and "timed out" in failed.error
+        assert selected.calls == other.calls == 0
+        session = await service.start(MatchInput(
+            task="Review changes", agent="codex", engine=other_engine,
+        ))
+        completed = await wait_until_finished(service, session.id)
+        assert completed.status == "completed"
+        assert other.calls == 1 and selected.calls == 0

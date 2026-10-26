@@ -5,6 +5,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
@@ -39,7 +40,9 @@ def test_fresh_database_matches_models_and_alembic_head(tmp_path, kind, base):
         }
         assert application_tables == set(base.metadata.tables)
         with engine.connect() as connection:
-            assert MigrationContext.configure(connection).get_current_revision() == f"0001_{kind}"
+            assert MigrationContext.configure(connection).get_current_revision() == (
+                ScriptDirectory.from_config(migration_config(kind)).get_current_head()
+            )
             assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
             assert connection.exec_driver_sql("PRAGMA journal_mode").scalar_one() == "wal"
             assert connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 30_000
@@ -73,6 +76,7 @@ def test_user_reopen_preserves_records_and_foreign_keys_rollback(tmp_path):
         with Session(engine) as session:
             assert session.get(ProfileRecord, 1).data == '{"language":"ko"}'
             assert session.get(MatchSessionRecord, "task").recommendations == "[]"
+            assert session.get(MatchSessionRecord, "task").engine == "codex"
             assert session.get(FeedbackRecord, "feedback").action == "save"
             assert session.get(BookmarkRecord, "skill").feedback_id is None
         with pytest.raises(IntegrityError), Session(engine) as session, session.begin():
@@ -201,3 +205,44 @@ def test_named_alembic_configuration_upgrades_and_downgrades(tmp_path, monkeypat
         ).fetchall() == [("alembic_version",)]
     command.upgrade(config, "head")
     command.check(config)
+
+
+def test_engine_migration_preserves_old_sessions_recommendations_and_saved_records(tmp_path):
+    from skinder.user import UserStore
+
+    path = tmp_path / "old-user.sqlite3"
+    engine = create_database(path, "user")
+    try:
+        with engine.begin() as connection:
+            config = migration_config("user")
+            config.attributes["connection"] = connection
+            command.downgrade(config, "0001_user")
+            connection.exec_driver_sql(
+                "INSERT INTO match_sessions (id, task, agent, status, recommendations, created_at, updated_at) "
+                "VALUES ('old', 'Review changes', 'claude-code', 'completed', ?, 'created', 'updated')",
+                ('[{"skill_id":"review","task_fit":"Task","taste_fit":"Style","caveat":null}]',),
+            )
+            connection.exec_driver_sql("INSERT INTO match_session_skills VALUES ('old', 'review')")
+            connection.exec_driver_sql(
+                "INSERT INTO feedback VALUES ('choice', 'old', 'review', 'save', NULL, 'created')"
+            )
+            connection.exec_driver_sql("INSERT INTO bookmarks VALUES ('review', 'created', 'choice')")
+    finally:
+        engine.dispose()
+    store = UserStore(path)
+    try:
+        restored = store.get_match_session("old")
+        assert restored.engine == "codex" and restored.agent == "claude-code"
+        assert restored.recommendations[0].skill_id == "review"
+        assert restored.feedback[0].id == "choice"
+        assert store.get_bookmarks()[0]["skill_id"] == "review"
+        assert store.get_bookmarks()[0]["feedback_id"] == "choice"
+        with store.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "INSERT INTO match_sessions (id, task, agent, status, created_at, updated_at) "
+                "VALUES ('default', 'Review again', 'codex', 'completed', 'created', 'updated')"
+            )
+        assert store.get_match_session("default").engine == "codex"
+        assert store.start_match_session("Another review", "codex", engine="claude-code").engine == "claude-code"
+    finally:
+        store.close()

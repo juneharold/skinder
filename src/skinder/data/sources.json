@@ -690,7 +690,7 @@
           "evidence": [
             {
               "trait": "Present theme choices before applying a consistent selection.",
-              "excerpt": "## Application Process"
+              "excerpt": "**Ask for their choice**: Ask which theme to apply"
             },
             {
               "trait": "Coordinate colors and typography across an artifact.",
@@ -3258,12 +3258,12 @@
             "architecture"
           ],
           "workflow": [
-            "Define the page hierarchy before navigation and linking details."
+            "Organize the page hierarchy, navigation, URLs, and internal links together."
           ],
           "output_style": [],
           "evidence": [
             {
-              "trait": "Define the page hierarchy before navigation and linking details.",
+              "trait": "Organize the page hierarchy, navigation, URLs, and internal links together.",
               "excerpt": "— page hierarchy, navigation, URL patterns, and internal linking —"
             }
           ],
@@ -3310,7 +3310,7 @@
           "evidence": [
             {
               "trait": "Adapt content to the destination rather than copying one post everywhere.",
-              "excerpt": "Whatever the platform, storytelling and connecting with your audience come"
+              "excerpt": "**Adapt to each platform** (format, length, and tone)"
             }
           ],
           "installation": "standalone",
@@ -5424,19 +5424,19 @@
             "units"
           ],
           "workflow": [
-            "Preserve units and correlated uncertainty throughout the calculation."
+            "Keep units attached throughout the calculation."
           ],
           "output_style": [
             "Report rounded results with an explicit uncertainty."
           ],
           "evidence": [
             {
-              "trait": "Preserve units and correlated uncertainty throughout the calculation.",
-              "excerpt": "## Non-negotiable workflow"
+              "trait": "Keep units attached throughout the calculation.",
+              "excerpt": "**Attach units at input and strip them only at output.**"
             },
             {
               "trait": "Report rounded results with an explicit uncertainty.",
-              "excerpt": "an uncertainty. Concretely:"
+              "excerpt": "**Round the uncertainty first, then the value to the same decimal place.**"
             }
           ],
           "installation": "standalone",
@@ -7390,15 +7390,15 @@
             "essay"
           ],
           "workflow": [
-            "Build claim-evidence-analysis paragraphs and test the counterargument."
+            "Build each paragraph around a claim, evidence, and analysis."
           ],
           "output_style": [
             "Flag places that require real citations instead of inventing references."
           ],
           "evidence": [
             {
-              "trait": "Build claim-evidence-analysis paragraphs and test the counterargument.",
-              "excerpt": "### Counterargument"
+              "trait": "Build each paragraph around a claim, evidence, and analysis.",
+              "excerpt": "Use the claim-evidence-analysis pattern:"
             },
             {
               "trait": "Flag places that require real citations instead of inventing references.",

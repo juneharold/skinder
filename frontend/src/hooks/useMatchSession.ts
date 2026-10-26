@@ -1,0 +1,256 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, ApiError } from "../lib/api";
+import type { Agent, Feedback, MatchSession, PassReason, Recommendation, Skill } from "../lib/types";
+import { useSavedSkills, type SavedSkillsState } from "./useSavedSkills";
+import { errorMessage, type LoadState } from "../lib/async";
+
+type MatchRequest = {
+  task: string;
+  agent: Agent;
+  sessionId?: string;
+  baseline: MatchSession | null;
+  uncertain?: boolean;
+};
+type MatchSessionOptions = {
+  canStart: boolean;
+  onStarted: () => void;
+  onReviewed: (action: "choice" | "undo") => void;
+  onNotice: (message: string) => void;
+};
+const isMatching = (session: MatchSession | null) =>
+  session?.status === "pending" || session?.status === "running";
+
+export type MatchSessionController = {
+  session: MatchSession | null;
+  loadState: LoadState;
+  loadError: string;
+  reload: () => Promise<void>;
+  saved: SavedSkillsState;
+  matching: boolean;
+  starting: boolean;
+  cancelling: boolean;
+  canMatch: boolean;
+  pollError: string;
+  matchError: string | undefined;
+  retryMatch: () => void;
+  start: (task: string, agent: Agent) => void;
+  more: () => void;
+  choose: (skill: Skill, action: "save" | "pass", reason?: PassReason | null) => void;
+  undo: () => void;
+  cancel: () => Promise<void>;
+  canEdit: () => boolean;
+  isStarting: () => boolean;
+  remaining: Recommendation[];
+  reviewedIds: Set<string>;
+  lastChoice: Feedback | undefined;
+};
+
+export function useMatchSession({
+  canStart, onStarted, onReviewed, onNotice,
+}: MatchSessionOptions): MatchSessionController {
+  const [session, setSession] = useState<MatchSession | null>(null);
+  const currentSession = useRef<MatchSession | null>(null);
+  // Successful writes invalidate older initial reads and poll responses.
+  const version = useRef(0);
+  const loadVersion = useRef(0);
+  const [loadState, setLoadState] = useState<LoadState>("loading");
+  const [loadError, setLoadError] = useState("");
+  const [starting, setStarting] = useState(false);
+  const startGuard = useRef(false);
+  const [cancelling, setCancelling] = useState(false);
+  const cancelGuard = useRef(false);
+  const [matchError, setMatchError] = useState<{ message: string; request: MatchRequest } | null>(null);
+  const [pollError, setPollError] = useState("");
+  const saved = useSavedSkills({ canWrite: () => !startGuard.current, onNotice });
+  const matching = isMatching(session);
+  const canMatch = canStart && loadState === "ready";
+
+  const adoptSession = useCallback((next: MatchSession | null) => {
+    currentSession.current = next;
+    setSession(next);
+  }, []);
+  const reload = useCallback(async () => {
+    const requestVersion = ++loadVersion.current;
+    const generation = version.current;
+    const current = () => requestVersion === loadVersion.current && generation === version.current;
+    setLoadState("loading");
+    try {
+      const next = await api.current();
+      if (!current()) return;
+      adoptSession(next);
+      setLoadState("ready");
+      setLoadError("");
+    } catch (error) {
+      if (!current()) return;
+      setLoadState("error");
+      setLoadError(errorMessage(error));
+    }
+  }, [adoptSession]);
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  useEffect(() => {
+    if (!matching || !session) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const id = session.id;
+    const poll = async () => {
+      const generation = version.current;
+      try {
+        const next = await api.session(id);
+        if (active && generation === version.current && currentSession.current?.id === id) {
+          adoptSession(next);
+          setPollError("");
+        }
+      } catch (error) {
+        if (active && generation === version.current)
+          setPollError(`Could not check matching: ${errorMessage(error)}`);
+      }
+      if (active) timer = setTimeout(poll, 1200);
+    };
+    timer = setTimeout(poll, 800);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [matching, session?.id, adoptSession]);
+
+  async function reconcile(request: MatchRequest) {
+    const next = request.sessionId ? await api.session(request.sessionId) : await api.current();
+    const changed = request.sessionId
+      ? next && (next.updated_at !== request.baseline?.updated_at || isMatching(next))
+      : next && next.id !== request.baseline?.id &&
+        next.task === request.task && next.agent === request.agent;
+    return changed ? next : null;
+  }
+
+  async function startMatch(request: MatchRequest) {
+    // Refs enforce mutual exclusion before React commits the busy indicators.
+    if (startGuard.current || saved.isWriting() || isMatching(currentSession.current) || !canMatch) return;
+    startGuard.current = true;
+    setStarting(true);
+    setMatchError(null);
+    const generation = ++version.current;
+    try {
+      let next: MatchSession | null = null;
+      if (request.uncertain) next = await reconcile(request);
+      if (!next) {
+        request = { ...request, uncertain: false };
+        try {
+          next = await api.match(request.task, request.agent, request.sessionId);
+        } catch (error) {
+          if (error instanceof ApiError) throw error;
+          request = { ...request, uncertain: true };
+          next = await reconcile(request);
+          if (!next) throw error;
+        }
+      }
+      if (generation === version.current) {
+        adoptSession(next);
+        setPollError("");
+        onStarted();
+      }
+    } catch (error) {
+      if (generation === version.current) setMatchError({ message: errorMessage(error), request });
+    } finally {
+      startGuard.current = false;
+      setStarting(false);
+    }
+  }
+
+  function start(task: string, agent: Agent) {
+    void startMatch({ task, agent, baseline: currentSession.current });
+  }
+  function more() {
+    const current = currentSession.current;
+    if (current) void startMatch({
+      task: current.task, agent: current.agent, sessionId: current.id, baseline: current,
+    });
+  }
+
+  function choose(skill: Skill, action: "save" | "pass", reason: PassReason | null = null) {
+    const current = currentSession.current;
+    if (!current || isMatching(current) || startGuard.current) return;
+    void saved.mutate(`Retry ${action}`, async () => {
+      if (isMatching(currentSession.current) && currentSession.current?.id === current.id)
+        throw new Error("Wait for matching to finish before reviewing this task.");
+      const result = await api.feedback(current.id, skill.id, action, reason);
+      version.current++;
+      saved.setItems(result.saved.items);
+      if (currentSession.current?.id === current.id) adoptSession({
+        ...currentSession.current,
+        feedback: [
+          ...currentSession.current.feedback.filter((item) => item.id !== result.feedback.id),
+          result.feedback,
+        ],
+      });
+      onNotice(action === "save" ? `${skill.name} saved.` : `${skill.name} passed.`);
+      onReviewed("choice");
+    });
+  }
+
+  const reviewedIds = new Set(session?.feedback.map((item) => item.skill_id));
+  const remaining = session?.recommendations.filter((item) => !reviewedIds.has(item.skill_id)) ?? [];
+  const lastChoice = session
+    ? [...session.feedback].reverse().find((item) =>
+        session.recommendations.some((recommendation) => recommendation.skill_id === item.skill_id))
+    : undefined;
+
+  function undo() {
+    const current = currentSession.current;
+    if (!lastChoice || !current || isMatching(current)) return;
+    const choice = lastChoice;
+    void saved.mutate("Retry undo", async () => {
+      if (isMatching(currentSession.current) && currentSession.current?.id === current.id)
+        throw new Error("Wait for matching to finish before undoing a choice.");
+      const result = await api.undo(choice.id);
+      version.current++;
+      saved.setItems(result.items);
+      if (currentSession.current?.id === current.id) adoptSession({
+        ...currentSession.current,
+        feedback: currentSession.current.feedback.filter((item) => item.id !== choice.id),
+      });
+      onNotice("Last choice undone.");
+      onReviewed("undo");
+    });
+  }
+
+  async function cancel() {
+    const current = currentSession.current;
+    if (!current || cancelGuard.current || startGuard.current) return;
+    cancelGuard.current = true;
+    setCancelling(true);
+    const generation = ++version.current;
+    try {
+      const next = await api.cancel(current.id);
+      if (generation === version.current) {
+        version.current++;
+        adoptSession(next);
+        setPollError("");
+        saved.setError((previous) => previous?.label === "Retry cancellation" ? null : previous);
+      }
+    } catch (error) {
+      saved.setError({
+        message: `Could not stop matching: ${errorMessage(error)}`,
+        label: "Retry cancellation",
+        retry: () => void cancel(),
+      });
+    } finally {
+      cancelGuard.current = false;
+      setCancelling(false);
+    }
+  }
+
+  return {
+    session, loadState, loadError, reload, saved,
+    matching, starting, cancelling, canMatch, pollError,
+    matchError: matchError?.message,
+    retryMatch: () => { if (matchError) void startMatch(matchError.request); },
+    start, more, choose, undo, cancel,
+    canEdit: () => !!currentSession.current && !startGuard.current &&
+      !isMatching(currentSession.current) && !saved.isWriting(),
+    isStarting: () => startGuard.current,
+    remaining, reviewedIds, lastChoice,
+  };
+}

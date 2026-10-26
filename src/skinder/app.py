@@ -1,17 +1,18 @@
 import asyncio
-import contextlib
 import os
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import ValidationError
 
 from .catalog import CatalogStore
-from .matcher import CodexMatcher, MatchError
+from .matcher import CodexMatcher
+from .matching import Enricher, Matcher, MatchService, MatchServiceError, Retriever
 from .models import (
     Catalog,
     Error,
@@ -19,24 +20,26 @@ from .models import (
     FeedbackResult,
     Health,
     MatchInput,
-    MatchResult,
     MatchSession,
     Profile,
     Saved,
     Skill,
 )
+from .ownership import DatabaseOwnership
 from .retrieval import HybridRetriever
-from .sources import SourceEnricher, bounded_request, match_metadata
+from .sources import SourceEnricher
 from .sync import sync_status
 from .user import UserStore
+from .work import SyncWork, run_sync, wait_for_work
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def create_app(
-    *, user_db_path=None, catalog_db_path=None, matcher=None,
-    frontend_path=None, retriever=None, enricher=None,
-):
+    *, user_db_path: str | Path | None = None, catalog_db_path: str | Path | None = None,
+    matcher: Matcher | None = None, frontend_path: str | Path | None = None,
+    retriever: Retriever | None = None, enricher: Enricher | None = None,
+) -> FastAPI:
     user_db_path = Path(
         user_db_path or os.environ.get("SKINDER_USER_DB_PATH", str(ROOT / ".data" / "user.sqlite3"))
     )
@@ -45,34 +48,49 @@ def create_app(
     ))
     frontend_path = Path(frontend_path or ROOT / "frontend" / "dist")
     matcher = matcher or CodexMatcher()
-    catalog_store = None
-    search = None
-    sources = None
-    active_task = None
-    active_match_session_id = None
-    user_store = None
+    user_store: UserStore
+    catalog_store: CatalogStore
+    search: Retriever
+    service: MatchService
+    work = SyncWork()
 
     @asynccontextmanager
-    async def lifespan(app):
-        nonlocal user_store, catalog_store, search, sources
-        user_store = UserStore(user_db_path)
-        catalog_store = CatalogStore(catalog_db_path)
-        search = retriever or HybridRetriever(catalog_store)
-        sources = enricher or SourceEnricher(catalog_store)
-        app.state.user_store = user_store
-        app.state.catalog_store = catalog_store
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        nonlocal user_store, catalog_store, search, service
+        ownership = DatabaseOwnership(user_db_path)
+        cleanup = ExitStack()
+        cleanup.callback(ownership.release)
+        started = False
+
+        def initialize() -> None:
+            nonlocal user_store, catalog_store, search, service
+            ownership.acquire()
+            user_store = UserStore(user_db_path)
+            cleanup.callback(user_store.close)
+            user_store.recover_interrupted_sessions()
+            catalog_store = CatalogStore(catalog_db_path)
+            cleanup.callback(catalog_store.close)
+            search = retriever or HybridRetriever(catalog_store)
+            sources = enricher or SourceEnricher(catalog_store)
+            service = MatchService(user_store, catalog_store, matcher, search, sources)
+            app.state.user_store = user_store
+            app.state.catalog_store = catalog_store
+            app.state.match_service = service
+
+        async def shutdown() -> None:
+            try:
+                await work.drain()
+                if started:
+                    await service.shutdown()
+            finally:
+                await run_sync(cleanup.close)
+
         try:
+            await run_sync(initialize)
+            started = True
             yield
         finally:
-            if active_task is not None and not active_task.done():
-                user_store.finish_match_session(
-                    active_match_session_id, "failed", error="Matching was interrupted by shutdown."
-                )
-                active_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await active_task
-            user_store.close()
-            catalog_store.close()
+            await wait_for_work(asyncio.create_task(shutdown()))
 
     app = FastAPI(
         title="Skinder API",
@@ -87,7 +105,9 @@ def create_app(
     )
 
     @app.middleware("http")
-    async def local_origin(request: Request, call_next):
+    async def local_origin(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         host = request.headers.get("host", "")
         allowed_hosts = {"127.0.0.1:8742", "localhost:8742"}
         if host not in allowed_hosts:
@@ -107,149 +127,69 @@ def create_app(
         return response
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(request, exc):
+    async def validation_error(
+        request: Request, exc: RequestValidationError,
+    ) -> JSONResponse:
         issues = []
         for error in exc.errors():
             location = ".".join(str(part) for part in error["loc"] if part != "body")
             issues.append(f"{location or 'request'}: {error['msg']}")
         return JSONResponse({"detail": "; ".join(issues)}, 422)
 
-    def get_match_session(session_id):
-        session = user_store.get_match_session(session_id)
-        if session is None:
-            raise HTTPException(404, "Task session not found.")
-        return session
-
-    async def run_match(session, profile, feedback):
-        try:
-            async with asyncio.timeout(getattr(matcher, "timeout", 180)):
-                candidates = await asyncio.to_thread(
-                    search.search, session.task, session.agent,
-                    user_store.get_seen_skill_ids(session.id),
-                )
-                enriched = await sources.enrich(candidates[:40])
-                request = bounded_request(session.task, profile, feedback, enriched)
-                if not request["eligible_skills"]:
-                    user_store.finish_match_session(session.id, "completed", [])
-                    return
-                raw = await matcher.match(request)
-                result = MatchResult.model_validate_json(raw, strict=True)
-            ids = [recommendation.skill_id for recommendation in result.recommendations]
-            eligible = {skill["id"] for skill in request["eligible_skills"]}
-            if len(ids) != len(set(ids)) or not set(ids).issubset(eligible):
-                raise ValueError("Invalid recommendation IDs.")
-            # Feedback can arrive while a batch runs; do not return newly reviewed skills.
-            if set(ids) & user_store.get_seen_skill_ids(session.id):
-                raise ValueError("Already reviewed recommendation IDs.")
-            user_store.finish_match_session(session.id, "completed", result.recommendations)
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            user_store.finish_match_session(
-                session.id, "failed", error="Matching timed out. Try again."
-            )
-        except MatchError as exc:
-            user_store.finish_match_session(session.id, "failed", error=str(exc))
-        except (ValidationError, ValueError):
-            user_store.finish_match_session(
-                session.id, "failed", error="Codex returned invalid recommendations. Try again."
-            )
-        except Exception:  # noqa: BLE001 - keep background failures visible without leaking process data
-            user_store.finish_match_session(
-                session.id, "failed", error="Matching failed unexpectedly. Try again."
-            )
+    @app.exception_handler(MatchServiceError)
+    async def match_service_error(request: Request, exc: MatchServiceError) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, exc.status_code)
 
     @app.get("/api/health", response_model=Health)
-    async def health():
-        status = await asyncio.to_thread(search.status)
-        return Health(
-            catalog_count=catalog_store.count(), codex=await matcher.health(),
-            sync_status=sync_status(catalog_store), **status,
-        )
+    async def health() -> Health:
+        def snapshot() -> dict[str, Any]:
+            return {"catalog_count": catalog_store.count(),
+                    "sync_status": sync_status(catalog_store), **search.status()}
+
+        status = await work.run(snapshot)
+        return Health(codex=await matcher.health(), **status)
 
     @app.get("/api/catalog", response_model=Catalog)
     async def get_catalog(
         q: str = Query(default="", max_length=4000), category: str | None = None,
         offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=200),
-    ):
-        return await asyncio.to_thread(
+    ) -> Catalog:
+        return await work.run(
             catalog_store.page, q=q, category=category, offset=offset, limit=limit
         )
 
     @app.get("/api/skills/{skill_id}", response_model=Skill)
-    async def get_skill(skill_id: str):
-        skill = catalog_store.get(skill_id)
+    async def get_skill(skill_id: str) -> Skill:
+        skill = await work.run(catalog_store.get, skill_id)
         if skill is None:
             raise HTTPException(404, "Skill not found.")
         return skill
 
     @app.get("/api/profile", response_model=Profile)
-    async def get_profile():
-        return user_store.get_profile()
+    async def get_profile() -> Profile:
+        return await work.run(user_store.get_profile)
 
     @app.put("/api/profile", response_model=Profile)
-    async def put_profile(profile: Profile):
-        return user_store.set_profile(profile)
+    async def put_profile(profile: Profile) -> Profile:
+        return await work.run(user_store.set_profile, profile)
 
     @app.post("/api/matches", response_model=MatchSession, status_code=202)
-    async def start_match(value: MatchInput):
-        nonlocal active_task, active_match_session_id
-        if active_task is not None and not active_task.done():
-            raise HTTPException(409, "A match is already running. Wait for it or cancel it first.")
-        if value.session_id:
-            previous = get_match_session(value.session_id)
-            if previous.task != value.task or previous.agent != value.agent:
-                raise HTTPException(409, "A continuation must use the same task and target agent.")
-        profile = user_store.get_profile().model_dump()
-        profile["agent"] = value.agent
-        feedback = []
-        for event in user_store.get_preference_events(value.agent):
-            skill = catalog_store.get(event["skill_id"])
-            if skill:
-                feedback.append({**event, "skill": match_metadata(skill)})
-        session = user_store.start_match_session(value.task, value.agent, value.session_id)
-        active_match_session_id = session.id
-        active_task = asyncio.create_task(run_match(session, profile, feedback))
-        return user_store.get_match_session(session.id)
+    async def start_match(value: MatchInput) -> MatchSession:
+        return await service.start(value)
 
     @app.get("/api/matches/current", response_model=MatchSession | None)
-    async def current_match():
-        return user_store.get_current_match_session()
+    async def current_match() -> MatchSession | None:
+        return await work.run(user_store.get_current_match_session)
 
     @app.get("/api/matches/{session_id}", response_model=MatchSession)
-    async def get_match(session_id: str):
-        return get_match_session(session_id)
+    async def get_match(session_id: str) -> MatchSession:
+        return await work.run(service.get_session, session_id)
 
     @app.post("/api/matches/{session_id}/cancel", response_model=MatchSession)
-    async def cancel_match(session_id: str):
-        session = get_match_session(session_id)
-        if session.status == "running":
-            user_store.finish_match_session(session_id, "cancelled")
-            if active_match_session_id == session_id and active_task is not None:
-                active_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await active_task
-        return get_match_session(session_id)
+    async def cancel_match(session_id: str) -> MatchSession:
+        return await service.cancel(session_id)
 
-    @app.post("/api/feedback", response_model=FeedbackResult)
-    async def add_feedback(value: FeedbackInput):
-        get_match_session(value.session_id)
-        try:
-            feedback = user_store.add_feedback(value)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        return FeedbackResult(feedback=feedback, saved=await get_saved())
-
-    @app.delete("/api/feedback/{feedback_id}", response_model=Saved)
-    async def undo_feedback(feedback_id: str):
-        try:
-            user_store.undo_feedback(feedback_id)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        return await get_saved()
-
-    @app.get("/api/saved", response_model=Saved)
-    async def get_saved():
+    def saved_collection() -> Saved:
         return Saved(
             items=[
                 {"skill": skill, "saved_at": row["saved_at"]}
@@ -258,17 +198,50 @@ def create_app(
             ]
         )
 
+    @app.post("/api/feedback", response_model=FeedbackResult)
+    async def add_feedback(value: FeedbackInput) -> FeedbackResult:
+        def save_feedback() -> FeedbackResult:
+            service.get_session(value.session_id)
+            try:
+                feedback = user_store.add_feedback(value)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            return FeedbackResult(feedback=feedback, saved=saved_collection())
+
+        return await work.run(save_feedback)
+
+    @app.delete("/api/feedback/{feedback_id}", response_model=Saved)
+    async def undo_feedback(feedback_id: str) -> Saved:
+        def undo() -> Saved:
+            try:
+                user_store.undo_feedback(feedback_id)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            return saved_collection()
+
+        return await work.run(undo)
+
+    @app.get("/api/saved", response_model=Saved)
+    async def get_saved() -> Saved:
+        return await work.run(saved_collection)
+
     @app.put("/api/saved/{skill_id}", response_model=Saved)
-    async def put_saved(skill_id: str):
-        if catalog_store.get(skill_id) is None:
-            raise HTTPException(404, "Skill not found.")
-        user_store.add_bookmark(skill_id)
-        return await get_saved()
+    async def put_saved(skill_id: str) -> Saved:
+        def save() -> Saved:
+            if catalog_store.get(skill_id) is None:
+                raise HTTPException(404, "Skill not found.")
+            user_store.add_bookmark(skill_id)
+            return saved_collection()
+
+        return await work.run(save)
 
     @app.delete("/api/saved/{skill_id}", response_model=Saved)
-    async def delete_saved(skill_id: str):
-        user_store.remove_bookmark(skill_id)
-        return await get_saved()
+    async def delete_saved(skill_id: str) -> Saved:
+        def remove() -> Saved:
+            user_store.remove_bookmark(skill_id)
+            return saved_collection()
+
+        return await work.run(remove)
 
     if frontend_path.is_dir():
         assets = frontend_path / "assets"
@@ -276,7 +249,7 @@ def create_app(
             app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
     @app.get("/{path:path}", include_in_schema=False)
-    async def frontend(path: str):
+    async def frontend(path: str) -> Response:
         if path == "api" or path.startswith("api/"):
             raise HTTPException(404, "API endpoint not found.")
         candidate = (frontend_path / path).resolve()

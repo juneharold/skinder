@@ -5,15 +5,20 @@ import json
 import logging
 import os
 import threading
+from collections.abc import Iterable, Sequence
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Literal, Protocol, TypedDict
 from uuid import uuid4
 
 import numpy as np
+from numpy.typing import NDArray
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.dialects.sqlite import insert
 from usearch.index import Index
 
+from .catalog import CatalogStore
+from .models import Agent, Skill
 from .orm import (
     CatalogSkillRecord,
     RetrievalMemberRecord,
@@ -41,27 +46,36 @@ logger = logging.getLogger(__name__)
 _model_lock = threading.Lock()
 
 
-def _paths(catalog):
+class Embedder(Protocol):
+    def embed(self, texts: Sequence[str], /) -> Iterable[NDArray[np.float32]]: ...
+
+
+class RetrievalStatus(TypedDict):
+    indexed_count: int
+    retrieval_mode: Literal["hybrid", "keyword-only"]
+
+
+def _paths(catalog: CatalogStore) -> Path:
     return catalog.path.with_name(catalog.path.stem + "-search")
 
 
-def _identity(catalog):
+def _identity(catalog: CatalogStore) -> str:
     with catalog.db_sessions() as session:
         return session.get(RetrievalMetaRecord, "identity").value
 
 
-def _sha256(path):
+def _sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 @lru_cache(maxsize=32)
-def _verified_file(path, size, modified, expected):
+def _verified_file(path: Path, size: int, modified: int, expected: str) -> bool:
     # Size and modification time invalidate the cached verification after a file changes.
     return _sha256(path) == expected
 
 
-def _verified(path, expected):
+def _verified(path: Path, expected: str) -> bool:
     try:
         stat = path.stat()
         return _verified_file(path, stat.st_size, stat.st_mtime_ns, expected)
@@ -69,11 +83,11 @@ def _verified(path, expected):
         return False
 
 
-def _model_ready(directory):
+def _model_ready(directory: Path) -> bool:
     return all(_verified(directory / name, digest) for name, digest in MODEL_FILES.items())
 
 
-def _prepare_model(directory, allow_download):
+def _prepare_model(directory: Path, allow_download: bool) -> None:
     if _model_ready(directory):
         return
     if not allow_download:
@@ -103,7 +117,7 @@ def _prepare_model(directory, allow_download):
                 temporary.unlink(missing_ok=True)
 
 
-def _load_embedder(directory):
+def _load_embedder(directory: Path) -> Embedder:
     # The explicit directory and local_files_only both prevent FastEmbed's automatic downloads.
     from fastembed import TextEmbedding
     from fastembed.common.model_description import ModelSource, PoolingType
@@ -120,7 +134,7 @@ def _load_embedder(directory):
     )
 
 
-def _embed(embedder, texts):
+def _embed(embedder: Embedder, texts: Sequence[str]) -> NDArray[np.float32]:
     vectors = np.asarray(list(embedder.embed(texts)), dtype=np.float32)
     if vectors.shape != (len(texts), DIMENSIONS) or not np.isfinite(vectors).all():
         raise ValueError("Embedding model returned invalid vectors.")
@@ -130,7 +144,7 @@ def _embed(embedder, texts):
     return vectors / norms
 
 
-def _manifest(root, identity):
+def _manifest(root: Path, identity: str) -> dict[str, Any] | None:
     try:
         value = json.loads((root / "manifest.json").read_text())
         if (
@@ -151,7 +165,7 @@ def _manifest(root, identity):
         return None
 
 
-def _indexed_count(catalog, generation):
+def _indexed_count(catalog: CatalogStore, generation: str) -> int:
     with catalog.db_sessions() as session:
         return session.scalar(select(func.count()).select_from(RetrievalMemberRecord).join(
             SkillEmbeddingRecord,
@@ -165,7 +179,7 @@ def _indexed_count(catalog, generation):
         ))
 
 
-def _publish(root, manifest):
+def _publish(root: Path, manifest: dict[str, Any]) -> None:
     temporary = root / "manifest.json.part"
     try:
         with temporary.open("w") as output:
@@ -177,7 +191,9 @@ def _publish(root, manifest):
         temporary.unlink(missing_ok=True)
 
 
-def index_catalog(catalog, *, allow_download=True, embedder=None):
+def index_catalog(
+    catalog: CatalogStore, *, allow_download: bool = True, embedder: Embedder | None = None,
+) -> RetrievalStatus:
     """Resume embeddings, then publish a complete index. Caller owns the writer lock.
 
     Tests may supply an embedder with an ``embed(texts)`` method; production uses pinned E5.
@@ -282,7 +298,7 @@ def index_catalog(catalog, *, allow_download=True, embedder=None):
 
 
 class HybridRetriever:
-    def __init__(self, catalog, *, embedder=None):
+    def __init__(self, catalog: CatalogStore, *, embedder: Embedder | None = None) -> None:
         self.catalog = catalog
         self.root = _paths(catalog)
         self.identity = _identity(catalog)
@@ -312,7 +328,7 @@ class HybridRetriever:
                 self._generation = manifest["generation"]
             return self._index, manifest
 
-    def status(self):
+    def status(self) -> RetrievalStatus:
         try:
             resources = self._resources()
             if resources:
@@ -350,7 +366,7 @@ class HybridRetriever:
                 ids.extend(found[key] for key in batch if key in found)
         return self.catalog.eligible(ids, agent=agent, excluded=excluded)
 
-    def search(self, task, agent, excluded):
+    def search(self, task: str, agent: Agent, excluded: Iterable[str]) -> list[Skill]:
         excluded = set(excluded)
         lexical = self.catalog.keyword_search(task, agent=agent, excluded=excluded, limit=200)
         semantic = []

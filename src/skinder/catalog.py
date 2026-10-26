@@ -4,36 +4,38 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
+from typing import Any, Literal
 
 from sqlalchemy import column, func, literal_column, or_, select, table, text
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import sessionmaker
 
 from .database import create_database
-from .models import Catalog, Skill
+from .models import Agent, Catalog, Skill
 from .orm import CatalogAliasRecord, CatalogSkillRecord
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def default_catalog_db_path():
+def default_catalog_db_path() -> Path:
     return Path(os.environ.get("SKINDER_CATALOG_DB_PATH", ROOT / ".data" / "catalog.sqlite3"))
 
 
-def stable_id(repository, skill_path):
+def stable_id(repository: str, skill_path: str) -> str:
     directory = str(PurePosixPath(skill_path).parent)
     return hashlib.sha256(f"{repository.lower()}:{directory}".encode()).hexdigest()[:20]
 
 
-def retrieval_text(skill):
+def retrieval_text(skill: Skill) -> str:
     return "\n".join([
         skill.name, skill.description, skill.category, " ".join(skill.tags),
         *skill.requirements, *skill.workflow, *skill.output_style,
     ])
 
 
-def keyword_query(query):
+def keyword_query(query: str) -> str:
     # Quote tokens, rather than exposing FTS operators or SQL to user input.
     tokens = list(dict.fromkeys(re.findall(r"[^\W_]+", query.casefold())))[:64]
     return " OR ".join(f'"{token}"' for token in tokens)
@@ -45,16 +47,19 @@ skills_fts = table("skills_fts", column("skill_id"))
 
 
 class CatalogStore:
-    def __init__(self, path):
+    def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.engine = create_database(self.path, "catalog")
         # Each operation owns its session, including worker-thread searches.
         self.db_sessions = sessionmaker(self.engine, expire_on_commit=False)
 
-    def close(self):
+    def close(self) -> None:
         self.engine.dispose()
 
-    def upsert(self, skill, *, provider_id=None, raw=None, source_updated_at=None):
+    def upsert(
+        self, skill: Skill, *, provider_id: str | None = None,
+        raw: dict[str, Any] | None = None, source_updated_at: str | float | None = None,
+    ) -> Literal["added", "updated", "unchanged"]:
         content = retrieval_text(skill)
         text_hash = hashlib.sha256(content.encode()).hexdigest()
         payload = skill.model_dump_json(by_alias=True)
@@ -98,12 +103,12 @@ class CatalogStore:
                 "tags": " ".join(skill.tags), "author": skill.author})
         return "updated" if previous else "added"
 
-    def get(self, skill_id):
+    def get(self, skill_id: str) -> Skill | None:
         with self.db_sessions() as session:
             row = session.get(CatalogSkillRecord, skill_id)
             return Skill.model_validate_json(row.data) if row else None
 
-    def get_many(self, ids):
+    def get_many(self, ids: Iterable[str]) -> list[Skill]:
         ids = list(dict.fromkeys(ids))
         found = {}
         with self.db_sessions() as session:
@@ -115,11 +120,13 @@ class CatalogStore:
                 found.update((row.id, Skill.model_validate_json(row.data)) for row in rows)
         return [found[skill_id] for skill_id in ids if skill_id in found]
 
-    def count(self):
+    def count(self) -> int:
         with self.db_sessions() as session:
-            return session.scalar(select(func.count()).select_from(CatalogSkillRecord))
+            return session.execute(select(func.count()).select_from(CatalogSkillRecord)).scalar_one()
 
-    def page(self, *, q="", category=None, offset=0, limit=50):
+    def page(
+        self, *, q: str = "", category: str | None = None, offset: int = 0, limit: int = 50,
+    ) -> Catalog:
         match = keyword_query(q)
         statement = select(CatalogSkillRecord.data)
         order = (CatalogSkillRecord.name.collate("NOCASE"), CatalogSkillRecord.id)
@@ -149,7 +156,10 @@ class CatalogStore:
             total=total, has_more=offset + len(rows) < total,
         )
 
-    def keyword_search(self, query, *, agent=None, excluded=(), limit=200):
+    def keyword_search(
+        self, query: str, *, agent: Agent | None = None,
+        excluded: Iterable[str] = (), limit: int = 200,
+    ) -> list[Skill]:
         match = keyword_query(query)
         if not match:
             return []
@@ -174,7 +184,9 @@ class CatalogStore:
             ).limit(limit), {"match": match}).all()
         return [Skill.model_validate_json(row) for row in rows]
 
-    def eligible(self, ids, *, agent=None, excluded=()):
+    def eligible(
+        self, ids: Iterable[str], *, agent: Agent | None = None, excluded: Iterable[str] = (),
+    ) -> list[Skill]:
         excluded = set(excluded)
         return [skill for skill in self.get_many(ids) if skill.id not in excluded and (
             agent is None or skill.compatibility is None or agent in skill.compatibility

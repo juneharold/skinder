@@ -497,6 +497,50 @@ describe("skill discovery", () => {
     expect(backend.getSession()?.feedback.map((item) => item.skill_id)).toEqual(["design"]);
   });
 
+  it("restores a match accepted by the server when its response is lost without starting another job", async () => {
+    const backend = installBackend({ session: null });
+    const acceptMatch = vi.mocked(api.match).getMockImplementation()!;
+    vi.mocked(api.match).mockImplementationOnce(async (...args) => {
+      await acceptMatch(...args);
+      throw new TypeError("The connection closed before the response arrived.");
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.type(await screen.findByRole("textbox", { name: /What are you working on/ }), "Plan an onboarding flow");
+    await user.click(screen.getByRole("button", { name: "Find skills" }));
+
+    expect(await screen.findByRole("heading", { name: "Thoughtful Design" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Plan an onboarding flow" })).toBeVisible();
+    expect(backend.getMatchRequests()).toEqual([{ task: "Plan an onboarding flow", agent: "codex" }]);
+    expect(screen.queryByRole("button", { name: "Retry matching" })).not.toBeInTheDocument();
+  });
+
+  it("keeps cancellation authoritative when an earlier poll returns a running session", async () => {
+    const previousSkill = skill("design", "Thoughtful Design");
+    const running = sessionFor([previousSkill], { status: "running" });
+    const backend = installBackend({ session: running });
+    const stalePoll = deferred<Awaited<ReturnType<typeof api.session>>>();
+    vi.mocked(api.session).mockReturnValueOnce(stalePoll.promise);
+    const user = userEvent.setup();
+    render(<App />);
+
+    const stop = await screen.findByRole("button", { name: "Stop matching" });
+    await waitFor(() => expect(api.session).toHaveBeenCalled(), { timeout: 2000 });
+    await user.click(stop);
+    expect(await screen.findByRole("heading", { name: "Thoughtful Design" })).toBeVisible();
+
+    await act(async () => {
+      stalePoll.resolve(running);
+      await stalePoll.promise;
+    });
+
+    expect(backend.getSession()?.status).toBe("cancelled");
+    expect(screen.getByRole("heading", { name: "Thoughtful Design" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save this skill" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Stop matching" })).not.toBeInTheDocument();
+  });
+
   it("ignores an old saved-items failure after a newer bookmark succeeds", async () => {
     const backend = installBackend();
     const staleRead = deferred<Awaited<ReturnType<typeof api.saved>>>();

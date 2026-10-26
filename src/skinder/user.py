@@ -1,12 +1,16 @@
 import json
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal, TypedDict
 from uuid import uuid4
 
 from sqlalchemy import delete, or_, select, update
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from .database import create_database
-from .models import Feedback, FeedbackInput, MatchSession, Profile
+from .models import Agent, Feedback, FeedbackInput, MatchSession, Profile, Recommendation
 from .orm import (
     BookmarkRecord,
     FeedbackRecord,
@@ -16,15 +20,40 @@ from .orm import (
 )
 
 
-def now():
+class Bookmark(TypedDict):
+    skill_id: str
+    saved_at: str
+    feedback_id: str | None
+
+
+class PreferenceEvent(TypedDict):
+    skill_id: str
+    action: Literal["save", "pass"]
+    reason: Literal["wrong-task", "wrong-style", "too-much-setup"] | None
+    task: str
+    agent: Agent
+
+
+def now() -> str:
     return datetime.now(UTC).isoformat()
 
 
 class UserStore:
-    def __init__(self, path):
+    def __init__(self, path: str | Path) -> None:
         self.engine = create_database(path, "user")
         self.db_sessions = sessionmaker(self.engine, expire_on_commit=False)
+
+    @contextmanager
+    def _write_session(self) -> Iterator[Session]:
         with self.db_sessions.begin() as db:
+            # Reserve the writer before reading so concurrent operations cannot
+            # make the same decision and then fail while upgrading a read lock.
+            db.connection(execution_options={"sqlite_begin_mode": "IMMEDIATE"})
+            yield db
+
+    def recover_interrupted_sessions(self) -> None:
+        """Recover after startup has established exclusive ownership of this user database."""
+        with self._write_session() as db:
             db.execute(
                 update(MatchSessionRecord)
                 .where(MatchSessionRecord.status.in_(("running", "pending")))
@@ -35,20 +64,20 @@ class UserStore:
                 )
             )
 
-    def close(self):
+    def close(self) -> None:
         self.engine.dispose()
 
-    def get_profile(self):
+    def get_profile(self) -> Profile:
         with self.db_sessions() as db:
             row = db.get(ProfileRecord, 1)
             return Profile.model_validate_json(row.data) if row else Profile()
 
-    def set_profile(self, profile):
-        with self.db_sessions.begin() as db:
+    def set_profile(self, profile: Profile) -> Profile:
+        with self._write_session() as db:
             db.merge(ProfileRecord(id=1, data=profile.model_dump_json()))
         return profile
 
-    def get_match_session(self, session_id):
+    def get_match_session(self, session_id: str) -> MatchSession | None:
         with self.db_sessions() as db:
             row = db.get(MatchSessionRecord, session_id)
             if row is None:
@@ -65,16 +94,18 @@ class UserStore:
                 error=row.error, created_at=row.created_at, updated_at=row.updated_at,
             )
 
-    def get_current_match_session(self):
+    def get_current_match_session(self) -> MatchSession | None:
         with self.db_sessions() as db:
             session_id = db.scalar(
                 select(MatchSessionRecord.id).order_by(MatchSessionRecord.updated_at.desc()).limit(1)
             )
         return self.get_match_session(session_id) if session_id else None
 
-    def start_match_session(self, task, agent, session_id=None):
+    def start_match_session(
+        self, task: str, agent: Agent, session_id: str | None = None,
+    ) -> MatchSession | None:
         timestamp = now()
-        with self.db_sessions.begin() as db:
+        with self._write_session() as db:
             if session_id:
                 db.execute(
                     update(MatchSessionRecord)
@@ -89,11 +120,14 @@ class UserStore:
                 ))
         return self.get_match_session(session_id)
 
-    def finish_match_session(self, session_id, status, recommendations=None, error=None):
+    def finish_match_session(
+        self, session_id: str, status: Literal["completed", "failed", "cancelled"],
+        recommendations: Sequence[Recommendation] | None = None, error: str | None = None,
+    ) -> None:
         values = {"status": status, "error": error, "updated_at": now()}
         if recommendations is not None:
             values["recommendations"] = json.dumps([r.model_dump() for r in recommendations])
-        with self.db_sessions.begin() as db:
+        with self._write_session() as db:
             # Cancellation is authoritative even if a subprocess produces a late result.
             changed = db.execute(
                 update(MatchSessionRecord)
@@ -112,14 +146,14 @@ class UserStore:
                 for skill_id in {r.skill_id for r in recommendations} - known
             ])
 
-    def get_seen_skill_ids(self, session_id):
+    def get_seen_skill_ids(self, session_id: str) -> set[str]:
         with self.db_sessions() as db:
             return set(db.scalars(
                 select(FeedbackRecord.skill_id).where(FeedbackRecord.session_id == session_id)
             ))
 
-    def add_feedback(self, value: FeedbackInput):
-        with self.db_sessions.begin() as db:
+    def add_feedback(self, value: FeedbackInput) -> Feedback:
+        with self._write_session() as db:
             if db.get(MatchSessionSkillRecord, (value.session_id, value.skill_id)) is None:
                 raise ValueError("Feedback requires a skill recommended in this task session.")
             previous = db.scalar(select(FeedbackRecord).where(
@@ -140,12 +174,12 @@ class UserStore:
         return result
 
     @staticmethod
-    def _require_feedback_idle(session):
+    def _require_feedback_idle(session: MatchSessionRecord) -> None:
         if session.status in ("pending", "running"):
             raise ValueError("Wait for matching to finish or cancel it before changing feedback.")
 
-    def undo_feedback(self, feedback_id):
-        with self.db_sessions.begin() as db:
+    def undo_feedback(self, feedback_id: str) -> None:
+        with self._write_session() as db:
             row = db.get(FeedbackRecord, feedback_id)
             if row is None:
                 return
@@ -169,7 +203,7 @@ class UserStore:
                 else:
                     db.delete(bookmark)
 
-    def get_bookmarks(self):
+    def get_bookmarks(self) -> list[Bookmark]:
         with self.db_sessions() as db:
             rows = db.scalars(select(BookmarkRecord).order_by(BookmarkRecord.saved_at.desc()))
             return [
@@ -177,19 +211,19 @@ class UserStore:
                 for row in rows
             ]
 
-    def add_bookmark(self, skill_id):
-        with self.db_sessions.begin() as db:
+    def add_bookmark(self, skill_id: str) -> None:
+        with self._write_session() as db:
             bookmark = db.get(BookmarkRecord, skill_id)
             if bookmark:
                 bookmark.feedback_id = None
             else:
                 db.add(BookmarkRecord(skill_id=skill_id, saved_at=now()))
 
-    def remove_bookmark(self, skill_id):
-        with self.db_sessions.begin() as db:
+    def remove_bookmark(self, skill_id: str) -> None:
+        with self._write_session() as db:
             db.execute(delete(BookmarkRecord).where(BookmarkRecord.skill_id == skill_id))
 
-    def get_preference_events(self, agent):
+    def get_preference_events(self, agent: Agent) -> list[PreferenceEvent]:
         # A plain pass and wrong-task reason are local exclusions, never global taste signals.
         with self.db_sessions() as db:
             rows = db.execute(

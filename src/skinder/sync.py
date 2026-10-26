@@ -7,9 +7,11 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
@@ -26,11 +28,11 @@ DIMENSIONS = ("language", "category", "occupation")
 logger = logging.getLogger(__name__)
 
 
-def now():
+def now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def sync_status(catalog):
+def sync_status(catalog: CatalogStore) -> dict[str, Any] | None:
     """Read existing state without initializing or mutating a sync run."""
     with catalog.db_sessions() as session:
         row = session.get(SyncRunRecord, 1)
@@ -91,7 +93,7 @@ class TaxonomyLinks(HTMLParser):
                     self.links.add(path)
 
 
-def language_values(document):
+def language_values(document: Any) -> list[str]:
     """Find language enums in parameters or named schemas in the public API contract."""
     result = set()
 
@@ -111,7 +113,9 @@ def language_values(document):
     return sorted(result)
 
 
-def import_skill(row, category=None, previous=None):
+def import_skill(
+    row: Any, category: str | None = None, previous: Skill | None = None,
+) -> Skill:
     if not isinstance(row, dict):
         raise TypeError("Skill row is not an object")
     for field in ("id", "name", "githubUrl"):
@@ -170,7 +174,11 @@ def import_skill(row, category=None, previous=None):
 
 
 class Sync:
-    def __init__(self, catalog, client, *, max_requests=None, sleep=time.sleep, monotonic=time.monotonic):
+    def __init__(
+        self, catalog: CatalogStore, client: httpx.Client, *, max_requests: int | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.catalog, self.client = catalog, client
         self.max_requests, self.sleep, self.monotonic = max_requests, sleep, monotonic
         self.calls, self.last_call = 0, None
@@ -425,14 +433,14 @@ class Sync:
         return sync_status(self.catalog)
 
 
-def positive(value):
+def positive(value: str) -> int:
     number = int(value)
     if not 1 <= number <= 10_000_000:
         raise argparse.ArgumentTypeError("must be between 1 and 10000000")
     return number
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--catalog-db-path", type=str, default=str(default_catalog_db_path()),

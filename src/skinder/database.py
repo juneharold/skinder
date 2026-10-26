@@ -1,13 +1,17 @@
 """SQLite engine configuration and versioned database initialization."""
 
 from pathlib import Path
+from typing import Literal
 
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import URL, create_engine, event
+from sqlalchemy.engine import Engine
+
+DatabaseKind = Literal["user", "catalog"]
 
 
-def sqlite_engine(url):
+def sqlite_engine(url: URL) -> Engine:
     engine = create_engine(url, connect_args={"timeout": 30, "check_same_thread": False})
 
     @event.listens_for(engine, "connect")
@@ -31,7 +35,7 @@ def sqlite_engine(url):
     return engine
 
 
-def migration_config(kind):
+def migration_config(kind: DatabaseKind) -> Config:
     if kind not in {"user", "catalog"}:
         raise ValueError("Database kind must be 'user' or 'catalog'")
     config = Config()
@@ -39,7 +43,7 @@ def migration_config(kind):
     return config
 
 
-def create_database(path, kind):
+def create_database(path: str | Path, kind: DatabaseKind) -> Engine:
     config = migration_config(kind)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

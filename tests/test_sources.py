@@ -1,9 +1,11 @@
 import asyncio
 import json
+import sqlite3
+import threading
 
 import httpx
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from test_catalog_store import example_skill
 
 from skinder.catalog import CatalogStore
@@ -90,3 +92,60 @@ def test_prompt_bound_keeps_task_preferences_and_limits_candidates():
     assert result["task"] == task and result["profile"] == profile
     assert [row["id"] for row in result["eligible_skills"]] == [str(i) for i in range(40)]
     assert len(json.dumps(result, ensure_ascii=False)) <= MAX_PROMPT_CHARS
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_cache_write_contention_keeps_loop_responsive_and_drains_on_cancel(tmp_path, cancel):
+    catalog = CatalogStore(tmp_path / "catalog.sqlite3")
+    skill = example_skill(1)
+    catalog.upsert(skill)
+    acquired, release, released, writing = (threading.Event() for _ in range(4))
+
+    def hold_writer():
+        with sqlite3.connect(catalog.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            acquired.set()
+            release.wait(timeout=3)
+            connection.rollback()
+        released.set()
+
+    def observe_write(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith("INSERT INTO source_cache"):
+            writing.set()
+
+    event.listen(catalog.engine, "before_cursor_execute", observe_write)
+    writer = threading.Thread(target=hold_writer)
+    writer.start()
+    task = None
+    try:
+        assert await asyncio.to_thread(acquired.wait, 2)
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, text="Review the code."))
+        task = asyncio.create_task(SourceEnricher(catalog, transport=transport).enrich([skill]))
+        assert await asyncio.to_thread(writing.wait, 2)
+        # The loop must regain control before the competing writer's watchdog releases its lock.
+        assert not released.is_set()
+        if cancel:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await task
+            assert result[0]["source_excerpt"] == "Review the code."
+        # Even on cancellation, no cache write is left running after enrich returns.
+        with catalog.db_sessions() as session:
+            assert session.get(SourceCacheRecord, skill.id).content == "Review the code."
+    finally:
+        release.set()
+        await asyncio.to_thread(writer.join, 4)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        event.remove(catalog.engine, "before_cursor_execute", observe_write)
+        catalog.close()

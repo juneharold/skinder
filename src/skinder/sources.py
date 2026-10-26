@@ -3,13 +3,18 @@
 import asyncio
 import json
 import time
+from collections.abc import Mapping, Sequence
+from typing import Any, TypedDict
 from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert
 
+from .catalog import CatalogStore
+from .models import Skill
 from .orm import CatalogSkillRecord, SourceCacheRecord
+from .work import run_sync
 
 MAX_FILE_BYTES = 256 * 1024
 MAX_EXCERPT = 4000
@@ -21,7 +26,18 @@ MATCH_FIELDS = {
 }
 
 
-def raw_skill_url(skill):
+class SourceContent(TypedDict):
+    content: str
+    fetched_at: float
+
+
+class CachedSource(SourceContent):
+    skill_id: str
+    source_url: str
+    source_updated_at: str | None
+
+
+def raw_skill_url(skill: Skill) -> str | None:
     url = urlsplit(skill.source_url)
     if (url.scheme != "https" or url.hostname != "github.com" or url.port is not None
             or url.username or url.password):
@@ -39,7 +55,7 @@ def raw_skill_url(skill):
     return "https://raw.githubusercontent.com/" + quote(path, safe="/")
 
 
-def match_metadata(skill):
+def match_metadata(skill: Skill) -> dict[str, Any]:
     data = skill.model_dump(include=MATCH_FIELDS)
     data["description"] = data["description"][:2000]
     data["name"] = data["name"][:300]
@@ -52,7 +68,10 @@ def match_metadata(skill):
     return data
 
 
-def bounded_request(task, profile, feedback, candidates):
+def bounded_request(
+    task: str, profile: dict[str, Any], feedback: Sequence[Mapping[str, Any]],
+    candidates: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
     request = {
         "task": task, "profile": profile, "recent_feedback": list(feedback),
         "eligible_skills": [dict(item) for item in candidates[:40]],
@@ -73,46 +92,66 @@ def bounded_request(task, profile, feedback, candidates):
 
 
 class SourceEnricher:
-    def __init__(self, catalog, *, transport=None, timeout=20):
+    def __init__(
+        self, catalog: CatalogStore, *, transport: httpx.AsyncBaseTransport | None = None,
+        timeout: float = 20,
+    ) -> None:
         self.catalog = catalog
         self.transport = transport
         self.timeout = timeout
 
-    def cached(self, skill):
+    def cached(self, skill: Skill) -> tuple[CachedSource | None, str | None]:
         with self.catalog.db_sessions() as session:
             row = session.get(SourceCacheRecord, skill.id)
             current = session.scalar(select(CatalogSkillRecord.source_updated_at).where(
                 CatalogSkillRecord.id == skill.id
             ))
-            cached = ({
+            cached: CachedSource | None = ({
                 "skill_id": row.skill_id, "source_url": row.source_url,
                 "source_updated_at": row.source_updated_at,
                 "fetched_at": row.fetched_at, "content": row.content,
             } if row else None)
         return cached, current
 
+    def _cache(
+        self, skill: Skill, source_updated_at: str | None, fetched_at: float, content: str,
+    ) -> None:
+        with self.catalog.db_sessions.begin() as session:
+            statement = insert(SourceCacheRecord).values(
+                skill_id=skill.id, source_url=skill.source_url,
+                source_updated_at=source_updated_at, fetched_at=fetched_at, content=content,
+            )
+            session.execute(statement.on_conflict_do_update(
+                index_elements=["skill_id"],
+                set_={key: getattr(statement.excluded, key) for key in (
+                    "source_url", "source_updated_at", "fetched_at", "content",
+                )},
+            ))
+
     @staticmethod
-    def with_content(item, row, status):
+    def with_content(
+        item: dict[str, Any], row: SourceContent, status: str,
+    ) -> dict[str, Any]:
         return {
             **item, "source_status": status, "source_excerpt": row["content"][:MAX_EXCERPT],
             "source_truncated": len(row["content"]) > MAX_EXCERPT,
             "source_fetched_at": row["fetched_at"],
         }
 
-    async def enrich(self, skills):
+    async def enrich(self, skills: Sequence[Skill]) -> list[dict[str, Any]]:
         results = [match_metadata(skill) for skill in skills]
         semaphore = asyncio.Semaphore(4)
         async with httpx.AsyncClient(
             timeout=10, transport=self.transport, follow_redirects=False,
             headers={"User-Agent": "Skinder-source-reader/1.0"},
         ) as client:
-            async def read(index, skill):
+            async def read(index: int, skill: Skill) -> None:
                 item = results[index]
                 if skill.provenance == "bundled":
                     # Bundled metadata already contains reviewed, pinned source evidence.
                     results[index] = {**item, "source_status": "reviewed-metadata"}
                     return
-                cached, stamp = self.cached(skill)
+                cached, stamp = await run_sync(self.cached, skill)
                 same_source = cached and cached["source_url"] == skill.source_url
                 fresh = same_source and cached["source_updated_at"] == stamp and (
                     time.time() - cached["fetched_at"] < CACHE_SECONDS
@@ -141,24 +180,16 @@ class SourceEnricher:
                 except (httpx.HTTPError, UnicodeError, ValueError):
                     return
                 fetched_at = time.time()
-                with self.catalog.db_sessions.begin() as session:
-                    statement = insert(SourceCacheRecord).values(
-                        skill_id=skill.id, source_url=skill.source_url,
-                        source_updated_at=stamp, fetched_at=fetched_at, content=text,
-                    )
-                    session.execute(statement.on_conflict_do_update(
-                        index_elements=["skill_id"],
-                        set_={key: getattr(statement.excluded, key) for key in (
-                            "source_url", "source_updated_at", "fetched_at", "content",
-                        )},
-                    ))
+                await run_sync(self._cache, skill, stamp, fetched_at, text)
                 results[index] = self.with_content(
                     item, {"content": text, "fetched_at": fetched_at}, "fetched"
                 )
 
             try:
                 async with asyncio.timeout(self.timeout):
-                    await asyncio.gather(*(read(index, skill) for index, skill in enumerate(skills)))
+                    async with asyncio.TaskGroup() as reads:
+                        for index, skill in enumerate(skills):
+                            reads.create_task(read(index, skill))
             except TimeoutError:
                 pass
         return results

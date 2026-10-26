@@ -8,6 +8,7 @@ import shutil
 import signal
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from .models import CodexStatus, MatchResult
 
@@ -16,7 +17,7 @@ class MatchError(RuntimeError):
     pass
 
 
-async def terminate(process):
+async def terminate(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGTERM)
@@ -28,7 +29,7 @@ async def terminate(process):
             await process.wait()
 
 
-def codex_environment():
+def codex_environment() -> dict[str, str]:
     env = os.environ.copy()
     for key in (
         "CODEX_THREAD_ID",
@@ -43,10 +44,10 @@ def codex_environment():
 
 
 class CodexMatcher:
-    def __init__(self, timeout=180):
+    def __init__(self, timeout: float = 180) -> None:
         self.timeout = timeout
 
-    async def health(self):
+    async def health(self) -> CodexStatus:
         executable = shutil.which("codex")
         if not executable:
             return CodexStatus(
@@ -82,7 +83,7 @@ class CodexMatcher:
             if process is not None:
                 await terminate(process)
 
-    async def match(self, request):
+    async def match(self, request: dict[str, Any]) -> str:
         executable = shutil.which("codex")
         if not executable:
             raise MatchError(

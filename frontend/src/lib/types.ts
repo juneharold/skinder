@@ -10,7 +10,7 @@ export type MatchSession = components["schemas"]["MatchSession"];
 export type Health = components["schemas"]["Health"];
 export type SavedItem = components["schemas"]["SavedItem"];
 export type Saved = components["schemas"]["Saved"];
-export type FeedbackResult = { feedback: Feedback; saved: Saved };
+export type FeedbackResult = components["schemas"]["FeedbackResult"];
 export const defaultProfile: Profile = {
   agent: "codex",
   planning: "balanced",

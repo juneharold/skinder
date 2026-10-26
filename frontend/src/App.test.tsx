@@ -10,6 +10,24 @@ beforeEach(() => vi.restoreAllMocks());
 afterEach(() => vi.restoreAllMocks());
 
 describe("skill discovery", () => {
+  it("keeps catalog bookmarks usable when Codex is unavailable", async () => {
+    const backend = installBackend({ session: null });
+    vi.mocked(api.health).mockResolvedValue({
+      status: "ok", catalog_count: backend.skills.length,
+      codex: { installed: false, authenticated: false, message: "Install Codex." },
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByRole("textbox", { name: "What are you working on?" }), "Build a portfolio");
+    expect(screen.getByRole("button", { name: "Find skills" })).toBeDisabled();
+    await user.click(screen.getByRole("link", { name: "Explore" }));
+    await user.click(await screen.findByRole("button", { name: "Save Thoughtful Design" }));
+    await screen.findByRole("button", { name: "Remove Thoughtful Design from saved" });
+    expect(backend.getSaved().map(item => item.skill.id)).toEqual(["design"]);
+    expect(backend.getSession()).toBeNull();
+    expect(backend.getMatchRequests()).toEqual([]);
+  });
+
   it("retries a lost save response idempotently without starting a new match", async () => {
     const backend = installBackend();
     const feedback = vi.mocked(api.feedback).getMockImplementation()!;

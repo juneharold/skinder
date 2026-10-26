@@ -15,7 +15,7 @@ export default function SkillCard({
   onOpen: () => void;
   onSwipe: (action: "save" | "pass") => void;
 }) {
-  const start = useRef<{ x: number; y: number } | null>(null);
+  const start = useRef<{ x: number; y: number; pointerId: number } | null>(null);
   const [drag, setDrag] = useState(0);
   function reset() {
     start.current = null;
@@ -33,16 +33,25 @@ export default function SkillCard({
       onPointerDown={(event) => {
         if (
           disabled ||
+          start.current ||
           event.button !== 0 ||
           (event.target as HTMLElement).closest(
             "button,a,input,select,textarea",
           )
         )
           return;
-        start.current = { x: event.clientX, y: event.clientY };
+        start.current = {
+          x: event.clientX,
+          y: event.clientY,
+          pointerId: event.pointerId,
+        };
       }}
       onPointerMove={(event) => {
-        if (!start.current || disabled) return;
+        if (
+          !start.current ||
+          start.current.pointerId !== event.pointerId ||
+          disabled
+        ) return;
         const dx = event.clientX - start.current.x;
         const dy = event.clientY - start.current.y;
         if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 10) {
@@ -55,7 +64,7 @@ export default function SkillCard({
         }
       }}
       onPointerUp={(event) => {
-        if (!start.current) return;
+        if (!start.current || start.current.pointerId !== event.pointerId) return;
         const dx = event.clientX - start.current.x;
         const dy = event.clientY - start.current.y;
         reset();
@@ -66,8 +75,12 @@ export default function SkillCard({
         )
           onSwipe(dx > 0 ? "save" : "pass");
       }}
-      onPointerCancel={reset}
-      onLostPointerCapture={reset}
+      onPointerCancel={(event) => {
+        if (start.current?.pointerId === event.pointerId) reset();
+      }}
+      onLostPointerCapture={(event) => {
+        if (start.current?.pointerId === event.pointerId) reset();
+      }}
     >
       <div className="card-topline">
         <span className="card-index" aria-hidden="true">

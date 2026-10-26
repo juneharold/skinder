@@ -514,7 +514,7 @@ code {
   border: 2px solid var(--ink);
   border-bottom: 0;
   border-radius: 8px 8px 0 0;
-  touch-action: pan-y;
+  touch-action: pan-y pinch-zoom;
   transform: translateX(var(--drag, 0)) rotate(var(--rotation, 0));
   transition: transform 0.12s ease;
 }

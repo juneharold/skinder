@@ -76,4 +76,14 @@ describe("skill card gestures", () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
     expect(onSwipe).not.toHaveBeenCalled();
   });
+
+  it("does not let a second touch turn a stationary press into a swipe", () => {
+    const { card, onSwipe } = renderCard();
+    fireEvent.pointerDown(card, { button: 0, pointerId: 1, clientX: 180, clientY: 80 });
+    fireEvent.pointerDown(card, { button: 0, pointerId: 2, clientX: 300, clientY: 80 });
+    fireEvent.pointerMove(card, { pointerId: 2, clientX: 40, clientY: 82 });
+    fireEvent.pointerUp(card, { pointerId: 2, clientX: 40, clientY: 82 });
+    fireEvent.pointerUp(card, { pointerId: 1, clientX: 180, clientY: 80 });
+    expect(onSwipe).not.toHaveBeenCalled();
+  });
 });

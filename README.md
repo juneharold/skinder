@@ -2,7 +2,7 @@
 
 **Find your kind of skill.** A local app that matches your task and your taste with real agent skills for Codex and Claude Code.
 
-Describe what you want to do, add optional working and output preferences, and meet a deck of relevant skills. Pass, save, or explain what did not click. Inspect the source and copy installation instructions when you find a good match.
+Describe what you want to do, add optional working and output preferences, and review a deck of relevant skills. Pass, save, or explain why a skill does not fit. You can also save skills directly from the catalog or their details. Inspect the source and copy installation instructions when you find a good match.
 
 ## Run locally
 
@@ -28,11 +28,13 @@ Catalog browsing, source inspection, and saved skills work without a Codex login
 
 - A pinned catalog of real skills from multiple maintainers, across development, design, writing, research, documents, data, productivity, and marketing.
 - Separate explanations for task fit and working-style fit, with setup and style caveats when relevant.
-- Swipe gestures, pass/save buttons, keyboard controls (left/right arrows, Z to undo), and an optional reason for passing.
-- Saved skills, search and category filters, source evidence, and copyable installation instructions.
-- Persistent preferences and progress. Refreshing the page returns to the latest task.
+- Swipe gestures, labeled pass/save buttons, keyboard controls while reviewing the deck (left/right arrows, Z to undo), and an optional reason for passing.
+- Bookmarks from the deck, catalog, or skill details, with search, category filters, source evidence, and copyable installation instructions.
+- Persistent preferences and progress. Refreshing restores the latest task and the view and filters in the URL; browser Back and Forward restore navigation.
 
-Task relevance comes first. Explicit preferences take priority over learned hints. A plain pass or “not this task” only dismisses the skill for the current task; “not my style” and “too much setup” can inform later matches. Saves are weak, contextual preference signals. Feedback changes the next batch, not the deck you are currently reviewing.
+Task relevance comes first. Explicit preferences take priority over learned hints. A plain pass or “not this task” only dismisses the skill for the current task; “not my style” and “too much setup” can inform later matches. Saves from the deck are weak, contextual preference signals. Direct catalog and detail bookmarks do not create preference feedback. Feedback changes the next batch, not the deck you are currently reviewing.
+
+Editing a task starts a new deck; finding more continues the task shown above the current deck. Undo reverses the latest choice in the current batch and preserves skills saved independently. Passing a skill never removes an existing bookmark.
 
 Style descriptions are interpretations of source instructions, not measured performance or guarantees about output. Some skills require additional tools or a companion suite; their details describe those requirements. Skinder copies installation instructions and never installs or executes a discovered skill.
 

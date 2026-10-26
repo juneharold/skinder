@@ -5,135 +5,204 @@ import {
   ArrowUpRight,
   Bookmark,
   Check,
-  ChevronDown,
-  Compass,
-  Heart,
-  LoaderCircle,
+  Pencil,
   RotateCcw,
   Search,
   SlidersHorizontal,
-  Sparkles,
-  X,
-  Zap,
 } from "lucide-react";
-import { api } from "./lib/api";
+import { api, ApiError } from "./lib/api";
 import {
   defaultProfile,
   type Agent,
   type Health,
   type MatchSession,
-  type PassReason,
   type Profile,
+  type PassReason,
   type SavedItem,
   type Skill,
 } from "./lib/types";
-import { BrandMark, SkillIcon } from "./components/Icons";
 import Preferences from "./components/Preferences";
 import SkillDetail from "./components/SkillDetail";
 import SkillCard from "./components/SkillCard";
+import Dialog from "./components/Dialog";
 
 type View = "discover" | "explore" | "saved";
-const examples = [
-  {
-    label: "Build something beautiful",
-    task: "Build a distinctive landing page for my new product. I want thoughtful typography and a clean, playful visual style.",
-    category: "Design",
-  },
-  {
-    label: "Find the right words",
-    task: "Turn my rough product notes into clear, warm website copy. Keep it concise and avoid marketing jargon.",
-    category: "Writing",
-  },
-  {
-    label: "Make sense of the data",
-    task: "Explore a CSV of customer feedback, find useful patterns, and explain the results with clear charts.",
-    category: "Data",
-  },
-];
+type Resource = "catalog" | "profile" | "session" | "saved" | "health";
+type LoadState = "loading" | "ready" | "error";
+type MatchRequest = {
+  task: string;
+  agent: Agent;
+  sessionId?: string;
+  baseline: MatchSession | null;
+  uncertain?: boolean;
+};
+type ActionError = {
+  message: string;
+  label: string;
+  retry: () => void;
+  skillId?: string;
+  kind?: "bookmark";
+};
+const message = (error: unknown) =>
+  error instanceof Error ? error.message : "Please try again.";
+const isMatching = (session: MatchSession | null) =>
+  session?.status === "pending" || session?.status === "running";
+function readLocation() {
+  const params = new URLSearchParams(window.location.search);
+  const view = params.get("view");
+  return {
+    view: (view === "explore" || view === "saved" ? view : "discover") as View,
+    q: params.get("q") ?? "",
+    category: params.get("category") ?? "All skills",
+  };
+}
 
 export default function App() {
-  const [view, setView] = useState<View>("discover");
+  const [location, setLocation] = useState(readLocation);
+  const { view, q, category } = location;
   const [skills, setSkills] = useState<Skill[]>([]);
   const [profile, setProfile] = useState<Profile>(defaultProfile);
   const [health, setHealth] = useState<Health | null>(null);
   const [session, setSession] = useState<MatchSession | null>(null);
+  const sessionRef = useRef<MatchSession | null>(null);
+  const sessionVersion = useRef(0);
   const [saved, setSaved] = useState<SavedItem[]>([]);
+  const savedVersion = useRef(0);
+  const loadVersions = useRef<Record<Resource, number>>({
+    catalog: 0,
+    profile: 0,
+    session: 0,
+    saved: 0,
+    health: 0,
+  });
+  const [loads, setLoads] = useState<Record<Resource, LoadState>>({
+    catalog: "loading",
+    profile: "loading",
+    session: "loading",
+    saved: "loading",
+    health: "loading",
+  });
+  const [loadErrors, setLoadErrors] = useState<
+    Partial<Record<Resource, string>>
+  >({});
   const [task, setTask] = useState("");
   const [agent, setAgent] = useState<Agent>("codex");
-  const [loading, setLoading] = useState(true);
-  const [bootError, setBootError] = useState("");
-  const [error, setError] = useState("");
-  const [toast, setToast] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
   const [preferencesOpen, setPreferencesOpen] = useState(false);
+  const preferenceGeneration = useRef(0);
+  const profileGuard = useRef(false);
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [profileError, setProfileError] = useState<{
+    message: string;
+    draft: Profile;
+  } | null>(null);
   const [detail, setDetail] = useState<Skill | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [departing, setDeparting] = useState<"save" | "pass" | null>(null);
+  const [writeBusy, setWriteBusy] = useState(false);
+  const writeGuard = useRef(false);
+  const [matchBusy, setMatchBusy] = useState(false);
+  const matchGuard = useRef(false);
+  const [cancelBusy, setCancelBusy] = useState(false);
+  const cancelGuard = useRef(false);
+  const [matchError, setMatchError] = useState<{
+    message: string;
+    request: MatchRequest;
+  } | null>(null);
+  const [actionError, setActionError] = useState<ActionError | null>(null);
+  const [pollError, setPollError] = useState("");
+  const [toast, setToast] = useState("");
   const [showPassReasons, setShowPassReasons] = useState(false);
-  const [search, setSearch] = useState("");
-  const [category, setCategory] = useState("All skills");
-  const [previewIndex, setPreviewIndex] = useState(0);
-  const taskRef = useRef<HTMLTextAreaElement>(null);
+  const [hadBatch, setHadBatch] = useState(false);
   const deckRef = useRef<HTMLDivElement>(null);
-  const operationRef = useRef(false);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setBootError("");
-    try {
-      const [catalog, storedProfile, current, bookmarks] = await Promise.all([
-        api.catalog(),
-        api.profile(),
-        api.current(),
-        api.saved(),
-      ]);
-      setSkills(catalog.skills);
-      setProfile(storedProfile);
-      setAgent(current?.agent ?? storedProfile.agent);
-      setSession(current);
-      setTask(current?.task ?? "");
-      setSaved(bookmarks.items);
-    } catch (error) {
-      setBootError(
-        error instanceof Error
-          ? error.message
-          : "Could not connect to Skinder.",
-      );
-    } finally {
-      setLoading(false);
-    }
-    api
-      .health()
-      .then(setHealth)
-      .catch(() => setHealth(null));
+  const matching = isMatching(session);
+  const connected = !!health?.codex.installed && !!health?.codex.authenticated;
+  const adoptSession = useCallback((next: MatchSession | null) => {
+    sessionRef.current = next;
+    setSession(next);
   }, []);
+
+  const load = useCallback(
+    async (resource: Resource) => {
+      const requestVersion = ++loadVersions.current[resource];
+      setLoads((previous) => ({ ...previous, [resource]: "loading" }));
+      const savedGeneration = savedVersion.current;
+      const generation = sessionVersion.current;
+      const current = () =>
+        requestVersion === loadVersions.current[resource] &&
+        (resource !== "session" || generation === sessionVersion.current) &&
+        (resource !== "saved" || savedGeneration === savedVersion.current);
+      try {
+        if (resource === "catalog") {
+          const next = await api.catalog();
+          if (current()) setSkills(next.skills);
+        }
+        if (resource === "profile") {
+          const next = await api.profile();
+          if (current()) {
+            setProfile(next);
+            setAgent(next.agent);
+          }
+        }
+        if (resource === "health") {
+          const next = await api.health();
+          if (current()) setHealth(next);
+        }
+        if (resource === "session") {
+          const next = await api.current();
+          if (current()) adoptSession(next);
+        }
+        if (resource === "saved") {
+          const next = await api.saved();
+          if (current()) setSaved(next.items);
+        }
+        if (!current()) return;
+        setLoads((previous) => ({ ...previous, [resource]: "ready" }));
+        setLoadErrors((previous) => ({ ...previous, [resource]: undefined }));
+      } catch (error) {
+        if (!current()) return;
+        setLoads((previous) => ({ ...previous, [resource]: "error" }));
+        setLoadErrors((previous) => ({
+          ...previous,
+          [resource]: message(error),
+        }));
+      }
+    },
+    [adoptSession],
+  );
   useEffect(() => {
-    void load();
+    (
+      ["catalog", "profile", "session", "saved", "health"] as Resource[]
+    ).forEach((resource) => void load(resource));
   }, [load]);
   useEffect(() => {
+    const pop = () => setLocation(readLocation());
+    window.addEventListener("popstate", pop);
+    return () => window.removeEventListener("popstate", pop);
+  }, []);
+  useEffect(() => {
     if (!toast) return;
-    const timer = window.setTimeout(() => setToast(""), 4500);
-    return () => clearTimeout(timer);
+    const timeout = window.setTimeout(() => setToast(""), 5000);
+    return () => clearTimeout(timeout);
   }, [toast]);
-  const matching =
-    session?.status === "pending" || session?.status === "running";
   useEffect(() => {
     if (!matching || !session) return;
     let active = true;
     let timer: ReturnType<typeof setTimeout>;
+    const id = session.id;
     const poll = async () => {
+      const generation = sessionVersion.current;
       try {
-        const next = await api.session(session.id);
-        if (active) {
-          setSession(next);
-          setError("");
+        const next = await api.session(id);
+        if (
+          active &&
+          generation === sessionVersion.current &&
+          sessionRef.current?.id === id
+        ) {
+          adoptSession(next);
+          setPollError("");
         }
       } catch (error) {
-        if (active)
-          setError(
-            error instanceof Error
-              ? error.message
-              : "Connection interrupted. Retrying…",
-          );
+        if (active && generation === sessionVersion.current)
+          setPollError(`Could not check matching: ${message(error)}`);
       }
       if (active) timer = setTimeout(poll, 1200);
     };
@@ -142,950 +211,1034 @@ export default function App() {
       active = false;
       clearTimeout(timer);
     };
-  }, [matching, session?.id]);
+  }, [matching, session?.id, adoptSession]);
 
-  const reviewedIds = new Set(
-    session?.feedback.map((item) => item.skill_id) ?? [],
-  );
+  function url(next: typeof location) {
+    const params = new URLSearchParams(window.location.search);
+    params.set("view", next.view);
+    if (next.q) params.set("q", next.q);
+    else params.delete("q");
+    if (next.category !== "All skills") params.set("category", next.category);
+    else params.delete("category");
+    return `${window.location.pathname}?${params.toString()}`;
+  }
+  function navigate(next: Partial<typeof location>, replace = false) {
+    const value = { ...location, ...next };
+    window.history[replace ? "replaceState" : "pushState"]({}, "", url(value));
+    setLocation(value);
+  }
+  const canMatch =
+    loads.profile === "ready" &&
+    loads.session === "ready" &&
+    loads.health === "ready" &&
+    connected;
+  async function reconcile(request: MatchRequest) {
+    const next = request.sessionId
+      ? await api.session(request.sessionId)
+      : await api.current();
+    const changed = request.sessionId
+      ? next &&
+        (next.updated_at !== request.baseline?.updated_at || isMatching(next))
+      : next &&
+        next.id !== request.baseline?.id &&
+        next.task === request.task &&
+        next.agent === request.agent;
+    return changed ? next : null;
+  }
+  async function startMatch(request: MatchRequest) {
+    if (
+      matchGuard.current ||
+      writeGuard.current ||
+      isMatching(sessionRef.current) ||
+      !canMatch
+    )
+      return;
+    matchGuard.current = true;
+    setMatchBusy(true);
+    setMatchError(null);
+    const generation = ++sessionVersion.current;
+    try {
+      let next: MatchSession | null = null;
+      if (request.uncertain) next = await reconcile(request);
+      if (!next) {
+        request = { ...request, uncertain: false };
+        try {
+          next = await api.match(
+            request.task,
+            request.agent,
+            request.sessionId,
+          );
+        } catch (error) {
+          if (error instanceof ApiError) throw error;
+          request = { ...request, uncertain: true };
+          next = await reconcile(request);
+          if (!next) throw error;
+        }
+      }
+      if (generation === sessionVersion.current) {
+        setHadBatch(
+          !!request.sessionId && !!request.baseline?.recommendations.length,
+        );
+        adoptSession(next);
+        setPollError("");
+        setEditOpen(false);
+        navigate({ view: "discover" });
+      }
+    } catch (error) {
+      if (generation === sessionVersion.current)
+        setMatchError({ message: message(error), request });
+    } finally {
+      matchGuard.current = false;
+      setMatchBusy(false);
+    }
+  }
+  function submitTask(event: React.FormEvent) {
+    event.preventDefault();
+    if (task.trim().length >= 3)
+      void startMatch({
+        task: task.trim(),
+        agent,
+        baseline: sessionRef.current,
+      });
+  }
+  function more() {
+    if (session)
+      void startMatch({
+        task: session.task,
+        agent: session.agent,
+        sessionId: session.id,
+        baseline: session,
+      });
+  }
+  async function mutate(
+    label: string,
+    operation: () => Promise<void>,
+    skill?: Skill,
+  ) {
+    if (writeGuard.current || matchGuard.current) return;
+    writeGuard.current = true;
+    savedVersion.current++;
+    setWriteBusy(true);
+    setActionError(null);
+    try {
+      await operation();
+      setLoads((previous) => ({ ...previous, saved: "ready" }));
+    } catch (error) {
+      setActionError({
+        message: `${skill ? `${skill.name}: ` : ""}${message(error)}`,
+        label,
+        skillId: skill?.id,
+        kind: skill ? "bookmark" : undefined,
+        retry: () => void mutate(label, operation, skill),
+      });
+    } finally {
+      savedVersion.current++;
+      writeGuard.current = false;
+      setWriteBusy(false);
+    }
+  }
+  function choose(action: "save" | "pass", reason: PassReason | null = null) {
+    const current = sessionRef.current;
+    if (!currentSkill || !current || matching || matchGuard.current) return;
+    const skill = currentSkill;
+    void mutate(`Retry ${action}`, async () => {
+      if (
+        isMatching(sessionRef.current) &&
+        sessionRef.current?.id === current.id
+      )
+        throw new Error(
+          "Wait for matching to finish before reviewing this task.",
+        );
+      const result = await api.feedback(current.id, skill.id, action, reason);
+      setShowPassReasons(false);
+      sessionVersion.current++;
+      setSaved(result.saved.items);
+      if (sessionRef.current?.id === current.id)
+        adoptSession({
+          ...sessionRef.current,
+          feedback: [
+            ...sessionRef.current.feedback.filter(
+              (item) => item.id !== result.feedback.id,
+            ),
+            result.feedback,
+          ],
+        });
+      setToast(
+        action === "save" ? `${skill.name} saved.` : `${skill.name} passed.`,
+      );
+    });
+  }
+  function undo() {
+    const current = sessionRef.current;
+    if (!lastChoice || !current || matching) return;
+    const choice = lastChoice;
+    void mutate("Retry undo", async () => {
+      if (
+        isMatching(sessionRef.current) &&
+        sessionRef.current?.id === current.id
+      )
+        throw new Error("Wait for matching to finish before undoing a choice.");
+      const result = await api.undo(choice.id);
+      sessionVersion.current++;
+      setSaved(result.items);
+      if (sessionRef.current?.id === current.id)
+        adoptSession({
+          ...sessionRef.current,
+          feedback: sessionRef.current.feedback.filter(
+            (item) => item.id !== choice.id,
+          ),
+        });
+      setToast("Last choice undone.");
+    });
+  }
+  function bookmark(skill: Skill) {
+    const remove = saved.some((item) => item.skill.id === skill.id);
+    void mutate(
+      remove ? "Retry removal" : "Retry save",
+      async () => {
+        setSaved(
+          (await (remove ? api.unsave(skill.id) : api.save(skill.id))).items,
+        );
+        setToast(
+          remove ? `${skill.name} removed from saved.` : `${skill.name} saved.`,
+        );
+      },
+      skill,
+    );
+  }
+  async function savePreferences(draft: Profile) {
+    if (profileGuard.current) return;
+    profileGuard.current = true;
+    setProfileBusy(true);
+    setProfileError(null);
+    const generation = preferenceGeneration.current;
+    try {
+      const next = await api.saveProfile(draft);
+      loadVersions.current.profile++;
+      setProfile(next);
+      if (generation === preferenceGeneration.current)
+        setPreferencesOpen(false);
+      setToast("Preferences saved for future batches.");
+    } catch (error) {
+      setProfileError({ message: message(error), draft });
+      throw error;
+    } finally {
+      profileGuard.current = false;
+      setProfileBusy(false);
+    }
+  }
+  async function cancel() {
+    if (!session || cancelGuard.current || matchGuard.current) return;
+    cancelGuard.current = true;
+    setCancelBusy(true);
+    const id = session.id;
+    const generation = ++sessionVersion.current;
+    try {
+      const next = await api.cancel(id);
+      if (generation === sessionVersion.current) {
+        sessionVersion.current++;
+        adoptSession(next);
+        setPollError("");
+        setActionError((previous) =>
+          previous?.label === "Retry cancellation" ? null : previous,
+        );
+      }
+    } catch (error) {
+      setActionError({
+        message: `Could not stop matching: ${message(error)}`,
+        label: "Retry cancellation",
+        retry: () => void cancel(),
+      });
+    } finally {
+      cancelGuard.current = false;
+      setCancelBusy(false);
+    }
+  }
+  const reviewedIds = new Set(session?.feedback.map((item) => item.skill_id));
   const remaining =
     session?.recommendations.filter(
       (item) => !reviewedIds.has(item.skill_id),
     ) ?? [];
-  const currentRecommendation = remaining[0];
+  const recommendation = remaining[0];
   const currentSkill = skills.find(
-    (skill) => skill.id === currentRecommendation?.skill_id,
+    (skill) => skill.id === recommendation?.skill_id,
   );
-  const previewSkills = skills.filter((skill) =>
-    [
-      "frontend-design",
-      "brainstorming",
-      "copywriting",
-      "scientific-writing",
-    ].includes(skill.slug),
-  );
-  const previews = previewSkills.length ? previewSkills : skills;
-  const previewSkill = previews[previewIndex % Math.max(previews.length, 1)];
-  const activeSkill = session ? currentSkill : previewSkill;
-  const categories = [...new Set(skills.map((skill) => skill.category))].sort();
-  const hasTaste =
-    profile.planning !== "balanced" ||
-    profile.communication !== "balanced" ||
-    profile.verification !== "balanced" ||
-    !!profile.output_style.trim();
   const lastChoice = session
     ? [...session.feedback]
         .reverse()
-        .find((feedback) =>
+        .find((item) =>
           session.recommendations.some(
-            (item) => item.skill_id === feedback.skill_id,
+            (recommendation) => recommendation.skill_id === item.skill_id,
           ),
         )
     : undefined;
-
-  async function startMatch(more = false) {
-    if (operationRef.current || matching || task.trim().length < 3) return;
-    operationRef.current = true;
-    setBusy(true);
-    setError("");
-    setShowPassReasons(false);
-    try {
-      const next = await api.match(
-        more && session ? session.task : task.trim(),
-        more && session ? session.agent : agent,
-        more ? session?.id : undefined,
-      );
-      setSession(next);
-      setView("discover");
-      if (window.matchMedia("(max-width: 650px)").matches) {
-        requestAnimationFrame(() => deckRef.current?.scrollIntoView({
-          behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
-          block: "start",
-        }));
-      }
-    } catch (error) {
-      setError(
-        error instanceof Error ? error.message : "Could not start matching.",
-      );
-    } finally {
-      operationRef.current = false;
-      setBusy(false);
-    }
-  }
-  async function choose(
-    action: "save" | "pass",
-    reason: PassReason | null = null,
-  ) {
-    if (!currentSkill || !session || operationRef.current || matching) return;
-    operationRef.current = true;
-    setBusy(true);
-    setError("");
-    setShowPassReasons(false);
-    try {
-      const feedback = await api.feedback(
-        session.id,
-        currentSkill.id,
-        action,
-        reason,
-      );
-      setDeparting(action);
-      await new Promise((resolve) => setTimeout(resolve, 190));
-      setSession((previous) =>
-        previous
-          ? {
-              ...previous,
-              feedback: [
-                ...previous.feedback.filter((item) => item.id !== feedback.id),
-                feedback,
-              ],
-            }
-          : previous,
-      );
-      setToast(
-        action === "save"
-          ? `${currentSkill.name} is in your saved skills.`
-          : reason === "wrong-style"
-            ? "Got it. Your next batch will take that into account."
-            : "Passed. On to the next possibility.",
-      );
-      const bookmarks = await api.saved();
-      setSaved(bookmarks.items);
-    } catch (error) {
-      setError(
-        error instanceof Error
-          ? error.message
-          : "Your choice could not be saved.",
-      );
-    } finally {
-      setDeparting(null);
-      operationRef.current = false;
-      setBusy(false);
-    }
-  }
-  async function undo() {
-    if (!lastChoice || !session || operationRef.current || matching) return;
-    operationRef.current = true;
-    setBusy(true);
-    setError("");
-    try {
-      await api.undo(lastChoice.id);
-      const [updated, bookmarks] = await Promise.all([
-        api.session(session.id),
-        api.saved(),
-      ]);
-      setSession(updated);
-      setSaved(bookmarks.items);
-      setToast("Last choice undone. Take another look.");
-    } catch (error) {
-      setError(
-        error instanceof Error ? error.message : "Could not undo that choice.",
-      );
-    } finally {
-      operationRef.current = false;
-      setBusy(false);
-    }
-  }
-  async function cancel() {
-    if (!session || busy) return;
-    setBusy(true);
-    try {
-      setSession(await api.cancel(session.id));
-      setError("");
-    } catch (error) {
-      setError(
-        error instanceof Error ? error.message : "Could not stop matching.",
-      );
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function removeSaved(skill: Skill) {
-    try {
-      await api.unsave(skill.id);
-      setSaved((items) => items.filter((item) => item.skill.id !== skill.id));
-      setToast(`${skill.name} removed from saved skills.`);
-    } catch (error) {
-      setError(
-        error instanceof Error ? error.message : "Could not remove this skill.",
-      );
-    }
-  }
-  useEffect(() => {
-    const handleKey = (event: KeyboardEvent) => {
-      if (
-        view !== "discover" ||
-        preferencesOpen ||
-        detail ||
-        !session ||
-        matching ||
-        busy ||
-        event.repeat || event.metaKey || event.ctrlKey || event.altKey
-      )
-        return;
-      if (
-        (event.target as HTMLElement).closest(
-          'input,textarea,select,[contenteditable="true"],dialog',
-        )
-      )
-        return;
-      if (event.key === "ArrowLeft" && currentSkill) {
-        event.preventDefault();
-        void choose("pass");
-      }
-      if (event.key === "ArrowRight" && currentSkill) {
-        event.preventDefault();
-        void choose("save");
-      }
-      if (
-        event.key.toLowerCase() === "z" &&
-        !event.ctrlKey &&
-        !event.metaKey &&
-        lastChoice
-      ) {
-        event.preventDefault();
-        void undo();
-      }
-    };
-    document.addEventListener("keydown", handleKey);
-    return () => document.removeEventListener("keydown", handleKey);
-  });
-
+  const total = session?.recommendations.length ?? 0;
+  const reviewed = total - remaining.length;
+  const savedIds = new Set(saved.map((item) => item.skill.id));
+  const categories = [...new Set(skills.map((skill) => skill.category))].sort();
   const visibleSkills = (
     view === "saved" ? saved.map((item) => item.skill) : skills
   ).filter(
     (skill) =>
-      (category === "All skills" || category === skill.category) &&
+      (category === "All skills" || skill.category === category) &&
       `${skill.name} ${skill.description} ${skill.author} ${skill.tags.join(" ")}`
         .toLowerCase()
-        .includes(search.toLowerCase()),
+        .includes(q.toLowerCase()),
   );
-  const changeView = (next: View) => {
-    setView(next);
-    setSearch("");
-    setCategory("All skills");
-    setError("");
-  };
-  const displayError =
-    error || (session?.status === "failed" ? session.error : "");
+  const resourceNotice = (resource: Resource) =>
+    loads[resource] === "error" ? (
+      <div className="error-notice" role="alert">
+        <p>
+          Could not load{" "}
+          {resource === "session" ? "your current task" : resource}.{" "}
+          {loadErrors[resource]}
+        </p>
+        <button onClick={() => void load(resource)}>Retry {resource}</button>
+      </div>
+    ) : null;
+  const matchNotice = matchError && (
+    <div className="error-notice" role="alert">
+      <p>Matching could not finish. {matchError.message}</p>
+      <button
+        disabled={matchBusy}
+        onClick={() => void startMatch(matchError.request)}
+      >
+        Retry matching
+      </button>
+    </div>
+  );
+  const taskForm = (
+    <form onSubmit={submitTask} className="task-form">
+      <label className="field-label" htmlFor="task">
+        What are you working on?
+      </label>
+      <textarea
+        id="task"
+        rows={5}
+        minLength={3}
+        maxLength={4000}
+        required
+        value={task}
+        disabled={matchBusy}
+        onChange={(event) => setTask(event.target.value)}
+        placeholder="Describe your task and the result you have in mind."
+      />
+      <label className="field-label" htmlFor="target-agent">
+        Target agent
+      </label>
+      <select
+        id="target-agent"
+        value={agent}
+        disabled={matchBusy}
+        onChange={(event) => setAgent(event.target.value as Agent)}
+      >
+        <option value="codex">Codex</option>
+        <option value="claude-code">Claude Code</option>
+      </select>
+      <button
+        className="primary-button"
+        disabled={
+          !canMatch ||
+          matchBusy ||
+          matching ||
+          writeBusy ||
+          task.trim().length < 3
+        }
+      >
+        {matchBusy ? "Starting matching…" : "Find skills"}
+        <ArrowRight size={18} />
+      </button>
+    </form>
+  );
 
   return (
     <div className="app-shell">
       <header className="site-header">
         <a
           className="brand"
-          href="#"
-          aria-label="Skinder home"
+          href={url({ ...location, view: "discover" })}
           onClick={(event) => {
             event.preventDefault();
-            changeView("discover");
+            navigate({ view: "discover" });
           }}
+          aria-label="Skinder home"
         >
-          <BrandMark />
-          <span>
-            skinder<span className="brand-dot">.</span>
-          </span>
-          <span className="beta-label">BETA</span>
+          skinder<span className="brand-diamond">♦</span>
         </a>
         <nav aria-label="Main navigation">
-          <button
-            className={view === "discover" ? "active" : ""}
-            onClick={() => changeView("discover")}
-          >
-            <Sparkles size={16} />
-            Discover
-          </button>
-          <button
-            className={view === "explore" ? "active" : ""}
-            onClick={() => changeView("explore")}
-          >
-            <Compass size={16} />
-            Explore
-          </button>
-          <button
-            className={view === "saved" ? "active" : ""}
-            onClick={() => changeView("saved")}
-          >
-            <Heart size={16} />
-            Saved<span className="nav-count">{saved.length}</span>
-          </button>
+          {(["discover", "explore", "saved"] as View[]).map((item) => (
+            <a
+              key={item}
+              href={url({ ...location, view: item })}
+              aria-current={view === item ? "page" : undefined}
+              onClick={(event) => {
+                if (!event.ctrlKey && !event.metaKey) {
+                  event.preventDefault();
+                  navigate({ view: item });
+                }
+              }}
+            >
+              {item[0].toUpperCase() + item.slice(1)}
+              {item === "saved" && (
+                <span className="nav-count">
+                  {loads.saved === "ready" ? saved.length : "—"}
+                </span>
+              )}
+            </a>
+          ))}
         </nav>
-        <button
-          className="connection-status"
-          onClick={() => {
-            api
-              .health()
-              .then((value) => {
-                setHealth(value);
-                setToast(value.codex.message);
-              })
-              .catch(() => setToast("Could not reach the local backend."));
-          }}
-          title="Check Codex connection"
-        >
+        <span className="connection">
           <span
             className={
-              health?.codex.authenticated ? "status-dot online" : "status-dot"
+              connected ? "connection-dot connected" : "connection-dot"
             }
           />
-          <span>
-            {health?.codex.authenticated
+          {loads.health === "loading"
+            ? "Checking Codex"
+            : connected
               ? "Codex connected"
-              : health
-                ? "Codex needs setup"
-                : "Local workspace"}
-          </span>
+              : "Codex unavailable"}
+        </span>
+        <button
+          className="icon-button header-preferences"
+          aria-label="Preferences"
+          disabled={loads.profile !== "ready" || profileBusy}
+          onClick={() => {
+            preferenceGeneration.current++;
+            setPreferencesOpen(true);
+          }}
+        >
+          <SlidersHorizontal size={20} />
         </button>
       </header>
-
       <main>
-        {bootError ? (
-          <div className="connection-error">
-            <div className="empty-icon">
-              <Zap />
+        {loads.health === "ready" && !connected && (
+          <div className="setup-notice">
+            <div>
+              <strong>Connect Codex to find matches.</strong>
+              <p>
+                Install the Codex CLI and sign in with <code>codex login</code>.
+                You can still explore and save skills.
+              </p>
             </div>
-            <h1>Let’s reconnect.</h1>
-            <p>{bootError}</p>
-            <p className="muted">
-              Make sure the local Skinder backend is running.
-            </p>
-            <button className="primary-button" onClick={() => void load()}>
-              Try again
-              <RotateCcw size={17} />
+            <button onClick={() => void load("health")}>
+              Recheck connection
             </button>
           </div>
-        ) : loading ? (
-          <div className="loading-page">
-            <LoaderCircle className="spin" size={30} />
-            <p>Getting the good skills together…</p>
+        )}
+        {resourceNotice("health")}
+        {profileBusy && (
+          <p className="status-notice" role="status">
+            Saving preferences…
+          </p>
+        )}
+        {profileError && !preferencesOpen && (
+          <div className="error-notice" role="alert">
+            <p>Could not save preferences. {profileError.message}</p>
+            <button
+              disabled={profileBusy}
+              onClick={() =>
+                void savePreferences(profileError.draft).catch(() => {})
+              }
+            >
+              Retry preferences
+            </button>
           </div>
-        ) : view === "discover" ? (
+        )}
+        {actionError &&
+          (!detail ||
+            actionError.skillId !== detail.id ||
+            actionError.kind !== "bookmark") && (
+            <div className="error-notice global-error" role="alert">
+              <p>{actionError.message}</p>
+              <button disabled={writeBusy} onClick={actionError.retry}>
+                {actionError.label}
+              </button>
+              <button
+                className="text-button"
+                onClick={() => setActionError(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+        {view === "discover" ? (
           <>
-            <section className="discovery-layout">
-              <div className="task-column">
-                <div className="eyebrow hero-eyebrow">
-                  <span className="tiny-spark">✳</span> GOOD WORK STARTS WITH A
-                  GOOD MATCH
-                </div>
-                <h1>
-                  Find your
-                  <br />
-                  kind of{" "}
-                  <span className="accent-word">
-                    skill
-                    <svg viewBox="0 0 180 15" aria-hidden="true">
-                      <path d="M3 11C48 0 126 1 175 7" />
-                    </svg>
-                    .
-                  </span>
-                </h1>
-                <p className="hero-description">
-                  Your task. Your taste. A skill that gets both.
-                  <br />
-                  Less searching, more <span>“that’s the one.”</span>
+            {resourceNotice("profile")}
+            {resourceNotice("session")}
+            {loads.session === "loading" ? (
+              <div className="empty-state" role="status">
+                <span className="diamond">♦</span>
+                <h1>Loading your table…</h1>
+              </div>
+            ) : loads.session === "error" ? (
+              <div className="empty-state">
+                <h1>Your current task is unavailable.</h1>
+                <p>
+                  Retry loading your task to pick up where you left off. You can
+                  still browse the catalog.
                 </p>
-                <form
-                  className="task-form"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    void startMatch();
+              </div>
+            ) : !session ? (
+              <section className="welcome-layout">
+                <div className="welcome-intro">
+                  <span className="eyebrow">
+                    A good skill changes the game.
+                  </span>
+                  <h1>
+                    Your task.
+                    <br />A better hand.
+                  </h1>
+                  <p>
+                    Find agent skills that fit what you’re doing and how you
+                    like to work.
+                  </p>
+                  <div className="how-it-works">
+                    <span>
+                      <b>01</b> Describe your task.
+                    </span>
+                    <span>
+                      <b>02</b> Review one skill at a time.
+                    </span>
+                    <span>
+                      <b>03</b> Save a fit. Pass on the rest.
+                    </span>
+                  </div>
+                  <a
+                    href={url({ ...location, view: "explore" })}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      navigate({ view: "explore" });
+                    }}
+                  >
+                    Or explore the catalog <ArrowUpRight size={16} />
+                  </a>
+                </div>
+                <div className="task-entry">
+                  <span className="card-index">
+                    A<br />♦
+                  </span>
+                  <h2>Deal me in.</h2>
+                  {taskForm}
+                  {matchNotice}
+                </div>
+              </section>
+            ) : (
+              <div className="discover-layout">
+                <aside className="task-sidebar">
+                  <span className="eyebrow">Current task</span>
+                  <h1>{session.task}</h1>
+                  <div className="sidebar-section">
+                    <span className="eyebrow">Target</span>
+                    <strong>
+                      {session.agent === "codex" ? "Codex" : "Claude Code"}
+                    </strong>
+                  </div>
+                  <div className="sidebar-actions">
+                    <button
+                      disabled={loads.profile !== "ready" || profileBusy}
+                      onClick={() => {
+                        preferenceGeneration.current++;
+                        setPreferencesOpen(true);
+                      }}
+                    >
+                      <SlidersHorizontal size={18} />
+                      Preferences
+                    </button>
+                    <button
+                      disabled={matchBusy || matching || writeBusy}
+                      onClick={() => {
+                        setTask(session.task);
+                        setAgent(session.agent);
+                        setEditOpen(true);
+                      }}
+                    >
+                      <Pencil size={18} />
+                      Edit task
+                    </button>
+                  </div>
+                  <p className="small muted">
+                    Save adds a skill to your collection. Pass leaves it out of
+                    this deck.
+                  </p>
+                </aside>
+                <section
+                  className="deck-column"
+                  aria-label="Skill deck"
+                  ref={deckRef}
+                  tabIndex={0}
+                  onKeyDown={(event) => {
+                    if (
+                      event.repeat ||
+                      event.ctrlKey ||
+                      event.metaKey ||
+                      event.altKey ||
+                      (event.target as HTMLElement).closest(
+                        "input,textarea,select,dialog,a",
+                      ) ||
+                      matching ||
+                      matchBusy ||
+                      writeBusy ||
+                      detail ||
+                      preferencesOpen ||
+                      editOpen
+                    )
+                      return;
+                    if (event.key === "ArrowLeft") {
+                      event.preventDefault();
+                      choose("pass");
+                    }
+                    if (event.key === "ArrowRight") {
+                      event.preventDefault();
+                      choose("save");
+                    }
+                    if (event.key.toLowerCase() === "z") {
+                      event.preventDefault();
+                      undo();
+                    }
                   }}
                 >
-                  <label className="field-label" htmlFor="task">
-                    What are you working on?
-                    <span>Start with a little context</span>
-                  </label>
-                  <div className="task-input-wrap">
-                    <textarea
-                      id="task"
-                      ref={taskRef}
-                      value={task}
-                      onChange={(event) => setTask(event.target.value)}
-                      maxLength={4000}
-                      rows={4}
-                      placeholder="I’m building a landing page and want it to feel thoughtful, playful, and nothing like a template…"
-                      disabled={matching}
-                    />
-                    <span className="textarea-decoration">
-                      <Sparkles size={16} />
-                    </span>
-                  </div>
-                  <div className="agent-line">
-                    <span>Find skills for</span>
-                    <div className="agent-segment" aria-label="Target agent">
-                      <button
-                        type="button"
-                        aria-pressed={agent === "codex"}
-                        onClick={() => setAgent("codex")}
-                        disabled={matching}
-                      >
-                        <span className="agent-glyph">◉</span>Codex
-                      </button>
-                      <button
-                        type="button"
-                        aria-pressed={agent === "claude-code"}
-                        onClick={() => setAgent("claude-code")}
-                        disabled={matching}
-                      >
-                        <span className="claude-glyph">✳</span>Claude Code
-                      </button>
-                    </div>
-                  </div>
-                  <button
-                    className="taste-button"
-                    type="button"
-                    onClick={() => setPreferencesOpen(true)}
-                  >
-                    <span>
-                      <SlidersHorizontal size={17} />
-                      <strong>
-                        {hasTaste
-                          ? "Your taste is in the mix"
-                          : "Make it more you"}
-                      </strong>
-                      <span className="optional-label">
-                        {hasTaste ? "Personalized" : "Optional"}
-                      </span>
-                    </span>
-                    <ArrowUpRight size={17} />
-                  </button>
-                  <button
-                    className="primary-button match-button"
-                    type="submit"
-                    disabled={
-                      task.trim().length < 3 ||
-                      busy ||
-                      matching ||
-                      !skills.length
-                    }
-                  >
-                    {matching ? (
-                      <>
-                        <LoaderCircle size={18} className="spin" />
-                        Finding your kind of skill…
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles size={18} />
-                        {session ? "Find new matches" : "Find my matches"}
-                        <ArrowRight size={19} />
-                      </>
-                    )}
-                  </button>
-                  <p className="match-footnote">
-                    <span className="status-dot online" />
-                    Powered by your Codex login. Saved on this device.
-                  </p>
-                </form>
-                {displayError && (
-                  <div className="inline-error" role="alert">
-                    <span>{displayError}</span>
-                    <button
-                      className="text-button"
-                      onClick={() =>
-                        void startMatch(
-                          !!session &&
-                            session.task === task.trim() &&
-                            session.agent === agent,
-                        )
-                      }
-                      disabled={busy || matching}
-                    >
-                      Retry
-                      <RotateCcw size={14} />
-                    </button>
-                  </div>
-                )}
-                {health && !health.codex.authenticated && (
-                  <div className="setup-note">
-                    <strong>
-                      {health.codex.installed
-                        ? "Connect Codex to find your matches."
-                        : "Install Codex to find your matches."}
-                    </strong>
-                    <p>
-                      {health.codex.installed
-                        ? "Run codex login in your terminal, then check the connection above. You can explore the catalog in the meantime."
-                        : "Install the Codex CLI and sign in. You can still explore every skill and copy installation commands."}
+                  <span className="sr-only" role="status">
+                    {!matching && session.status === "completed"
+                      ? `Matching complete. ${remaining.length} skills left to review.`
+                      : ""}
+                  </span>
+                  {!editOpen && matchNotice}
+                  {pollError && (
+                    <p className="error-notice" role="alert">
+                      {pollError} We’ll keep checking.
                     </p>
-                  </div>
-                )}
-                <div className="catalog-proof">
-                  <div className="mini-avatars">
-                    <span>A</span>
-                    <span>V</span>
-                    <span>✳</span>
-                    <span>↗</span>
-                  </div>
-                  <p>
-                    <strong>{skills.length} real skills.</strong> Many ways to
-                    do great work.
-                  </p>
-                </div>
-              </div>
-
-              <div className="deck-column" ref={deckRef}>
-                <div className="deck-caption">
-                  <span>
-                    <span className="status-dot coral" />
-                    {matching
-                      ? "A GOOD MATCH IS WORTH A MOMENT"
-                      : session
-                        ? "A LITTLE CHEMISTRY. A LOT OF CAPABILITY."
-                        : "GREAT SKILLS. DIFFERENT PERSONALITIES."}
-                  </span>
-                  <span className="deck-caption-number">
-                    {session
-                      ? `${session.recommendations.length - remaining.length} / ${session.recommendations.length}`
-                      : "YOUR NEXT COLLABORATOR"}
-                  </span>
-                </div>
-                <div className={`card-stage ${matching ? "is-matching" : ""}`}>
-                  <div className="card-back back-two" />
-                  <div className="card-back back-one" />
-                  {matching ? (
-                    <div className="matching-card">
-                      <div className="matching-orbit">
-                        <BrandMark />
-                        <span />
-                        <span />
-                        <span />
-                      </div>
-                      <span className="eyebrow">LOOKING FOR THE CLICK</span>
-                      <h2>
-                        Getting to know
-                        <br />
-                        your task.
-                      </h2>
+                  )}
+                  {matching || matchBusy ? (
+                    <div className="empty-state matching-state" role="status">
+                      <span className="diamond">♦</span>
+                      <span className="eyebrow">Finding your next hand</span>
+                      <h2>Looking for a good fit.</h2>
                       <p>
-                        Looking through {skills.length} skills for an approach
-                        that feels right for you.
+                        Matching skills to your task and preferences. This can
+                        take a little while.
                       </p>
-                      <div className="matching-steps">
-                        <span>
-                          <Check size={14} />
-                          Your task and taste
-                        </span>
-                        <span>
-                          <LoaderCircle className="spin" size={14} />
-                          Finding the right approaches
-                        </span>
-                      </div>
                       <button
-                        className="text-button"
-                        disabled={busy}
+                        disabled={matchBusy || cancelBusy}
                         onClick={() => void cancel()}
                       >
-                        Stop matching
-                        <X size={14} />
+                        {cancelBusy ? "Stopping…" : "Stop matching"}
                       </button>
                     </div>
-                  ) : activeSkill ? (
-                    <SkillCard
-                      key={`${activeSkill.id}-${!!session}`}
-                      skill={activeSkill}
-                      recommendation={
-                        session ? currentRecommendation : undefined
-                      }
-                      preview={!session}
-                      disabled={busy}
-                      departing={departing}
-                      onOpen={() => setDetail(activeSkill)}
-                      onSwipe={(action) => void choose(action)}
-                    />
                   ) : (
-                    <div className="finished-card">
-                      <div className="finished-art">
-                        <Heart size={46} strokeWidth={1.3} />
-                        <Sparkles className="finished-spark" size={20} />
-                      </div>
-                      <span className="eyebrow">
-                        {session?.status === "failed"
-                          ? "LET’S TRY THAT AGAIN"
-                          : session?.status === "cancelled"
-                            ? "TAKE YOUR TIME"
-                            : "THAT’S THIS ROUND"}
-                      </span>
-                      <h2>
-                        {session?.status === "failed"
-                          ? "A little hiccup."
-                          : session?.status === "cancelled"
-                            ? "Matching paused."
-                            : session?.recommendations.length === 0
-                              ? "Nothing quite fits. Yet."
-                              : "Your next good match is out there."}
-                      </h2>
-                      <p>
-                        {session?.status === "failed"
-                          ? "We couldn’t finish this batch. Your saved skills are right where you left them."
-                          : session?.status === "cancelled"
-                            ? "Ready for another look? Start again whenever you like."
-                            : session?.recommendations.length === 0
-                              ? "Try a more specific task, adjust your taste, or explore what’s in the catalog."
-                              : "Look for more possibilities, or take a closer look at the skills you saved."}
-                      </p>
-                      <button
-                        className="primary-button"
-                        disabled={busy}
-                        onClick={() => void startMatch(!!session)}
-                      >
-                        {session?.status === "failed" ||
-                        session?.status === "cancelled"
-                          ? "Try again"
-                          : "Find more possibilities"}
-                        <ArrowRight size={17} />
-                      </button>
-                      <button
-                        className="text-button"
-                        onClick={() =>
-                          changeView(saved.length ? "saved" : "explore")
-                        }
-                      >
-                        {saved.length
-                          ? "See my saved skills"
-                          : "Explore the catalog"}
-                        <ArrowUpRight size={15} />
-                      </button>
-                    </div>
-                  )}
-                </div>
-                {!matching && !session && previewSkill ? (
-                  <div className="preview-controls">
-                    <button
-                      className="preview-arrow"
-                      aria-label="Previous preview skill"
-                      onClick={() =>
-                        setPreviewIndex(
-                          (index) =>
-                            (index - 1 + previews.length) % previews.length,
-                        )
-                      }
-                    >
-                      <ArrowLeft size={17} />
-                    </button>
-                    <span>Just a little taste of what’s out there</span>
-                    <button
-                      className="preview-arrow"
-                      aria-label="Next preview skill"
-                      onClick={() => setPreviewIndex((index) => index + 1)}
-                    >
-                      <ArrowRight size={17} />
-                    </button>
-                  </div>
-                ) : !matching && currentSkill ? (
-                  <>
-                    <div className="swipe-controls">
-                      <button
-                        className="undo-button"
-                        disabled={busy || !lastChoice}
-                        onClick={() => void undo()}
-                        aria-label="Undo last choice"
-                      >
-                        <RotateCcw size={19} />
-                      </button>
-                      <button
-                        className="pass-button"
-                        disabled={busy}
-                        onClick={() => void choose("pass")}
-                        aria-label="Pass on this skill"
-                      >
-                        <X size={27} strokeWidth={1.7} />
-                      </button>
-                      <button
-                        className="save-button"
-                        disabled={busy}
-                        onClick={() => void choose("save")}
-                        aria-label="Save this skill"
-                      >
-                        <Heart size={26} strokeWidth={1.8} />
-                      </button>
-                      <button
-                        className="reason-button"
-                        disabled={busy}
-                        onClick={() => setShowPassReasons((value) => !value)}
-                        aria-label="Pass with a reason"
-                        aria-expanded={showPassReasons}
-                      >
-                        <SlidersHorizontal size={19} />
-                      </button>
-                    </div>
-                    <div className="swipe-hint">
-                      <span>← Pass</span>
-                      <span>Swipe to follow your instinct</span>
-                      <span>Save →</span>
-                    </div>
-                    {showPassReasons && (
-                      <div className="pass-reasons">
-                        <span>What didn’t click?</span>
-                        {(
-                          [
-                            ["wrong-task", "Not this task"],
-                            ["wrong-style", "Not my style"],
-                            ["too-much-setup", "Too much setup"],
-                          ] as const
-                        ).map(([reason, label]) => (
+                    <>
+                      {session.status === "failed" && (
+                        <div className="error-notice" role="alert">
+                          <p>Matching failed. {session.error}</p>
                           <button
-                            key={reason}
-                            disabled={busy}
-                            onClick={() => void choose("pass", reason)}
+                            disabled={!canMatch || writeBusy}
+                            onClick={more}
                           >
-                            {label}
+                            Retry matching
                           </button>
-                        ))}
-                      </div>
-                    )}
-                  </>
-                ) : !matching && lastChoice ? (
-                  <button
-                    className="text-button finished-undo"
-                    disabled={busy}
-                    onClick={() => void undo()}
-                  >
-                    <RotateCcw size={15} />
-                    Undo last choice
-                  </button>
-                ) : null}
-              </div>
-            </section>
-
-            <section className="inspiration-section">
-              <div className="section-line">
-                <div>
-                  <span className="eyebrow">A FEW PLACES TO START</span>
-                  <h2>What’s on your mind?</h2>
-                </div>
-                <button
-                  className="text-button"
-                  onClick={() => changeView("explore")}
-                >
-                  Explore all {skills.length} skills
-                  <ArrowUpRight size={16} />
-                </button>
-              </div>
-              <div className="inspiration-grid">
-                {examples.map((example) => (
-                  <button
-                    key={example.label}
-                    onClick={() => {
-                      setTask(example.task);
-                      taskRef.current?.focus();
-                      window.scrollTo({ top: 0, behavior: "smooth" });
-                    }}
-                    disabled={matching}
-                  >
-                    <span
-                      className="inspiration-icon"
-                      data-category={example.category}
-                    >
-                      <SkillIcon category={example.category} size={22} />
+                        </div>
+                      )}
+                      {session.status === "cancelled" && (
+                        <div className="status-notice" role="status">
+                          Matching stopped.{" "}
+                          {remaining.length > 0
+                            ? "Your previous cards are still here."
+                            : "You can try again when you’re ready."}
+                        </div>
+                      )}
+                      {resourceNotice("catalog")}
+                      {loads.catalog === "loading" ? (
+                        <div className="empty-state" role="status">
+                          Loading skills…
+                        </div>
+                      ) : currentSkill ? (
+                        <div className="card-stack">
+                          <SkillCard
+                            skill={currentSkill}
+                            recommendation={recommendation}
+                            disabled={writeBusy || matchBusy}
+                            onOpen={() => setDetail(currentSkill)}
+                            onSwipe={choose}
+                          />
+                          <div className="deck-actions">
+                            <button
+                              aria-label="Undo last choice"
+                              disabled={!lastChoice || writeBusy}
+                              onClick={undo}
+                            >
+                              <RotateCcw size={18} />
+                              <span>Undo</span>
+                            </button>
+                            <button
+                              aria-label="Pass on this skill"
+                              disabled={writeBusy}
+                              onClick={() => choose("pass")}
+                            >
+                              <ArrowLeft size={18} />
+                              <span>Pass</span>
+                            </button>
+                            <button
+                              className="primary-button"
+                              aria-label={
+                                savedIds.has(currentSkill.id)
+                                  ? "Keep saved"
+                                  : "Save this skill"
+                              }
+                              disabled={writeBusy}
+                              onClick={() => choose("save")}
+                            >
+                              <span>
+                                {savedIds.has(currentSkill.id)
+                                  ? "Keep saved"
+                                  : "Save"}
+                              </span>
+                              <ArrowRight size={18} />
+                            </button>
+                          </div>
+                          <div className="pass-reasons">
+                            <button
+                              className="text-button"
+                              disabled={writeBusy}
+                              aria-expanded={showPassReasons}
+                              onClick={() =>
+                                setShowPassReasons(!showPassReasons)
+                              }
+                            >
+                              Pass with a reason
+                            </button>
+                            {showPassReasons && (
+                              <div
+                                className="reason-options"
+                                aria-label="Reason for passing"
+                              >
+                                <button
+                                  disabled={writeBusy}
+                                  onClick={() => choose("pass", "wrong-task")}
+                                >
+                                  Not for this task
+                                </button>
+                                <button
+                                  disabled={writeBusy}
+                                  onClick={() => choose("pass", "wrong-style")}
+                                >
+                                  Not my style
+                                </button>
+                                <button
+                                  disabled={writeBusy}
+                                  onClick={() =>
+                                    choose("pass", "too-much-setup")
+                                  }
+                                >
+                                  Too much setup
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ) : (
+                        loads.catalog === "ready" && (
+                          <div className="empty-state" role="status">
+                            <span className="diamond">♦</span>
+                            <span className="eyebrow">
+                              {total
+                                ? "All cards considered"
+                                : "The search is complete"}
+                            </span>
+                            <h2>
+                              {session.status === "cancelled"
+                                ? "Matching cancelled."
+                                : session.status === "failed"
+                                  ? "We couldn’t finish this hand."
+                                  : total
+                                    ? "Batch reviewed."
+                                    : hadBatch
+                                      ? "No further matches."
+                                      : "No matching skills yet."}
+                            </h2>
+                            <p>
+                              {total
+                                ? "Your saved skills are ready whenever you need them. Find another batch for this task, or edit your brief."
+                                : "Try a more specific task, adjust your preferences, or browse the catalog."}
+                            </p>
+                            <button
+                              className="primary-button"
+                              disabled={!canMatch || writeBusy}
+                              onClick={more}
+                            >
+                              Find more for this task
+                              <ArrowRight size={18} />
+                            </button>
+                            {lastChoice && (
+                              <button
+                                className="text-button"
+                                aria-label="Undo last choice"
+                                disabled={writeBusy}
+                                onClick={undo}
+                              >
+                                <RotateCcw size={16} />
+                                Undo last choice
+                              </button>
+                            )}
+                          </div>
+                        )
+                      )}
+                    </>
+                  )}
+                </section>
+                <aside className="progress-sidebar">
+                  <div>
+                    <span className="eyebrow">Deck progress</span>
+                    <p className="progress-count">
+                      {reviewed} <span>of {total} reviewed</span>
+                    </p>
+                    <div className="progress-dots" aria-hidden="true">
+                      {Array.from({ length: total }, (_, index) => (
+                        <span
+                          key={index}
+                          className={index < reviewed ? "done" : ""}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                  <div className="shortcuts">
+                    <span className="eyebrow">Keyboard shortcuts</span>
+                    <p>
+                      <kbd>←</kbd>Pass
+                    </p>
+                    <p>
+                      <kbd>→</kbd>Save
+                    </p>
+                    <p>
+                      <kbd>Z</kbd>Undo
+                    </p>
+                    <span className="small muted">
+                      Available when the deck is focused. You can also swipe a
+                      card.
                     </span>
-                    <span>{example.label}</span>
-                    <ArrowUpRight size={17} />
-                  </button>
-                ))}
+                  </div>
+                </aside>
               </div>
-            </section>
+            )}
           </>
         ) : (
-          <section className="library-view">
+          <section className="library">
             <div className="library-heading">
               <div>
                 <span className="eyebrow">
-                  {view === "saved"
-                    ? "THE ONES THAT CLICKED"
-                    : "A WORLD OF WAYS TO WORK"}
+                  {view === "saved" ? "Your collection" : "The skill catalog"}
                 </span>
                 <h1>
                   {view === "saved"
-                    ? "Your kind of capable."
-                    : "Good skills. Open minds."}
+                    ? "A hand worth keeping."
+                    : "Find your next advantage."}
                 </h1>
-                <p className="muted">
+                <p>
                   {view === "saved"
-                    ? "Your shortlist, ready for whatever comes next."
-                    : `${skills.length} real skills from people with different ways of doing great work.`}
+                    ? "Skills you’ve saved, ready for your next project."
+                    : "Browse the source. Save what fits. Make it yours."}
                 </p>
               </div>
-              <div className="library-count">
-                <span>{view === "saved" ? saved.length : skills.length}</span>
-                {view === "saved" ? "saved skills" : "possibilities"}
-              </div>
+              <span className="library-diamond" aria-hidden="true">
+                ♦
+              </span>
             </div>
-            <div className="library-tools">
-              <label className="search-input">
+            <div className="library-filters">
+              <label className="search-field">
                 <Search size={18} />
+                <span className="sr-only">Search skills</span>
                 <input
-                  aria-label="Search skills"
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                  placeholder="A skill, a task, a different approach…"
+                  value={q}
+                  placeholder="Search skills, authors, or tags"
+                  onChange={(event) =>
+                    navigate({ q: event.target.value }, true)
+                  }
                 />
-                {search && (
-                  <button
-                    aria-label="Clear search"
-                    onClick={() => setSearch("")}
-                  >
-                    <X size={16} />
-                  </button>
-                )}
               </label>
-              <div className="category-select">
+              <label className="category-select">
+                <span className="sr-only">Category</span>
                 <select
-                  aria-label="Filter by category"
                   value={category}
-                  onChange={(event) => setCategory(event.target.value)}
+                  onChange={(event) =>
+                    navigate({ category: event.target.value })
+                  }
                 >
                   <option>All skills</option>
-                  {categories.map((value) => (
-                    <option key={value}>{value}</option>
+                  {categories.map((item) => (
+                    <option key={item}>{item}</option>
                   ))}
                 </select>
-                <ChevronDown size={16} />
-              </div>
+              </label>
             </div>
-            {error && (
-              <p className="inline-error" role="alert">
-                {error}
-              </p>
-            )}
-            {visibleSkills.length ? (
-              <div className="library-grid">
-                {visibleSkills.map((skill) => (
-                  <article className="library-card" key={skill.id}>
-                    <div className="section-line">
-                      <div
-                        className="skill-symbol"
-                        data-category={skill.category}
-                      >
-                        <SkillIcon category={skill.category} size={25} />
-                      </div>
-                      <span
-                        className="category-label"
-                        data-category={skill.category}
-                      >
-                        {skill.category}
-                      </span>
-                    </div>
-                    <button
-                      className="library-card-link"
-                      onClick={() => setDetail(skill)}
-                    >
+            {resourceNotice(view === "saved" ? "saved" : "catalog")}
+            {view === "explore" && resourceNotice("saved")}
+            {loads[view === "saved" ? "saved" : "catalog"] === "loading" ? (
+              <div className="empty-state" role="status">
+                Loading skills…
+              </div>
+            ) : (
+              loads[view === "saved" ? "saved" : "catalog"] === "ready" && (
+                <>
+                  <p className="result-count" role="status">
+                    {visibleSkills.length}{" "}
+                    {visibleSkills.length === 1 ? "skill" : "skills"}
+                    {category !== "All skills" ? ` in ${category}` : ""}
+                    {q ? ` matching “${q}”` : ""}
+                  </p>
+                  <div className="skill-grid">
+                    {visibleSkills.map((skill, index) => (
+                      <article className="catalog-card" key={skill.id}>
+                        <div className="catalog-top">
+                          <span className="small-index">
+                            {String(index + 1).padStart(2, "0")} ♦
+                          </span>
+                          <span className="eyebrow">{skill.category}</span>
+                        </div>
+                        <h2>
+                          <button
+                            className="title-button"
+                            onClick={() => setDetail(skill)}
+                          >
+                            {skill.name}
+                          </button>
+                        </h2>
+                        <span className="small muted">by {skill.author}</span>
+                        <p>{skill.description}</p>
+                        <div className="tag-row">
+                          {skill.tags.slice(0, 3).map((tag) => (
+                            <span key={tag}>{tag}</span>
+                          ))}
+                        </div>
+                        <div className="catalog-actions">
+                          <button
+                            className="text-button"
+                            onClick={() => setDetail(skill)}
+                          >
+                            View details
+                            <ArrowUpRight size={16} />
+                          </button>
+                          <button
+                            className={
+                              savedIds.has(skill.id)
+                                ? "bookmark-button is-saved"
+                                : "bookmark-button"
+                            }
+                            aria-label={
+                              savedIds.has(skill.id)
+                                ? `Remove ${skill.name} from saved`
+                                : `Save ${skill.name}`
+                            }
+                            disabled={
+                              writeBusy || matchBusy || loads.saved !== "ready"
+                            }
+                            onClick={() => bookmark(skill)}
+                          >
+                            {savedIds.has(skill.id) ? (
+                              <Check size={17} />
+                            ) : (
+                              <Bookmark size={17} />
+                            )}
+                            <span>
+                              {savedIds.has(skill.id) ? "Saved" : "Save"}
+                            </span>
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                  {visibleSkills.length === 0 && (
+                    <div className="empty-state">
+                      <span className="diamond">♦</span>
                       <h2>
-                        {skill.name}
-                        <ArrowUpRight size={18} />
+                        {q || category !== "All skills"
+                          ? "No skills match these filters."
+                          : "Your collection starts here."}
                       </h2>
-                      <p>{skill.description}</p>
-                    </button>
-                    <div className="tag-row">
-                      {skill.tags.slice(0, 2).map((tag) => (
-                        <span key={tag}>{tag}</span>
-                      ))}
-                    </div>
-                    <div className="library-card-bottom">
-                      <span>
-                        by <strong>{skill.author}</strong>
-                      </span>
-                      {view === "saved" ? (
+                      <p>
+                        {q || category !== "All skills"
+                          ? "Try another search or category."
+                          : "Explore the catalog or review a deck to save your first skill."}
+                      </p>
+                      {q || category !== "All skills" ? (
                         <button
-                          className="icon-button saved-icon"
-                          onClick={() => void removeSaved(skill)}
-                          aria-label={`Remove ${skill.name} from saved`}
+                          onClick={() =>
+                            navigate({ q: "", category: "All skills" })
+                          }
                         >
-                          <Bookmark size={18} fill="currentColor" />
+                          Clear filters
                         </button>
                       ) : (
-                        <button
-                          className="text-button"
-                          onClick={() => setDetail(skill)}
-                        >
-                          Take a look
-                          <ArrowRight size={15} />
+                        <button onClick={() => navigate({ view: "explore" })}>
+                          Explore skills
+                          <ArrowRight size={16} />
                         </button>
                       )}
                     </div>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <div className="library-empty">
-                <div className="empty-icon">
-                  {view === "saved" && !saved.length ? (
-                    <Heart size={30} />
-                  ) : (
-                    <Search size={30} />
                   )}
-                </div>
-                <h2>
-                  {view === "saved" && !saved.length
-                    ? "Make room for a good match."
-                    : "No skills found."}
-                </h2>
-                <p>
-                  {view === "saved" && !saved.length
-                    ? "Swipe right on a skill you like. It’ll be waiting right here."
-                    : "Try another search or give a different category a look."}
-                </p>
-                <button
-                  className="primary-button"
-                  onClick={() => {
-                    if (view === "saved" && !saved.length)
-                      changeView("discover");
-                    else {
-                      setSearch("");
-                      setCategory("All skills");
-                    }
-                  }}
-                >
-                  {view === "saved" && !saved.length
-                    ? "Find my first match"
-                    : "Show all skills"}
-                  <ArrowRight size={17} />
-                </button>
-              </div>
+                </>
+              )
             )}
           </section>
         )}
       </main>
-
       <footer className="site-footer">
-        <div>
-          <BrandMark small />
-          <span>A little less searching. A little more possibility.</span>
-        </div>
         <span>
-          Skills, meet chemistry.<span className="footer-heart"> ♡</span>
+          SKINDER <span className="red">♦</span> Pick your skills. Make your
+          move.
         </span>
+        <span>Real skills. Original sources.</span>
       </footer>
-      {toast && (
-        <div className="toast" role="status">
-          <Check size={16} />
-          {toast}
+      <div className="toast" role="status" aria-live="polite">
+        {toast}
+      </div>
+      {editOpen && (
+        <Dialog
+          title="Edit task"
+          onClose={() => {
+            if (!matchGuard.current) setEditOpen(false);
+          }}
+        >
+          <h2>A new task. A new hand.</h2>
+          <p className="muted">
+            Starting a new task replaces this deck. Your saved skills stay in
+            your collection.
+          </p>
+          {taskForm}
+          {matchNotice}
           <button
-            aria-label="Dismiss notification"
-            onClick={() => setToast("")}
+            className="text-button"
+            disabled={matchBusy}
+            onClick={() => setEditOpen(false)}
           >
-            <X size={14} />
+            Cancel
           </button>
-        </div>
+        </Dialog>
       )}
       {preferencesOpen && (
         <Preferences
-          profile={{ ...profile, agent }}
-          onClose={() => setPreferencesOpen(false)}
-          onSave={async (next) => {
-            const result = await api.saveProfile(next);
-            setProfile(result);
-            setToast(
-              "Your taste is saved. We’ll use it for your next matches.",
-            );
+          profile={profile}
+          onClose={() => {
+            preferenceGeneration.current++;
+            setPreferencesOpen(false);
           }}
+          onSave={savePreferences}
         />
       )}
       {detail && (
         <SkillDetail
           skill={detail}
-          agent={agent}
+          agent={session?.agent ?? agent}
           recommendation={session?.recommendations.find(
             (item) => item.skill_id === detail.id,
           )}
+          saved={savedIds.has(detail.id)}
+          saveDisabled={writeBusy || matchBusy || loads.saved !== "ready"}
+          onSave={() => bookmark(detail)}
+          saveError={
+            actionError?.kind === "bookmark" &&
+            actionError.skillId === detail.id
+              ? actionError
+              : null
+          }
           onClose={() => setDetail(null)}
         />
       )}

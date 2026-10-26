@@ -7,6 +7,7 @@ import {
   Quote,
   Terminal,
   CircleCheck,
+  Bookmark,
 } from "lucide-react";
 import type { Agent, Recommendation, Skill } from "../lib/types";
 import { SkillIcon } from "./Icons";
@@ -17,11 +18,19 @@ export default function SkillDetail({
   agent: initialAgent,
   recommendation,
   onClose,
+  saved,
+  saveDisabled,
+  onSave,
+  saveError,
 }: {
   skill: Skill;
   agent: Agent;
   recommendation?: Recommendation;
   onClose: () => void;
+  saved: boolean;
+  saveDisabled: boolean;
+  onSave: () => void;
+  saveError: { message: string; label: string; retry: () => void } | null;
 }) {
   const [agent, setAgent] = useState<Agent>(
     skill.compatibility.includes(initialAgent)
@@ -44,7 +53,7 @@ export default function SkillDetail({
     }
   }
   return (
-    <Dialog title="Meet the skill" onClose={onClose} className="detail-dialog">
+    <Dialog title="Skill details" onClose={onClose} className="detail-dialog">
       <div className="detail-identity">
         <div className="skill-symbol" data-category={skill.category}>
           <SkillIcon category={skill.category} size={34} />
@@ -55,21 +64,37 @@ export default function SkillDetail({
       </div>
       <h2>{skill.name}</h2>
       <p className="detail-description">{skill.description}</p>
+      <button
+        className="primary-button detail-save"
+        disabled={saveDisabled}
+        onClick={onSave}
+        aria-label={
+          saved ? `Remove ${skill.name} from saved` : `Save ${skill.name}`
+        }
+      >
+        {saved ? <Check size={18} /> : <Bookmark size={18} />}{" "}
+        {saved ? "Remove from saved" : "Save skill"}
+      </button>
+      {saveError && (
+        <div className="error-notice" role="alert">
+          <p>{saveError.message}</p>
+          <button disabled={saveDisabled} onClick={saveError.retry}>
+            {saveError.label}
+          </button>
+        </div>
+      )}
       <a
         className="source-line"
         href={`https://github.com/${skill.repository}`}
         target="_blank"
         rel="noreferrer"
       >
-        <span className="author-avatar">
-          {skill.author.slice(0, 1).toUpperCase()}
-        </span>
         {skill.repository}
         <ArrowUpRight size={15} />
       </a>
       {recommendation && (
         <div className="detail-match">
-          <h3>Why you two might click</h3>
+          <h3>Why this skill fits</h3>
           <p>
             <strong>Your task</strong>
             {recommendation.task_fit}
@@ -127,7 +152,7 @@ export default function SkillDetail({
         <div className="section-line">
           <h3>
             <Terminal size={17} />
-            Take it for a spin
+            Installation command
           </h3>
           <div className="mini-segment">
             {(["codex", "claude-code"] as const).map((target) => (

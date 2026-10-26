@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowRight, Check, SlidersHorizontal } from "lucide-react";
 import type { Profile } from "../lib/types";
 import Dialog from "./Dialog";
@@ -13,6 +13,14 @@ export default function Preferences({
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState(profile);
+  const pending = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const groups = [
@@ -46,34 +54,45 @@ export default function Preferences({
   ] as const;
   async function submit(event: React.FormEvent) {
     event.preventDefault();
+    if (pending.current) return;
+    pending.current = true;
     setSaving(true);
     setError("");
     try {
       await onSave(draft);
-      onClose();
     } catch (error) {
-      setError(
-        error instanceof Error
-          ? error.message
-          : "Your preferences could not be saved.",
-      );
+      if (mounted.current)
+        setError(
+          error instanceof Error
+            ? error.message
+            : "Your preferences could not be saved.",
+        );
     } finally {
-      setSaving(false);
+      pending.current = false;
+      if (mounted.current) setSaving(false);
     }
   }
   return (
-    <Dialog title="Your taste" onClose={onClose} className="preferences-dialog">
+    <Dialog
+      title="Preferences"
+      onClose={onClose}
+      className="preferences-dialog"
+    >
       <div className="dialog-title-icon">
         <SlidersHorizontal size={25} />
       </div>
-      <h2>A little more you.</h2>
+      <h2>Make it your kind of work.</h2>
       <p className="muted">
         The right skill should fit how you like to work, too. Everything here is
         optional.
       </p>
       <form onSubmit={submit}>
         {groups.map((group) => (
-          <fieldset className="preference-group" key={group.field}>
+          <fieldset
+            disabled={saving}
+            className="preference-group"
+            key={group.field}
+          >
             <legend>{group.title}</legend>
             <div className="choice-row">
               {group.options.map(([value, label]) => (
@@ -97,6 +116,7 @@ export default function Preferences({
           What does a great result look like to you?
         </label>
         <textarea
+          disabled={saving}
           id="output-style"
           className="style-input"
           maxLength={2000}
@@ -117,7 +137,7 @@ export default function Preferences({
           </p>
         )}
         <button className="primary-button" disabled={saving} type="submit">
-          {saving ? "Saving…" : "Save my taste"}
+          {saving ? "Saving…" : "Save preferences"}
           <ArrowRight size={18} />
         </button>
       </form>

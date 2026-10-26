@@ -1,13 +1,20 @@
 import type {
   Agent,
-  Feedback,
+  FeedbackResult,
   Health,
   MatchSession,
   PassReason,
   Profile,
-  SavedItem,
+  Saved,
   Skill,
 } from "./types";
+
+export class ApiError extends Error {
+  constructor(message: string, public status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -20,10 +27,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     const detail = payload?.detail;
-    throw new Error(
+    throw new ApiError(
       typeof detail === "string"
         ? detail
         : `The request couldn't be completed (${response.status}). Please try again.`,
+      response.status,
     );
   }
   return response.json() as Promise<T>;
@@ -53,17 +61,21 @@ export const api = {
     action: "save" | "pass",
     reason: PassReason | null = null,
   ) =>
-    request<Feedback>("/feedback", {
+    request<FeedbackResult>("/feedback", {
       method: "POST",
       body: body({ session_id, skill_id, action, reason }),
     }),
   undo: (id: string) =>
-    request<{ ok: boolean }>(`/feedback/${encodeURIComponent(id)}`, {
+    request<Saved>(`/feedback/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
-  saved: () => request<{ items: SavedItem[] }>("/saved"),
+  saved: () => request<Saved>("/saved"),
+  save: (id: string) =>
+    request<Saved>(`/saved/${encodeURIComponent(id)}`, {
+      method: "PUT",
+    }),
   unsave: (id: string) =>
-    request<{ ok: boolean }>(`/saved/${encodeURIComponent(id)}`, {
+    request<Saved>(`/saved/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
 };

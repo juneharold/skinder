@@ -22,7 +22,28 @@ Open **http://127.0.0.1:8742**. The start script installs locked dependencies, b
 uv run skinder
 ```
 
-Catalog browsing, source inspection, and saved skills work without a Codex login. New recommendations use your existing Codex allowance. Skinder does not collect your login credentials or require an API key. The app runs locally, but matching sends the task, preferences, catalog descriptions, and relevant feedback to Codex's model provider.
+Catalog browsing, source inspection, and saved skills work without a Codex login. New recommendations use your existing Codex allowance. Skinder does not collect your login credentials or require an API key. Retrieval and embeddings run locally; matching sends only the shortlisted descriptions, source excerpts, task, preferences, and relevant feedback to Codex's model provider.
+
+## Import SkillsMP and enable hybrid search
+
+```sh
+# Crawl the available catalog partitions, resume interrupted work, then build the local index.
+uv run best-effort-full-sync
+
+# Inspect progress without starting another crawl.
+uv run best-effort-full-sync --status
+
+# Rebuild search from already imported records, without contacting SkillsMP.
+uv run best-effort-full-sync --index-only
+```
+
+The sync starts with public category, occupation, and language lists. It paginates each partition, splits capped searches using remaining filters, also checks recently updated results, and deduplicates skills by repository and path. It checkpoints progress, respects provider limits, and can take hours or longer. Rerunning resumes unfinished work; after a completed pass, the next invocation starts a new refresh. Existing skills and bookmarks are never removed just because a later crawl misses them.
+
+This is **best-effort-full-sync**, not a guarantee that every SkillsMP listing was obtained. Provider caps, undiscovered taxonomy, changing results, and access failures remain visible in the report. A quota/access interruption pauses the crawl. Use `--max-requests 10` for a bounded trial; the budget includes taxonomy requests and retries. Use `--db PATH` or `SKINDER_CATALOG_DB_PATH` to select a catalog database.
+
+The first indexing run downloads the pinned multilingual E5-small model (about 470 MB). FastEmbed runs it locally, SQLite FTS5 supplies keyword rankings, and a persistent USearch index supplies vector candidates. Changed metadata is re-embedded; unchanged records reuse their vectors. A failed index build preserves the previous published index. Until an index is ready, matching uses keyword retrieval and the app identifies that reduced mode.
+
+Each match combines keyword and vector rankings into at most 40 candidates. Imported skills' original `SKILL.md` files are fetched from GitHub only for that shortlist, cached for seven days, and supplied as bounded reference excerpts to Codex. Source failures preserve metadata matching and are identified as missing evidence. Imported compatibility, license, revision, and style remain unknown unless supported by evidence; importing a listing does not verify it. Codex chooses zero to twelve final recommendations. Nothing downloaded is installed or executed.
 
 ## What is included
 
@@ -73,9 +94,9 @@ uv run python scripts/evaluate_matches.py --live --output .data/evaluation-resul
 
 ## Data and boundaries
 
-Local state lives in `.data/skinder.sqlite3`, which is ignored by Git. Set `SKINDER_DB_PATH` to use another database. The bundled catalog is available without network requests at startup. No application telemetry is sent.
+Personal state lives in `.data/skinder.sqlite3`, which is ignored by Git. Set `SKINDER_DB_PATH` to use another database. Catalog data lives in the adjacent `catalog.sqlite3` by default; set `SKINDER_CATALOG_DB_PATH` to override it. CLI imports never open the personal-state database. The 150 bundled skills seed the catalog without a network request. Search indexes and downloaded models are local artifacts beside the catalog database. No application telemetry is sent.
 
-One matching request runs at a time, with cancellation and a three-minute timeout. A server restart marks unfinished matching as interrupted rather than automatically retrying. A failed additional batch preserves earlier results. Matching uses only supplied descriptions in a temporary, read-only workspace with tools and integrations disabled.
+One matching request runs at a time, with cancellation and a three-minute timeout covering retrieval, source enrichment, and Codex. A server restart marks unfinished matching as interrupted rather than automatically retrying. A failed additional batch preserves earlier results. Codex receives only the bounded shortlist in a temporary, read-only workspace with tools and integrations disabled. App startup never downloads an embedding model or contacts SkillsMP.
 
 The app binds to loopback and rejects foreign hosts and browser origins. It is intended for personal localhost use. Accounts, hosted deployment, automatic installation, and task execution are outside this version.
 

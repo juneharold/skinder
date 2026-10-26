@@ -529,7 +529,12 @@ export interface operations {
     };
     get_catalog_api_catalog_get: {
         parameters: {
-            query?: never;
+            query?: {
+                q?: string;
+                category?: string | null;
+                offset?: number;
+                limit?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;

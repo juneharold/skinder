@@ -67,6 +67,58 @@
       "get": {
         "summary": "Get Catalog",
         "operationId": "get_catalog_api_catalog_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 4000,
+              "default": "",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -79,44 +131,44 @@
             }
           },
           "400": {
-            "description": "Bad Request",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
               }
-            }
+            },
+            "description": "Bad Request"
           },
           "404": {
-            "description": "Not Found",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
               }
-            }
+            },
+            "description": "Not Found"
           },
           "409": {
-            "description": "Conflict",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
               }
-            }
+            },
+            "description": "Conflict"
           },
           "422": {
-            "description": "Unprocessable Entity",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
               }
-            }
+            },
+            "description": "Unprocessable Entity"
           }
         }
       }
@@ -935,6 +987,16 @@
             },
             "type": "array",
             "title": "Categories"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More",
+            "default": false
           }
         },
         "additionalProperties": false,
@@ -1131,6 +1193,32 @@
           },
           "codex": {
             "$ref": "#/components/schemas/CodexStatus"
+          },
+          "indexed_count": {
+            "type": "integer",
+            "title": "Indexed Count",
+            "default": 0
+          },
+          "retrieval_mode": {
+            "type": "string",
+            "enum": [
+              "hybrid",
+              "keyword-only"
+            ],
+            "title": "Retrieval Mode",
+            "default": "keyword-only"
+          },
+          "sync_status": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sync Status"
           }
         },
         "additionalProperties": false,
@@ -1427,21 +1515,10 @@
           },
           "description": {
             "type": "string",
-            "maxLength": 300,
             "title": "Description"
           },
           "category": {
             "type": "string",
-            "enum": [
-              "Development",
-              "Design",
-              "Writing",
-              "Research",
-              "Documents",
-              "Data",
-              "Productivity",
-              "Marketing"
-            ],
             "title": "Category"
           },
           "author": {
@@ -1457,22 +1534,43 @@
             "title": "Source Url"
           },
           "revision": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Revision"
           },
           "license": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "License"
           },
           "compatibility": {
-            "items": {
-              "type": "string",
-              "enum": [
-                "codex",
-                "claude-code"
-              ]
-            },
-            "type": "array",
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "codex",
+                    "claude-code"
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Compatibility"
           },
           "requirements": {
@@ -1512,6 +1610,37 @@
           },
           "install_commands": {
             "$ref": "#/components/schemas/InstallCommands"
+          },
+          "provenance": {
+            "type": "string",
+            "enum": [
+              "bundled",
+              "skillsmp"
+            ],
+            "title": "Provenance",
+            "default": "bundled"
+          },
+          "provider_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Url"
+          },
+          "content_language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Language"
           }
         },
         "additionalProperties": false,

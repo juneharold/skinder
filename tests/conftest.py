@@ -8,6 +8,7 @@ import pytest
 
 from skinder.app import create_app
 from skinder.matcher import CodexMatcher
+from skinder.models import Skill
 
 
 @pytest.fixture
@@ -72,13 +73,24 @@ pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(
     monkeypatch.setattr("skinder.matcher.shutil.which", lambda name: str(fake))
     db_path = tmp_path / "state.sqlite3"
 
+    class SessionTestRetriever:
+        # Session/feedback tests control ranking; real hybrid behavior has its own tests.
+        def search(self, task, agent, excluded):
+            return [Skill.model_validate(skill) for skill in skills
+                    if skill["id"] not in excluded and agent in skill["compatibility"]][:40]
+
+        def status(self):
+            return {"indexed_count": 0, "retrieval_mode": "keyword-only"}
+
     @asynccontextmanager
-    async def client(timeout=180, frontend_path=None):
+    async def client(timeout=180, frontend_path=None, retriever=None, enricher=None):
         app = create_app(
             db_path=db_path,
             catalog_path=catalog_path,
             matcher=CodexMatcher(timeout=timeout),
             frontend_path=frontend_path,
+            retriever=retriever or SessionTestRetriever(),
+            enricher=enricher,
         )
         async with (
             app.router.lifespan_context(app),

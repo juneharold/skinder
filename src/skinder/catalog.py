@@ -56,9 +56,19 @@ class CatalogStore:
                     payload TEXT, PRIMARY KEY (provider, external_id)
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
-                    skill_id UNINDEXED, name, description, tags, tokenize='unicode61'
+                    skill_id UNINDEXED, name, description, tags, author, tokenize='unicode61'
                 );
             """)
+            if "author" not in {row["name"] for row in db.execute("PRAGMA table_info(skills_fts)")}:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("DROP TABLE skills_fts")
+                db.execute("CREATE VIRTUAL TABLE skills_fts USING fts5("
+                           "skill_id UNINDEXED,name,description,tags,author,tokenize='unicode61')")
+                db.execute(
+                    "INSERT INTO skills_fts SELECT id,name,json_extract(data,'$.description'),"
+                    "(SELECT group_concat(value,' ') FROM json_each(data,'$.tags')),"
+                    "json_extract(data,'$.author') FROM catalog_skills"
+                )
 
     @contextmanager
     def connect(self):
@@ -114,8 +124,8 @@ class CatalogStore:
             )
             db.execute("DELETE FROM skills_fts WHERE skill_id=?", (skill.id,))
             db.execute(
-                "INSERT INTO skills_fts VALUES (?,?,?,?)",
-                (skill.id, skill.name, skill.description, " ".join(skill.tags)),
+                "INSERT INTO skills_fts VALUES (?,?,?,?,?)",
+                (skill.id, skill.name, skill.description, " ".join(skill.tags), skill.author),
             )
         return "updated" if previous else "added"
 
@@ -152,7 +162,7 @@ class CatalogStore:
                 join = " JOIN skills_fts ON skills_fts.skill_id=s.id"
                 clauses.append("skills_fts MATCH ?")
                 params.append(match)
-                order = "bm25(skills_fts,0,4,1,2),s.rowid"
+                order = "bm25(skills_fts,0,4,1,2,2),s.rowid"
         if category:
             clauses.append("s.category=?")
             params.append(category)
@@ -185,7 +195,7 @@ class CatalogStore:
                 "WHERE skills_fts MATCH ? AND NOT EXISTS (SELECT 1 FROM exclusions e WHERE e.id=s.id) "
                 "AND (? IS NULL OR s.compatibility IS NULL OR EXISTS "
                 "(SELECT 1 FROM json_each(s.compatibility) WHERE value=?)) "
-                "ORDER BY bm25(skills_fts,0,4,1,2),s.rowid LIMIT ?",
+                "ORDER BY bm25(skills_fts,0,4,1,2,2),s.rowid LIMIT ?",
                 (match, agent, agent, limit),
             ).fetchall()
         return [Skill.model_validate_json(row[0]) for row in rows]

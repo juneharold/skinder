@@ -4,15 +4,16 @@ This contract is shared by the independent backend, catalog, and frontend tasks.
 
 ## Catalog
 
-Ship `src/skinder/data/catalog.json` as `{ "version": 1, "generated_at": "ISO timestamp", "skills": [Skill...] }`. Ship `src/skinder/data/sources.json` with pinned source revisions and selected paths. The backend loads this snapshot, with no network requirement at startup.
+Ship `src/skinder/data/catalog.json` as `{ "version": 1, "generated_at": "ISO timestamp", "skills": [Skill...] }`. Ship `src/skinder/data/sources.json` with pinned source revisions and selected paths. The backend seeds a persistent catalog database from this snapshot without network access. SkillsMP imports extend that database without modifying the bundled snapshot or personal-state database.
 
 `Skill`:
 - `id`: stable opaque URL-safe string derived from repository + skill directory (not revision); unique across all sources.
 - `name`: readable display name; `slug`: original frontmatter skill name.
-- `description`: short original summary of purpose (at most 300 characters).
-- `category`: one of `Development`, `Design`, `Writing`, `Research`, `Documents`, `Data`, `Productivity`, `Marketing`.
-- `author`: source owner; `repository`: `owner/repo`; `source_url`: commit-pinned GitHub SKILL.md URL; `revision`: commit SHA; `license`: source-supported license label or `See source license`.
-- `compatibility`: list of `codex` and/or `claude-code`; only include a target after checking portability.
+- `description`: source summary; imported summaries may exceed the bundled 300-character limit.
+- `category`: display string. The bundled categories are retained; imports can add source categories or `Uncategorized`.
+- `author`: source owner; `repository`: `owner/repo`; `source_url`: GitHub SKILL.md URL; `revision`: pinned commit SHA or null when unknown; `license`: source-supported label or null when unknown.
+- `compatibility`: list of `codex` and/or `claude-code`, or null when unknown. Only include a target after checking portability; unknown imports remain eligible with a caveat.
+- `provenance`: `bundled` (default) or `skillsmp`; `provider_url` and `content_language`: optional nullable source metadata.
 - `requirements`: string[] describing needed tools/accounts/packages; use [] for none specifically required by the instructions.
 - `tags`: string[] of 2–5 concise capability tags.
 - `workflow`: string[] of 1–3 evidence-backed descriptions of the working method.
@@ -20,7 +21,7 @@ Ship `src/skinder/data/catalog.json` as `{ "version": 1, "generated_at": "ISO ti
 - `evidence`: array of `{trait: string, excerpt: string}` for short literal source evidence supporting workflow/output traits. These traits are Skinder-inferred, not measured quality.
 - `install_commands`: object with optional `codex` and `claude-code` string values. Copy-only commands, no automatic execution. Prefer documented skills CLI for portable standalone skills; retain interactive confirmations; do not use --yes or --all.
 
-Target 150 real skills from several maintainers across the categories. Deduplicate exact copied instructions but retain distinct approaches to similar tasks. Do not mirror full source bodies into the catalog. Record attribution/license and only short evidence excerpts. Source retrieval and refresh are explicit Python maintenance commands.
+The bundled snapshot targets 150 reviewed skills. Imported records retain unknown fields and empty evidence rather than fabricating style, setup or installation claims. Empty imported requirements are unknown, not proof of no setup. Full shortlisted instructions live in a separate source cache, not in catalog responses. Source files are never executed.
 
 ## API
 
@@ -39,8 +40,8 @@ Errors: appropriate HTTP status and `{ "detail": "human-readable message" }`.
 `MatchSession`: `{id: string, task: string, agent: string, status: "pending" | "running" | "completed" | "failed" | "cancelled", recommendations: Recommendation[], feedback: Feedback[], error: string | null, created_at: string, updated_at: string}`. Recommendations contains the current batch. Feedback spans the whole task session. At most one matching process is active.
 
 Endpoints:
-- GET `/api/health` → `{status:"ok", catalog_count:number, codex:{installed:boolean, authenticated:boolean, message:string}}`.
-- GET `/api/catalog` → `{skills:Skill[], categories:string[]}`.
+- GET `/api/health` → `{status:"ok", catalog_count:number, indexed_count:number, retrieval_mode:"hybrid"|"keyword-only", sync_status:object|null, codex:{installed:boolean, authenticated:boolean, message:string}}`.
+- GET `/api/catalog` accepts `q` (up to 4000 characters), `category`, `offset` (nonnegative), `limit` (1–200, default 50) → `{skills:Skill[], categories:string[], total:number, has_more:boolean}`. Filtering and paging happen in the database. Categories describe the whole local catalog; total describes the filtered result set.
 - GET `/api/skills/{id}` → Skill.
 - GET `/api/profile` → Profile; PUT `/api/profile` accepts complete Profile → Profile.
 - POST `/api/matches` accepts `{task:string, agent:"codex"|"claude-code", session_id?:string}` → MatchSession (HTTP 202). With session_id, create another batch for that same task and target, using new feedback and excluding reviewed skill IDs. Reject mismatched task/agent on continuation. Without session_id, create a fresh task session. Task length 3–4000; profile output style at most 2000.
@@ -56,9 +57,11 @@ Pydantic models are the contract source of truth. Backend provides a command to 
 
 ## Matching and persistence
 
-Use codex exec with an existing local login, no separate API key. A compact request includes only the supplied task, profile, eligible catalog metadata, and up to 30 recent feedback events with their task context. Positive saves are weak contextual preference signals; only explicit wrong-style/too-much-setup negatives affect future taste. Explicit preferences override learned hints. A wrong-task or plain pass only excludes the skill from that task session.
+Use codex exec with an existing local login, no separate API key. Local keyword and vector retrieval produce at most 40 eligible candidates using reciprocal rank fusion. Known incompatibilities and reviewed IDs are excluded; unknown compatibility is passed explicitly. A compact request includes the task, profile, candidate metadata and bounded source excerpts, and up to 30 recent feedback events with their task context. Excerpts are at most 4000 characters each and the serialized request at most 200000 characters; omit excerpts and oldest feedback as needed. Positive saves are weak contextual preference signals; only explicit wrong-style/too-much-setup negatives affect future taste. Explicit preferences override learned hints. A wrong-task or plain pass only excludes the skill from that task session.
 
-Return up to 12 relevant recommendations, possibly fewer or none. Explain task fit and taste fit separately; no arbitrary percentages. Validate IDs, compatibility, duplicates, seen IDs, and JSON shape before committing results. Keep existing completed results if a subsequent batch fails. No hidden keyword fallback masquerading as AI matching. New feedback affects the next batch, not the order of cards already displayed.
+Return up to 12 relevant recommendations, possibly fewer or none. Explain task fit and taste fit separately; no arbitrary percentages. Validate IDs, eligibility, duplicates, seen IDs, and JSON shape before committing results. Keep existing completed results if a subsequent batch fails. Without an available vector index, retrieval is explicitly keyword-only; final recommendations still require Codex. New feedback affects the next batch, not the order of cards already displayed.
+
+`best-effort-full-sync` owns catalog ingestion and model/index setup. It checkpoints pages, respects provider responses, reports unresolved caps, and never claims a complete provider snapshot. Catalog identity is repository plus skill directory, preserving bundled IDs. Alias data records provider IDs; bundled reviewed metadata takes precedence. Missing records in later partial crawls are not deleted. SQLite is authoritative; vector indexes are replaceable immutable artifacts published atomically. Runtime model loading is local-only. Source enrichment fetches only shortlisted GitHub SKILL.md files, with four concurrent requests, a 20-second deadline, a 256 KiB file limit, and a seven-day cache. Missing/stale/truncated evidence is identified to Codex.
 
 SQLite persists profile, task sessions, feedback, and bookmarks. Restore latest session after refresh. On backend restart mark in-flight matching interrupted/failed rather than automatically repeating it. Missing Codex/login and model errors must leave catalog browsing and saved items usable. Cancel/timeout must terminate and reap the process, and late results must not overwrite cancelled state. Default timeout 180 seconds. Credentials never enter browser responses or application database. Bind 127.0.0.1:8742; reject cross-origin browser API calls. Vite dev proxy allows normal same-origin frontend requests.
 

@@ -1,16 +1,16 @@
 import asyncio
 import contextlib
-import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
+from .catalog import CatalogStore
 from .matcher import CodexMatcher, MatchError
 from .models import (
     Catalog,
@@ -25,49 +25,44 @@ from .models import (
     Saved,
     Skill,
 )
+from .retrieval import HybridRetriever
+from .sources import SourceEnricher, bounded_request, match_metadata
 from .store import Store
+from .sync import sync_status
 
-CATEGORIES = [
-    "Development",
-    "Design",
-    "Writing",
-    "Research",
-    "Documents",
-    "Data",
-    "Productivity",
-    "Marketing",
-]
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def load_catalog(path):
-    if not path.exists():
-        return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    skills = [Skill.model_validate(item) for item in data["skills"]]
-    catalog = {skill.id: skill for skill in skills}
-    if len(catalog) != len(skills):
-        raise ValueError("Catalog has duplicate skill IDs.")
-    return catalog
-
-
-def create_app(*, db_path=None, catalog_path=None, matcher=None, frontend_path=None):
+def create_app(
+    *, db_path=None, catalog_path=None, catalog_db_path=None, matcher=None,
+    frontend_path=None, retriever=None, enricher=None,
+):
     db_path = Path(
         db_path or os.environ.get("SKINDER_DB_PATH", str(ROOT / ".data" / "skinder.sqlite3"))
     )
     catalog_path = Path(catalog_path or Path(__file__).parent / "data" / "catalog.json")
+    catalog_db_path = Path(catalog_db_path or os.environ.get(
+        "SKINDER_CATALOG_DB_PATH", db_path.with_name("catalog.sqlite3")
+    ))
     frontend_path = Path(frontend_path or ROOT / "frontend" / "dist")
     matcher = matcher or CodexMatcher()
-    catalog = load_catalog(catalog_path)
+    catalog = None
+    search = None
+    sources = None
     active_task = None
     active_session = None
     store = None
 
     @asynccontextmanager
     async def lifespan(app):
-        nonlocal store
+        nonlocal store, catalog, search, sources
         store = Store(db_path)
+        catalog = CatalogStore(catalog_db_path)
+        catalog.seed(catalog_path)
+        search = retriever or HybridRetriever(catalog)
+        sources = enricher or SourceEnricher(catalog)
         app.state.store = store
+        app.state.catalog = catalog
         try:
             yield
         finally:
@@ -126,10 +121,19 @@ def create_app(*, db_path=None, catalog_path=None, matcher=None, frontend_path=N
             raise HTTPException(404, "Task session not found.")
         return session
 
-    async def run_match(session, request):
+    async def run_match(session, profile, feedback):
         try:
-            raw = await matcher.match(request)
-            result = MatchResult.model_validate_json(raw, strict=True)
+            async with asyncio.timeout(getattr(matcher, "timeout", 180)):
+                candidates = await asyncio.to_thread(
+                    search.search, session.task, session.agent, store.seen(session.id)
+                )
+                enriched = await sources.enrich(candidates[:40])
+                request = bounded_request(session.task, profile, feedback, enriched)
+                if not request["eligible_skills"]:
+                    store.finish(session.id, "completed", [])
+                    return
+                raw = await matcher.match(request)
+                result = MatchResult.model_validate_json(raw, strict=True)
             ids = [recommendation.skill_id for recommendation in result.recommendations]
             eligible = {skill["id"] for skill in request["eligible_skills"]}
             if len(ids) != len(set(ids)) or not set(ids).issubset(eligible):
@@ -140,6 +144,8 @@ def create_app(*, db_path=None, catalog_path=None, matcher=None, frontend_path=N
             store.finish(session.id, "completed", result.recommendations)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            store.finish(session.id, "failed", error="Matching timed out. Try again.")
         except MatchError as exc:
             store.finish(session.id, "failed", error=str(exc))
         except (ValidationError, ValueError):
@@ -151,17 +157,25 @@ def create_app(*, db_path=None, catalog_path=None, matcher=None, frontend_path=N
 
     @app.get("/api/health", response_model=Health)
     async def health():
-        return Health(catalog_count=len(catalog), codex=await matcher.health())
+        status = await asyncio.to_thread(search.status)
+        return Health(
+            catalog_count=catalog.count(), codex=await matcher.health(),
+            sync_status=sync_status(catalog), **status,
+        )
 
     @app.get("/api/catalog", response_model=Catalog)
-    async def get_catalog():
-        return Catalog(skills=list(catalog.values()), categories=CATEGORIES)
+    async def get_catalog(
+        q: str = Query(default="", max_length=4000), category: str | None = None,
+        offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=200),
+    ):
+        return await asyncio.to_thread(catalog.page, q=q, category=category, offset=offset, limit=limit)
 
     @app.get("/api/skills/{skill_id}", response_model=Skill)
     async def get_skill(skill_id: str):
-        if skill_id not in catalog:
+        skill = catalog.get(skill_id)
+        if skill is None:
             raise HTTPException(404, "Skill not found.")
-        return catalog[skill_id]
+        return skill
 
     @app.get("/api/profile", response_model=Profile)
     async def get_profile():
@@ -180,41 +194,16 @@ def create_app(*, db_path=None, catalog_path=None, matcher=None, frontend_path=N
             previous = get_session(value.session_id)
             if previous.task != value.task or previous.agent != value.agent:
                 raise HTTPException(409, "A continuation must use the same task and target agent.")
-        seen = store.seen(value.session_id) if value.session_id else set()
-        eligible = [
-            skill
-            for skill in catalog.values()
-            if value.agent in skill.compatibility and skill.id not in seen
-        ]
         profile = store.profile().model_dump()
         profile["agent"] = value.agent
-        fields = {
-            "id",
-            "name",
-            "description",
-            "category",
-            "requirements",
-            "tags",
-            "workflow",
-            "output_style",
-            "evidence",
-        }
-        request = {
-            "task": value.task,
-            "profile": profile,
-            "recent_feedback": [
-                {**event, "skill": catalog[event["skill_id"]].model_dump(include=fields - {"id"})}
-                for event in store.preference_events(value.agent)
-                if event["skill_id"] in catalog
-            ],
-            "eligible_skills": [skill.model_dump(include=fields) for skill in eligible],
-        }
+        feedback = []
+        for event in store.preference_events(value.agent):
+            skill = catalog.get(event["skill_id"])
+            if skill:
+                feedback.append({**event, "skill": match_metadata(skill)})
         session = store.start(value.task, value.agent, value.session_id)
         active_session = session.id
-        if eligible:
-            active_task = asyncio.create_task(run_match(session, request))
-        else:
-            store.finish(session.id, "completed", [])
+        active_task = asyncio.create_task(run_match(session, profile, feedback))
         return store.session(session.id)
 
     @app.get("/api/matches/current", response_model=MatchSession | None)
@@ -257,15 +246,15 @@ def create_app(*, db_path=None, catalog_path=None, matcher=None, frontend_path=N
     async def get_saved():
         return Saved(
             items=[
-                {"skill": catalog[row["skill_id"]], "saved_at": row["saved_at"]}
+                {"skill": skill, "saved_at": row["saved_at"]}
                 for row in store.saved()
-                if row["skill_id"] in catalog
+                if (skill := catalog.get(row["skill_id"])) is not None
             ]
         )
 
     @app.put("/api/saved/{skill_id}", response_model=Saved)
     async def put_saved(skill_id: str):
-        if skill_id not in catalog:
+        if catalog.get(skill_id) is None:
             raise HTTPException(404, "Skill not found.")
         store.save(skill_id)
         return await get_saved()

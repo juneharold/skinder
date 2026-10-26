@@ -84,6 +84,7 @@ def main():
     rendered = json.dumps(result, indent=2)
     print(rendered)
     if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered + "\n")
 
 

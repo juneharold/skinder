@@ -63,6 +63,12 @@ npm --prefix frontend run build
 
 Backend tests use real temporary SQLite databases and subprocesses that simulate the external Codex boundary. Automated checks do not consume model usage. Frontend tests exercise user interactions. Live evaluation is separate and uses your signed-in Codex allowance.
 
+The [live evaluation report](evaluation/REPORT.md) records six authored scenarios, their actual results, a no-match timeout that led to a prompt correction, and the successful checks afterward. These examples are not an independent benchmark. To repeat them without replacing the recorded results:
+
+```sh
+uv run python scripts/evaluate_matches.py --live --output .data/evaluation-results.json
+```
+
 ## Data and boundaries
 
 Local state lives in `.data/skinder.sqlite3`, which is ignored by Git. Set `SKINDER_DB_PATH` to use another database. The bundled catalog is available without network requests at startup. No application telemetry is sent.

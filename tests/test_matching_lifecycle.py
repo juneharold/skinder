@@ -5,7 +5,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import httpx
 import pytest
@@ -13,6 +13,7 @@ from test_catalog_store import example_skill
 
 from skinder.app import create_app
 from skinder.catalog import CatalogStore
+from skinder.claude_matcher import invoke
 from skinder.matcher import terminate
 from skinder.matching import MatchServiceError
 from skinder.models import EngineStatus, MatchInput
@@ -61,6 +62,78 @@ async def test_termination_reaps_child_that_ignores_graceful_shutdown():
         if process.returncode is None:
             process.kill()
         await process.wait()
+
+
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+async def test_claude_cleanup_stops_descendant_after_cli_leader_exits(tmp_path, stop):
+    child_pid_file = tmp_path / "descendant.pid"
+    leader_pid_file = tmp_path / "leader.pid"
+    child_code = (
+        "import os, pathlib, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"
+    )
+    leader_code = (
+        "import os, pathlib, subprocess, sys, time\n"
+        "root = pathlib.Path(sys.argv[1])\n"
+        "subprocess.Popen([sys.executable, '-c', sys.argv[2], str(root / 'descendant.pid')])\n"
+        "while not (root / 'descendant.pid').exists() or not (root / 'descendant.pid').read_text():\n"
+        "    time.sleep(0.005)\n"
+        "(root / 'leader.pid').write_text(str(os.getpid()))\n"
+    )
+    operation = asyncio.create_task(invoke(
+        sys.executable, ["-c", leader_code, str(tmp_path), child_code],
+        directory=str(tmp_path), timeout=1 if stop == "timeout" else 30, limit=1024,
+    ))
+    child_pid = leader_pid = None
+    try:
+        async with asyncio.timeout(3):
+            while not leader_pid_file.exists() or not leader_pid_file.read_text():
+                await asyncio.sleep(0.005)
+            child_pid = int(child_pid_file.read_text())
+            leader_pid = int(leader_pid_file.read_text())
+            # Observe the reaped leader before stopping the still-open stdout reader.
+            while True:
+                try:
+                    os.kill(leader_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.005)
+        if stop == "cancel":
+            operation.cancel()
+        completed, _ = await asyncio.wait({operation}, timeout=5)
+        assert operation in completed, "CLI cleanup exceeded its termination budget"
+        with pytest.raises(TimeoutError if stop == "timeout" else asyncio.CancelledError):
+            await operation
+
+        async with asyncio.timeout(2):
+            while True:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                # An adopted zombie has exited; only its new parent can reap it.
+                state = (await asyncio.to_thread(
+                    subprocess.run, ["ps", "-o", "stat=", "-p", str(child_pid)],
+                    capture_output=True, text=True, check=False,
+                )).stdout.strip()
+                if state.startswith("Z"):
+                    break
+                await asyncio.sleep(0.01)
+    finally:
+        if leader_pid is None and leader_pid_file.exists():
+            leader_pid = int(leader_pid_file.read_text())
+        if child_pid is None and child_pid_file.exists():
+            child_pid = int(child_pid_file.read_text())
+        if leader_pid is not None:
+            with suppress(ProcessLookupError):
+                os.killpg(leader_pid, signal.SIGKILL)
+        if child_pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+        operation.cancel()
+        with suppress(asyncio.CancelledError, TimeoutError):
+            await operation
 
 
 @asynccontextmanager

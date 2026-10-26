@@ -59,6 +59,7 @@ def create_app(
         nonlocal user_store, catalog_store, search, service
         ownership = DatabaseOwnership(user_db_path)
         cleanup = ExitStack()
+        # Callbacks run in reverse order: close the stores before releasing ownership.
         cleanup.callback(ownership.release)
         started = False
 
@@ -67,6 +68,7 @@ def create_app(
             ownership.acquire()
             user_store = UserStore(user_db_path)
             cleanup.callback(user_store.close)
+            # Recovery is safe only after excluding another server with live matching work.
             user_store.recover_interrupted_sessions()
             catalog_store = CatalogStore(catalog_db_path)
             cleanup.callback(catalog_store.close)
@@ -79,6 +81,7 @@ def create_app(
 
         async def shutdown() -> None:
             try:
+                # Cancelled request workers may still be using the stores.
                 await work.drain()
                 if started:
                     await service.shutdown()
@@ -109,6 +112,7 @@ def create_app(
         request: Request, call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
         host = request.headers.get("host", "")
+        # A local socket alone does not stop a browser from reaching it through another hostname.
         allowed_hosts = {"127.0.0.1:8742", "localhost:8742"}
         if host not in allowed_hosts:
             return JSONResponse({"detail": "Use http://127.0.0.1:8742 to access Skinder."}, 403)
@@ -117,6 +121,7 @@ def create_app(
             # The Vite proxy must rewrite Origin to the backend origin in development.
             if origin and origin != f"http://{host}":
                 return JSONResponse({"detail": "Cross-origin API requests are not allowed."}, 403)
+            # Browser requests can omit Origin; retain the separate cross-site check.
             if request.headers.get("sec-fetch-site") == "cross-site":
                 return JSONResponse({"detail": "Cross-site API requests are not allowed."}, 403)
         response = await call_next(request)
@@ -130,6 +135,7 @@ def create_app(
     async def validation_error(
         request: Request, exc: RequestValidationError,
     ) -> JSONResponse:
+        # Validation details can include submitted values; expose only locations and messages.
         issues = []
         for error in exc.errors():
             location = ".".join(str(part) for part in error["loc"] if part != "body")
@@ -190,6 +196,7 @@ def create_app(
         return await service.cancel(session_id)
 
     def saved_collection() -> Saved:
+        # User data outlives catalog entries; omit missing skills without deleting their saves.
         return Saved(
             items=[
                 {"skill": skill, "saved_at": row["saved_at"]}
@@ -206,6 +213,7 @@ def create_app(
                 feedback = user_store.add_feedback(value)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
+            # Retries return the current collection, which may have changed since the original save.
             return FeedbackResult(feedback=feedback, saved=saved_collection())
 
         return await work.run(save_feedback)
@@ -252,6 +260,7 @@ def create_app(
     async def frontend(path: str) -> Response:
         if path == "api" or path.startswith("api/"):
             raise HTTPException(404, "API endpoint not found.")
+        # Resolve symlinks before checking containment so they cannot expose files outside dist.
         candidate = (frontend_path / path).resolve()
         if candidate.is_relative_to(frontend_path.resolve()) and candidate.is_file():
             return FileResponse(candidate)

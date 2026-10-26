@@ -4,6 +4,7 @@ import type { Skill } from "../lib/types";
 
 export function useSkillCache() {
   const [skillsById, setSkillsById] = useState<Record<string, Skill>>({});
+  // Concurrent catalog/detail responses must merge against the latest cache before React renders.
   const cache = useRef<Record<string, Skill>>({});
   const add = useCallback((items: Skill[]) => {
     const next = { ...cache.current };
@@ -20,6 +21,7 @@ export type SkillCache = ReturnType<typeof useSkillCache>;
 export function useRecommendedSkills(ids: string[], { get, add }: SkillCache) {
   const [error, setError] = useState("");
   const [attempt, setAttempt] = useState(0);
+  // Depend on ID contents, not the fresh array that the parent creates on each render.
   const key = JSON.stringify(ids);
   useEffect(() => {
     let active = true;
@@ -31,6 +33,7 @@ export function useRecommendedSkills(ids: string[], { get, add }: SkillCache) {
       for (let offset = 0; offset < missing.length; offset += 12) {
         const results = await Promise.allSettled(missing.slice(offset, offset + 12).map((id) => api.skill(id)));
         if (!active) return;
+        // Keep successful details so retrying a partial failure only fetches the missing skills.
         add(results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []));
         if (results.some((result) => result.status === "rejected"))
           setError("Some recommended skills could not be loaded. Try again to review them.");

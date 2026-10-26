@@ -34,6 +34,7 @@ export default function App() {
   const loadVersions = useRef<Record<Resource, number>>({ profile: 0, health: 0 });
   const [loads, setLoads] = useState<Record<Resource, LoadState>>({ profile: "loading", health: "loading" });
   const [loadErrors, setLoadErrors] = useState<Partial<Record<Resource, string>>>({});
+  // Task edits stay separate from the active session until matching accepts the new brief.
   const [task, setTask] = useState("");
   const [agent, setAgent] = useState<Agent>("codex");
   const [editOpen, setEditOpen] = useState(false);
@@ -49,6 +50,7 @@ export default function App() {
   const focusAfterMatching = useRef(false);
   const connected = !!health?.codex.installed && !!health?.codex.authenticated;
   const matches = useMatchSession({
+    // Codex runs matching even when the requested skills target Claude Code.
     canStart: loads.profile === "ready" && loads.health === "ready" && !profileBusy && connected,
     onStarted: () => {
       focusAfterMatching.current = true;
@@ -73,6 +75,7 @@ export default function App() {
     cache.add(saved.items.map((item) => item.skill));
   }, [saved.items, cache.add]);
   const savedIds = new Set(saved.items.map((item) => item.skill.id));
+  // A filtered page's total cannot establish whether the full catalog is exhausted.
   const catalogSize = health?.catalog_count ?? (
     !q && category === "All skills" && catalog.loadState === "ready" ? catalog.total : undefined
   );
@@ -85,10 +88,9 @@ export default function App() {
       try {
         if (resource === "profile") {
           const next = await api.profile();
-          if (current()) {
-            setProfile(next);
-            setAgent(next.agent);
-          }
+          if (!current()) return;
+          setProfile(next);
+          setAgent(next.agent);
         }
         if (resource === "health") {
           const next = await api.health();
@@ -125,12 +127,14 @@ export default function App() {
   }, [toast]);
   useEffect(() => {
     if (!focusAfterMatching.current || matching || matchBusy) return;
+    // Give keyboard review focus once, without taking it from an open dialog or another view.
     focusAfterMatching.current = false;
     if (view === "discover" && !detail && !preferencesOpen && !editOpen)
       deckRef.current?.focus({ preventScroll: true });
   }, [matching, matchBusy, view, detail, preferencesOpen, editOpen]);
 
   function url(next: typeof location) {
+    // Preserve unrelated query parameters when updating the view and catalog filters.
     const params = new URLSearchParams(window.location.search);
     params.set("view", next.view);
     if (next.q) params.set("q", next.q);
@@ -163,15 +167,18 @@ export default function App() {
     profileGuard.current = true;
     setProfileBusy(true);
     setProfileError(null);
+    // Only close the submitting dialog; a later dialog owns its own draft.
     const generation = preferenceGeneration.current;
     try {
       const next = await api.saveProfile(draft);
+      // An initial profile read must not replace preferences that were just saved.
       loadVersions.current.profile++;
       setProfile(next);
       if (generation === preferenceGeneration.current)
         setPreferencesOpen(false);
       setToast("Preferences saved for future batches.");
     } catch (error) {
+      // Retrying after the dialog closes must still submit the original draft.
       setProfileError({ message: message(error), draft });
       throw error;
     } finally {
@@ -258,10 +265,9 @@ export default function App() {
               href={url({ ...location, view: item })}
               aria-current={view === item ? "page" : undefined}
               onClick={(event) => {
-                if (!event.ctrlKey && !event.metaKey) {
-                  event.preventDefault();
-                  navigate({ view: item });
-                }
+                if (event.ctrlKey || event.metaKey) return;
+                event.preventDefault();
+                navigate({ view: item });
               }}
             >
               {item[0].toUpperCase() + item.slice(1)}

@@ -10,6 +10,7 @@ import type {
   Skill,
 } from "./types";
 
+// Keep HTTP failures distinct from lost responses so matching can reconcile uncertain submissions.
 export class ApiError extends Error {
   constructor(message: string, public status: number) {
     super(message);
@@ -17,6 +18,7 @@ export class ApiError extends Error {
   }
 }
 
+// Retry policy belongs to each operation; a write may succeed before its response is lost.
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {
     ...options,

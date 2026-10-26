@@ -74,6 +74,7 @@ type BackendOptions = {
   skills?: Skill[];
 };
 
+// This models one session for interaction tests; backend tests cover ownership and concurrent writes.
 export function installBackend(options: BackendOptions = {}) {
   const skills = options.skills ?? [
     skill("design", "Thoughtful Design"),
@@ -87,6 +88,7 @@ export function installBackend(options: BackendOptions = {}) {
   let profile = structuredClone(options.profile ?? defaultProfile);
   const matchRequests: Array<{ task: string; agent: Agent; session_id?: string }> = [];
 
+  // Real HTTP responses cannot mutate server state through shared object references.
   const savedResponse = (): Saved => ({ items: structuredClone(saved) });
   const removeIfUnowned = (id: string) => {
     if (!directSaved.has(id) && !feedbackSaved.has(id)) {
@@ -234,6 +236,7 @@ export function installBackend(options: BackendOptions = {}) {
   };
 }
 
+// Tests choose response order explicitly to reproduce races without relying on network delays.
 export function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;

@@ -66,6 +66,24 @@ def test_repeat_import_updates_search_and_preserves_bundled_evidence(tmp_path):
         assert session.scalar(select(func.count()).select_from(CatalogAliasRecord)) == 1
 
 
+def test_blank_queries_list_skills_but_punctuation_only_queries_do_not(tmp_path):
+    catalog_store = CatalogStore(tmp_path / "catalog.sqlite3")
+    catalog_store.upsert(example_skill(1, category="Art"))
+    catalog_store.upsert(example_skill(2, category="Development"))
+
+    for query in ("", " \t\n"):
+        result = catalog_store.page(q=query, category="Art")
+        assert [skill.id for skill in result.skills] == ["example-1"]
+        assert result.total == 1
+        assert not result.has_more
+
+    result = catalog_store.page(q="***", category="Art")
+    assert result.skills == []
+    assert result.total == 0
+    assert not result.has_more
+    assert result.categories == ["Art", "Development"]
+
+
 def test_ids_match_bundled_directory_identity_and_survive_revision():
     assert stable_id("Example/Skills", "skills/review/SKILL.md") == stable_id(
         "example/skills", "skills/review/SKILL.md"

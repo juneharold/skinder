@@ -32,6 +32,7 @@ export default function SkillDetail({
   onSave: () => void;
   saveError: { message: string; label: string; retry: () => void } | null;
 }) {
+  // Installer selection belongs to this dialog and must not change the active task's agent.
   const [agent, setAgent] = useState<Agent>(
     skill.compatibility?.includes(initialAgent)
       ? initialAgent
@@ -39,6 +40,7 @@ export default function SkillDetail({
   );
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
+  // Imported installation commands are unverified; direct users to the original source.
   const command = skill.provenance === "skillsmp" ? null : skill.install_commands[agent];
   async function copy() {
     if (!command) return;

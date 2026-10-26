@@ -107,6 +107,7 @@ class UserStore:
         timestamp = now()
         with self._write_session() as db:
             if session_id:
+                # Keep the previous batch available until a continuation successfully replaces it.
                 db.execute(
                     update(MatchSessionRecord)
                     .where(MatchSessionRecord.id == session_id)
@@ -125,6 +126,7 @@ class UserStore:
         recommendations: Sequence[Recommendation] | None = None, error: str | None = None,
     ) -> None:
         values = {"status": status, "error": error, "updated_at": now()}
+        # None preserves the last batch on failure/cancellation; [] records a successful no-fit.
         if recommendations is not None:
             values["recommendations"] = json.dumps([r.model_dump() for r in recommendations])
         with self._write_session() as db:
@@ -136,6 +138,7 @@ class UserStore:
             )
             if not changed.rowcount or recommendations is None:
                 return
+            # Feedback remains valid for recommendations from any earlier batch in this session.
             known = set(db.scalars(
                 select(MatchSessionSkillRecord.skill_id).where(
                     MatchSessionSkillRecord.session_id == session_id
@@ -147,6 +150,7 @@ class UserStore:
             ])
 
     def get_seen_skill_ids(self, session_id: str) -> set[str]:
+        # Only reviewed skills are excluded; an unreviewed recommendation can appear again.
         with self.db_sessions() as db:
             return set(db.scalars(
                 select(FeedbackRecord.skill_id).where(FeedbackRecord.session_id == session_id)
@@ -160,9 +164,10 @@ class UserStore:
                 FeedbackRecord.session_id == value.session_id,
                 FeedbackRecord.skill_id == value.skill_id,
             ))
+            # Identical retries are allowed during matching and never recreate a removed bookmark.
+            if previous and previous.action == value.action and previous.reason == value.reason:
+                return Feedback.model_validate(previous, from_attributes=True)
             if previous:
-                if previous.action == value.action and previous.reason == value.reason:
-                    return Feedback.model_validate(previous, from_attributes=True)
                 raise ValueError("Undo the existing feedback before changing it.")
             self._require_feedback_idle(db.get(MatchSessionRecord, value.session_id))
             result = Feedback(**value.model_dump(), id=str(uuid4()), created_at=now())
@@ -185,23 +190,27 @@ class UserStore:
                 return
             self._require_feedback_idle(db.get(MatchSessionRecord, row.session_id))
             db.delete(row)
+            # The following queries flush this deletion before looking for another save owner.
             bookmark = db.scalar(
                 select(BookmarkRecord).where(BookmarkRecord.feedback_id == feedback_id)
             )
-            if bookmark:
-                other = db.scalar(
-                    select(FeedbackRecord.id)
-                    .where(
-                        FeedbackRecord.skill_id == row.skill_id,
-                        FeedbackRecord.action == "save",
-                        FeedbackRecord.created_at >= bookmark.saved_at,
-                    )
-                    .order_by(FeedbackRecord.created_at.desc()).limit(1)
+            # Undo may only change a bookmark still owned by this feedback.
+            if bookmark is None:
+                return
+            other = db.scalar(
+                select(FeedbackRecord.id)
+                .where(
+                    FeedbackRecord.skill_id == row.skill_id,
+                    FeedbackRecord.action == "save",
+                    # Older saves must not restore an explicitly removed bookmark.
+                    FeedbackRecord.created_at >= bookmark.saved_at,
                 )
-                if other:
-                    bookmark.feedback_id = other
-                else:
-                    db.delete(bookmark)
+                .order_by(FeedbackRecord.created_at.desc()).limit(1)
+            )
+            if other:
+                bookmark.feedback_id = other
+            else:
+                db.delete(bookmark)
 
     def get_bookmarks(self) -> list[Bookmark]:
         with self.db_sessions() as db:
@@ -215,11 +224,13 @@ class UserStore:
         with self._write_session() as db:
             bookmark = db.get(BookmarkRecord, skill_id)
             if bookmark:
+                # A direct save survives feedback undo and keeps its original timestamp.
                 bookmark.feedback_id = None
             else:
                 db.add(BookmarkRecord(skill_id=skill_id, saved_at=now()))
 
     def remove_bookmark(self, skill_id: str) -> None:
+        # Review history still informs later matches even if the skill is no longer bookmarked.
         with self._write_session() as db:
             db.execute(delete(BookmarkRecord).where(BookmarkRecord.skill_id == skill_id))
 

@@ -37,11 +37,14 @@ export default function DiscoverView({
     canMatch, pollError, remaining, reviewedIds, lastChoice, more, undo, cancel } = matches;
   const writeBusy = matches.saved.busy;
   const savedIds = new Set(matches.saved.items.map((item) => item.skill.id));
+  // Recommendation IDs survive catalog filtering; missing details do not mean an empty deck.
   const recommendation = remaining[0];
   const currentSkill = recommendation ? skillsById[recommendation.skill_id] : undefined;
   const total = session?.recommendations.length ?? 0;
   const reviewed = total - remaining.length;
   const knownSkills = Object.values(skillsById);
+  // Cached pages may be incomplete, and unknown compatibility remains eligible on the server.
+  // Offer another batch unless the known catalog proves exhaustion.
   const hasMoreCandidates = catalogSize === undefined || catalogSize > knownSkills.length || knownSkills.some(
     (skill) => session &&
       (skill.compatibility === null || skill.compatibility.includes(session.agent)) &&
@@ -49,6 +52,18 @@ export default function DiscoverView({
   );
   const retryMatching = session?.status === "failed" || session?.status === "cancelled";
   const canContinue = total > 0 && hasMoreCandidates;
+  let emptyHeading = "No matching skills yet.";
+  if (session?.status === "cancelled") {
+    emptyHeading = "Matching cancelled.";
+  } else if (session?.status === "failed") {
+    emptyHeading = "We couldn’t finish this hand.";
+  } else if (total && hasMoreCandidates) {
+    emptyHeading = "Batch reviewed.";
+  } else if (total) {
+    emptyHeading = "All available skills reviewed.";
+  } else if (session && session.feedback.length > 0) {
+    emptyHeading = "No further matches.";
+  }
   function choose(action: "save" | "pass", reason: PassReason | null = null) {
     if (currentSkill) matches.choose(currentSkill, action, reason);
   }
@@ -161,6 +176,7 @@ export default function DiscoverView({
             ref={deckRef}
             tabIndex={0}
             onKeyDown={(event) => {
+              // Shortcuts belong to the focused deck, without overriding typing or modal controls.
               if (
                 event.repeat ||
                 event.ctrlKey ||
@@ -333,71 +349,57 @@ export default function DiscoverView({
                     </div>
                   </div>
                 ) : (
-                  !recommendation && (
-                    <div className="empty-state" role="status">
-                      <span className="diamond">♦</span>
-                      <span className="eyebrow">
-                        {total
-                          ? "All cards considered"
-                          : "The search is complete"}
-                      </span>
-                      <h2>
-                        {session.status === "cancelled"
-                          ? "Matching cancelled."
-                          : session.status === "failed"
-                            ? "We couldn’t finish this hand."
-                            : total
-                              ? hasMoreCandidates
-                                ? "Batch reviewed."
-                                : "All available skills reviewed."
-                              : session.feedback.length > 0
-                                ? "No further matches."
-                                : "No matching skills yet."}
-                      </h2>
-                      <p>
-                        {retryMatching
-                          ? "Retry matching for this task, or change your brief. Your saved skills are still in your collection."
-                          : canContinue
-                            ? "Your saved skills are ready whenever you need them. Find another batch for this task, or edit your brief."
-                            : "Try a more specific task, adjust your preferences, or browse the catalog."}
-                      </p>
-                      <button
-                        className="primary-button"
-                        disabled={
-                          writeBusy ||
-                          ((retryMatching || canContinue) && !canMatch)
-                        }
-                        onClick={retryMatching || canContinue ? more : onEditTask}
-                      >
-                        {retryMatching
-                          ? "Retry matching"
-                          : canContinue
-                            ? "Find more for this task"
-                            : "Change task"}
-                        <ArrowRight size={18} />
-                      </button>
+                  <div className="empty-state" role="status">
+                    <span className="diamond">♦</span>
+                    <span className="eyebrow">
+                      {total
+                        ? "All cards considered"
+                        : "The search is complete"}
+                    </span>
+                    <h2>{emptyHeading}</h2>
+                    <p>
+                      {retryMatching
+                        ? "Retry matching for this task, or change your brief. Your saved skills are still in your collection."
+                        : canContinue
+                          ? "Your saved skills are ready whenever you need them. Find another batch for this task, or edit your brief."
+                          : "Try a more specific task, adjust your preferences, or browse the catalog."}
+                    </p>
+                    <button
+                      className="primary-button"
+                      disabled={
+                        writeBusy ||
+                        ((retryMatching || canContinue) && !canMatch)
+                      }
+                      onClick={retryMatching || canContinue ? more : onEditTask}
+                    >
+                      {retryMatching
+                        ? "Retry matching"
+                        : canContinue
+                          ? "Find more for this task"
+                          : "Change task"}
+                      <ArrowRight size={18} />
+                    </button>
+                    <button
+                      className="text-button"
+                      onClick={() => onNavigate(total ? "saved" : "explore")}
+                    >
+                      {total
+                        ? "View saved skills"
+                        : "Explore the catalog"}
+                      <ArrowUpRight size={16} />
+                    </button>
+                    {lastChoice && (
                       <button
                         className="text-button"
-                        onClick={() => onNavigate(total ? "saved" : "explore")}
+                        aria-label="Undo last choice"
+                        disabled={writeBusy}
+                        onClick={undo}
                       >
-                        {total
-                          ? "View saved skills"
-                          : "Explore the catalog"}
-                        <ArrowUpRight size={16} />
+                        <RotateCcw size={16} />
+                        Undo last choice
                       </button>
-                      {lastChoice && (
-                        <button
-                          className="text-button"
-                          aria-label="Undo last choice"
-                          disabled={writeBusy}
-                          onClick={undo}
-                        >
-                          <RotateCcw size={16} />
-                          Undo last choice
-                        </button>
-                      )}
-                    </div>
-                  )
+                    )}
+                  </div>
                 )}
               </>
             )}

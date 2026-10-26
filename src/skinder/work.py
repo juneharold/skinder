@@ -39,6 +39,7 @@ class SyncWork:
 
     async def run(self, function: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        # Track the worker's lifetime, not the caller's, so cancellation cannot hide it from drain.
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return await wait_for_work(task)

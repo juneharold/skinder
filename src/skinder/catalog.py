@@ -24,11 +24,13 @@ def default_catalog_db_path() -> Path:
 
 
 def stable_id(repository: str, skill_path: str) -> str:
+    # A skill keeps its identity when its source branch or revision changes.
     directory = str(PurePosixPath(skill_path).parent)
     return hashlib.sha256(f"{repository.lower()}:{directory}".encode()).hexdigest()[:20]
 
 
 def retrieval_text(skill: Skill) -> str:
+    # These fields define embedding content; changes elsewhere need no new vector.
     return "\n".join([
         skill.name, skill.description, skill.category, " ".join(skill.tags),
         *skill.requirements, *skill.workflow, *skill.output_style,
@@ -36,7 +38,7 @@ def retrieval_text(skill: Skill) -> str:
 
 
 def keyword_query(query: str) -> str:
-    # Quote tokens, rather than exposing FTS operators or SQL to user input.
+    # Treat task words literally instead of accepting FTS operators; cap work for long tasks.
     tokens = list(dict.fromkeys(re.findall(r"[^\W_]+", query.casefold())))[:64]
     return " OR ".join(f'"{token}"' for token in tokens)
 
@@ -68,6 +70,7 @@ class CatalogStore:
             # Serialize the read/modify/write decision and its FTS update across writers.
             session.connection(execution_options={"sqlite_begin_mode": "IMMEDIATE"})
             previous = session.get(CatalogSkillRecord, skill.id)
+            # Save provider observations even when existing catalog data is retained.
             if provider_id is not None:
                 statement = insert(CatalogAliasRecord).values(
                     provider="skillsmp", external_id=provider_id, skill_id=skill.id,
@@ -78,6 +81,7 @@ class CatalogStore:
                     set_={"skill_id": statement.excluded.skill_id,
                           "payload": statement.excluded.payload},
                 ))
+            # Provider listings cannot replace reviewed bundled evidence with unknown metadata.
             if previous and previous.provenance == "bundled" and skill.provenance != "bundled":
                 return "unchanged"
             if previous and previous.data == payload and previous.source_updated_at == source_updated_at:
@@ -118,6 +122,7 @@ class CatalogStore:
                     CatalogSkillRecord.id.in_(batch)
                 ))
                 found.update((row.id, Skill.model_validate_json(row.data)) for row in rows)
+        # SQL IN has no rank order; reconstruct the caller's order after batching the reads.
         return [found[skill_id] for skill_id in ids if skill_id in found]
 
     def count(self) -> int:
@@ -131,16 +136,16 @@ class CatalogStore:
         statement = select(CatalogSkillRecord.data)
         order = (CatalogSkillRecord.name.collate("NOCASE"), CatalogSkillRecord.id)
         params = {}
-        if q.strip():
-            if not match:
-                statement = statement.where(False)
-            else:
-                statement = statement.join(
-                    skills_fts, skills_fts.c.skill_id == CatalogSkillRecord.id,
-                ).where(text("skills_fts MATCH :match"))
-                params["match"] = match
-                order = (literal_column("bm25(skills_fts,0,4,1,2,2)"),
-                         literal_column("catalog_skills.rowid"))
+        if match:
+            statement = statement.join(
+                skills_fts, skills_fts.c.skill_id == CatalogSkillRecord.id,
+            ).where(text("skills_fts MATCH :match"))
+            params["match"] = match
+            order = (literal_column("bm25(skills_fts,0,4,1,2,2)"),
+                     literal_column("catalog_skills.rowid"))
+        elif q.strip():
+            # Blank input lists the catalog; punctuation alone must not match everything.
+            statement = statement.where(False)
         if category:
             statement = statement.where(CatalogSkillRecord.category == category)
         with self.db_sessions() as session:
@@ -148,6 +153,7 @@ class CatalogStore:
             rows = session.scalars(
                 statement.order_by(*order).limit(limit).offset(offset), params,
             ).all()
+            # Keep the category selector complete even when this query returns no skills.
             categories = session.scalars(select(CatalogSkillRecord.category).distinct().order_by(
                 CatalogSkillRecord.category
             )).all()
@@ -172,6 +178,7 @@ class CatalogStore:
             exclusions = func.json_each(json.dumps(excluded)).table_valued("value")
             statement = statement.where(CatalogSkillRecord.id.not_in(select(exclusions.c.value)))
         if agent is not None:
+            # Unknown compatibility stays eligible; only an explicit list constrains the agent.
             compatibility = func.json_each(CatalogSkillRecord.compatibility).table_valued("value")
             statement = statement.where(or_(
                 CatalogSkillRecord.compatibility.is_(None),
@@ -187,6 +194,7 @@ class CatalogStore:
     def eligible(
         self, ids: Iterable[str], *, agent: Agent | None = None, excluded: Iterable[str] = (),
     ) -> list[Skill]:
+        # Vector candidates must follow the same eligibility policy as keyword_search.
         excluded = set(excluded)
         return [skill for skill in self.get_many(ids) if skill.id not in excluded and (
             agent is None or skill.compatibility is None or agent in skill.compatibility

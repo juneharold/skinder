@@ -179,6 +179,7 @@ code {
   display: block;
   margin-bottom: 24px;
 }
+/* display:none would also hide these labels and live announcements from screen readers. */
 .sr-only {
   position: absolute;
   width: 1px;
@@ -494,6 +495,7 @@ code {
   position: relative;
   max-width: 540px;
   margin: 0 auto;
+  /* Keep the decorative back card behind the stack without putting it beneath the page. */
   isolation: isolate;
 }
 .card-stack:before {
@@ -514,6 +516,7 @@ code {
   border: 2px solid var(--ink);
   border-bottom: 0;
   border-radius: 8px 8px 0 0;
+  /* SkillCard handles horizontal swipes; leave vertical scrolling and zoom to the browser. */
   touch-action: pan-y pinch-zoom;
   transform: translateX(var(--drag, 0)) rotate(var(--rotation, 0));
   transition: transform 0.12s ease;
@@ -1428,6 +1431,7 @@ kbd {
     width: 15px;
   }
   .toast {
+    /* Leave the sticky deck actions unobstructed after a save or pass. */
     bottom: 85px;
     font-size: 12px;
   }

@@ -29,9 +29,11 @@ def run_migrations(kind):
 
     connection = config.attributes.get("connection")
     if connection is not None:
+        # Application startup owns this transaction, including rollback on a failed migration.
         migrate(connection)
         return
 
+    # CLI migrations honor the same database overrides as the server.
     variable = "SKINDER_USER_DB_PATH" if kind == "user" else "SKINDER_CATALOG_DB_PATH"
     path = os.environ.get(variable)
     url = URL.create("sqlite", database=path) if path else make_url(
@@ -50,6 +52,7 @@ def run_migrations(kind):
         Path(url.database).parent.mkdir(parents=True, exist_ok=True)
     engine = sqlite_engine(url)
     try:
+        # Direct Alembic runs need the same serialized, transactional initialization as startup.
         with (
             engine.connect().execution_options(sqlite_begin_mode="IMMEDIATE") as connection,
             connection.begin(),

@@ -15,6 +15,7 @@ export default function SkillCard({
   onOpen: () => void;
   onSwipe: (action: "save" | "pass") => void;
 }) {
+  // Only the initiating pointer owns the gesture; another touch must not move or commit it.
   const start = useRef<{ x: number; y: number; pointerId: number } | null>(null);
   const [drag, setDrag] = useState(0);
   function reset() {
@@ -54,10 +55,12 @@ export default function SkillCard({
         ) return;
         const dx = event.clientX - start.current.x;
         const dy = event.clientY - start.current.y;
+        // Leave vertical gestures to page scrolling instead of capturing the pointer.
         if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 10) {
           reset();
           return;
         }
+        // Clamp the visual movement without reducing the full distance used to commit a swipe.
         if (Math.abs(dx) > 12) {
           event.currentTarget.setPointerCapture(event.pointerId);
           setDrag(Math.max(-75, Math.min(75, dx)));
@@ -67,6 +70,7 @@ export default function SkillCard({
         if (!start.current || start.current.pointerId !== event.pointerId) return;
         const dx = event.clientX - start.current.x;
         const dy = event.clientY - start.current.y;
+        // Clear this gesture before the action can replace the card with the next skill.
         reset();
         if (
           !disabled &&

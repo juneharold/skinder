@@ -38,7 +38,9 @@ class Skill(Model):
     source_url: str
     revision: str | None
     license: str | None
+    # None means unknown support, so retrieval keeps the skill eligible for either agent.
     compatibility: list[Agent] | None
+    # Empty imported metadata is missing evidence, not proof of no setup or style constraints.
     requirements: list[str]
     tags: list[str]
     workflow: list[str]
@@ -65,6 +67,7 @@ class Recommendation(Model):
 
 
 class MatchResult(Model):
+    # Zero recommendations is a valid result when the available skills do not fit the task.
     recommendations: list[Recommendation] = Field(max_length=12)
 
 
@@ -94,6 +97,7 @@ class MatchInput(Model):
     @field_validator("task", mode="before")
     @classmethod
     def strip_task(cls, value):
+        # Normalize before length validation and continuation comparisons, without coercing types.
         return value.strip() if isinstance(value, str) else value
 
 

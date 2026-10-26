@@ -53,6 +53,7 @@ class MatchService:
         self.matcher = matcher
         self.retriever = retriever
         self.enricher = enricher
+        # Ownership excludes other servers; this lock serializes jobs within this server.
         self._lock = asyncio.Lock()
         self._active: asyncio.Task[None] | None = None
         self._session_id: str | None = None
@@ -70,6 +71,7 @@ class MatchService:
             if previous.task != value.task or previous.agent != value.agent:
                 raise MatchServiceError(409, "A continuation must use the same task and target agent.")
         profile = self.users.get_profile().model_dump()
+        # A task can target a different agent from the saved profile default.
         profile["agent"] = value.agent
         feedback = []
         for event in self.users.get_preference_events(value.agent):
@@ -104,34 +106,39 @@ class MatchService:
                 raise MatchServiceError(503, "Matching was interrupted by shutdown.")
             session = await run_sync(self.get_session, session_id)
             if session.status == "running":
+                # Persist cancellation first so a late result cannot replace it.
                 await run_sync(self.users.finish_match_session, session_id, "cancelled")
                 if self._session_id == session_id:
                     await self._stop_active()
             return await run_sync(self.get_session, session_id)
 
     async def _stop_active(self) -> None:
-        if self._active is not None and not self._active.done():
-            self._active.cancel()
-            try:
-                await self._active
-            except asyncio.CancelledError:
-                pass
+        if self._active is None or self._active.done():
+            return
+        self._active.cancel()
+        try:
+            await self._active
+        except asyncio.CancelledError:
+            pass
 
     async def shutdown(self) -> None:
+        # Reject queued starts before yielding to the shutdown task and waiting for the lock.
         self._closing = True
         await wait_for_work(asyncio.create_task(self._shutdown()))
 
     async def _shutdown(self) -> None:
         async with self._lock:
-            if self._active is not None and not self._active.done():
-                assert self._session_id is not None
-                try:
-                    await run_sync(
-                        self.users.finish_match_session, self._session_id, "failed",
-                        error="Matching was interrupted by shutdown.",
-                    )
-                finally:
-                    await self._stop_active()
+            if self._active is None or self._active.done():
+                return
+            assert self._session_id is not None
+            try:
+                await run_sync(
+                    self.users.finish_match_session, self._session_id, "failed",
+                    error="Matching was interrupted by shutdown.",
+                )
+            finally:
+                # A failed status write must not leave the matcher running.
+                await self._stop_active()
 
     def _search(self, session: MatchSession) -> list[Skill]:
         return self.retriever.search(
@@ -148,11 +155,13 @@ class MatchService:
     ) -> None:
         stage = "retrieval"
         try:
+            # Retrieval and source enrichment share the matcher's overall time budget.
             async with asyncio.timeout(getattr(self.matcher, "timeout", 180)):
                 candidates = await run_sync(self._search, session)
                 stage = "enrichment"
                 enriched = await self.enricher.enrich(candidates[:40])
                 request = bounded_request(session.task, profile, feedback, enriched)
+                # An empty candidate set is a successful no-fit result, with no CLI invocation.
                 result = MatchResult(recommendations=[])
                 if request["eligible_skills"]:
                     stage = "matcher"
@@ -162,6 +171,7 @@ class MatchService:
                         result = MatchResult.model_validate_json(raw, strict=True)
                     except ValidationError as exc:
                         raise InvalidRecommendations from exc
+            # The output schema cannot enforce membership in this request's candidate set.
             ids = [item.skill_id for item in result.recommendations]
             eligible = {skill["id"] for skill in request["eligible_skills"]}
             if len(ids) != len(set(ids)) or not set(ids).issubset(eligible):
@@ -169,6 +179,7 @@ class MatchService:
             stage = "persistence"
             await run_sync(self._complete, session, result)
         except asyncio.CancelledError:
+            # Cancel and shutdown own the terminal status; do not overwrite it as a failure here.
             raise
         except TimeoutError:
             await self._fail(session.id, "Matching timed out. Try again.")

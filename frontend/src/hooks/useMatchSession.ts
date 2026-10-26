@@ -50,7 +50,7 @@ export function useMatchSession({
 }: MatchSessionOptions): MatchSessionController {
   const [session, setSession] = useState<MatchSession | null>(null);
   const currentSession = useRef<MatchSession | null>(null);
-  // Successful writes invalidate older initial reads and poll responses.
+  // Match/cancel attempts and successful reviews invalidate older initial reads and polls.
   const version = useRef(0);
   const loadVersion = useRef(0);
   const [loadState, setLoadState] = useState<LoadState>("loading");
@@ -66,6 +66,7 @@ export function useMatchSession({
   const canMatch = canStart && loadState === "ready";
 
   const adoptSession = useCallback((next: MatchSession | null) => {
+    // Commands and retries need the latest session before React commits its next render.
     currentSession.current = next;
     setSession(next);
   }, []);
@@ -95,6 +96,7 @@ export function useMatchSession({
     let active = true;
     let timer: ReturnType<typeof setTimeout>;
     const id = session.id;
+    // Schedule after settlement so a slow check cannot overlap another poll.
     const poll = async () => {
       const generation = version.current;
       try {
@@ -107,6 +109,7 @@ export function useMatchSession({
         if (active && generation === version.current)
           setPollError(`Could not check matching: ${errorMessage(error)}`);
       }
+      // An invalidated response can leave this session running, so keep polling while active.
       if (active) timer = setTimeout(poll, 1200);
     };
     timer = setTimeout(poll, 800);
@@ -118,6 +121,7 @@ export function useMatchSession({
 
   async function reconcile(request: MatchRequest) {
     const next = request.sessionId ? await api.session(request.sessionId) : await api.current();
+    // Continuations keep their ID; a new task needs a different session with the requested brief.
     const changed = request.sessionId
       ? next && (next.updated_at !== request.baseline?.updated_at || isMatching(next))
       : next && next.id !== request.baseline?.id &&
@@ -141,16 +145,16 @@ export function useMatchSession({
           next = await api.match(request.task, request.agent, request.sessionId);
         } catch (error) {
           if (error instanceof ApiError) throw error;
+          // A lost response may hide an accepted job; reconcile before submitting again.
           request = { ...request, uncertain: true };
           next = await reconcile(request);
           if (!next) throw error;
         }
       }
-      if (generation === version.current) {
-        adoptSession(next);
-        setPollError("");
-        onStarted();
-      }
+      if (generation !== version.current) return;
+      adoptSession(next);
+      setPollError("");
+      onStarted();
     } catch (error) {
       if (generation === version.current) setMatchError({ message: errorMessage(error), request });
     } finally {
@@ -173,10 +177,12 @@ export function useMatchSession({
     const current = currentSession.current;
     if (!current || isMatching(current) || startGuard.current) return;
     void saved.mutate(`Retry ${action}`, async () => {
+      // A stored retry retains its original task, which may have resumed matching since failure.
       if (isMatching(currentSession.current) && currentSession.current?.id === current.id)
         throw new Error("Wait for matching to finish before reviewing this task.");
       const result = await api.feedback(current.id, skill.id, action, reason);
       version.current++;
+      // Saved ownership is global; only update the deck if this is still the same session.
       saved.setItems(result.saved.items);
       if (currentSession.current?.id === current.id) adoptSession({
         ...currentSession.current,
@@ -192,6 +198,7 @@ export function useMatchSession({
 
   const reviewedIds = new Set(session?.feedback.map((item) => item.skill_id));
   const remaining = session?.recommendations.filter((item) => !reviewedIds.has(item.skill_id)) ?? [];
+  // Feedback spans batches; undo must select a choice from the currently displayed batch.
   const lastChoice = session
     ? [...session.feedback].reverse().find((item) =>
         session.recommendations.some((recommendation) => recommendation.skill_id === item.skill_id))
@@ -206,6 +213,7 @@ export function useMatchSession({
         throw new Error("Wait for matching to finish before undoing a choice.");
       const result = await api.undo(choice.id);
       version.current++;
+      // The server preserves bookmarks owned outside this deck when undo removes a review save.
       saved.setItems(result.items);
       if (currentSession.current?.id === current.id) adoptSession({
         ...currentSession.current,
@@ -224,12 +232,12 @@ export function useMatchSession({
     const generation = ++version.current;
     try {
       const next = await api.cancel(current.id);
-      if (generation === version.current) {
-        version.current++;
-        adoptSession(next);
-        setPollError("");
-        saved.setError((previous) => previous?.label === "Retry cancellation" ? null : previous);
-      }
+      if (generation !== version.current) return;
+      // A poll started during cancellation must not restore the session's running state.
+      version.current++;
+      adoptSession(next);
+      setPollError("");
+      saved.setError((previous) => previous?.label === "Retry cancellation" ? null : previous);
     } catch (error) {
       saved.setError({
         message: `Could not stop matching: ${errorMessage(error)}`,

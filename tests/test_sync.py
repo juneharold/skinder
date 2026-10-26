@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 
 from skinder.catalog import CatalogStore, stable_id
 from skinder.orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
-from skinder.sync import Sync, import_skill, sync_status
+from skinder.sync import Sync, TaxonomyLinks, import_skill, sync_status
 
 
 def skill_row(name="one", **changes):
@@ -59,6 +59,85 @@ def test_status_read_does_not_create_sync_state(catalog):
     with catalog.db_sessions() as session:
         assert session.get(SyncRunRecord, 1) is None
         assert session.scalar(select(func.count()).select_from(SyncPartitionRecord)) == 0
+
+
+def test_taxonomy_links_accept_only_provider_taxonomy_anchors():
+    parser = TaxonomyLinks()
+    parser.feed('''
+        <a href="/categories/tools/">Tools</a>
+        <a href="https://skillsmp.com/occupations/software/developer">Developer</a>
+        <a href="/categories/tools">Duplicate</a>
+        <img href="/categories/image">
+        <a href="http://skillsmp.com/categories/insecure">Insecure</a>
+        <a href="https://other.example/categories/external">External</a>
+        <a href="https://skillsmp.com.evil.test/categories/lookalike">Lookalike</a>
+        <a href="/skills/other">Skill</a>
+        <a href="/categories/">Root</a>
+        <a>No link</a>
+    ''')
+
+    assert parser.links == {"/categories/tools", "/occupations/software/developer"}
+
+
+def test_discovery_bounds_unique_pages_but_keeps_all_filters(catalog, monkeypatch):
+    from skinder import sync as module
+
+    monkeypatch.setattr(module, "TAXONOMY_LIMIT", 4)
+    document = '''
+        <a href="/categories/a">A</a>
+        <a href="/categories/a/">Duplicate A</a>
+        <a href="/categories/b">B</a>
+        <a href="/categories/queued">Queued</a>
+        <a href="/categories/seen">Seen</a>
+    '''
+    with httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, text=document),
+    )) as client:
+        sync = Sync(catalog, client, sleep=lambda _: None)
+        sync.state["discovery_pending"] = ["/categories", "/categories/queued"]
+        sync.state["discovery_seen"] = ["/categories/seen"]
+
+        sync.discover()
+
+    with catalog.db_sessions() as session:
+        state = json.loads(session.get(SyncRunRecord, 1).data)
+        partitions = [json.loads(data) for data in session.scalars(select(SyncPartitionRecord.data))]
+    assert state["discovery_pending"] == ["/categories/queued", "/categories/a"]
+    assert state["discovery_seen"] == ["/categories/seen", "/categories"]
+    assert state["discovered"]["category"] == ["a", "b", "queued", "seen"]
+    assert {row["filters"]["category"] for row in partitions if "category" in row["filters"]} == {
+        "a", "b", "queued", "seen",
+    }
+    assert len(partitions) == 5
+    assert len(state["warnings"]) == 1
+
+
+@pytest.mark.parametrize("filters, missing, later", [
+    ({}, "language", "category"),
+    ({"language": "en"}, "category", "occupation"),
+])
+def test_expansion_waits_for_first_missing_dimension(catalog, filters, missing, later):
+    provider = Provider(lambda _: page([]))
+    sync = Sync(catalog, provider.client, sleep=lambda _: None)
+    sync.state["discovered"][later] = ["known"]
+    data = {"filters": filters, "sort": "stars", "recent_enqueued": True}
+
+    sync.expand(data)
+
+    with catalog.db_sessions() as session:
+        queued = [json.loads(row)["filters"]
+                  for row in session.scalars(select(SyncPartitionRecord.data))]
+    assert queued == [{}]
+
+    sync.state["discovered"][missing] = ["new"]
+    sync.expand(data)
+
+    with catalog.db_sessions() as session:
+        queued = [json.loads(row)["filters"]
+                  for row in session.scalars(select(SyncPartitionRecord.data))]
+    assert len(queued) == 2
+    assert {} in queued
+    assert filters | {missing: "new"} in queued
 
 
 def test_overlapping_partitions_preserve_id_metadata_and_category(catalog):

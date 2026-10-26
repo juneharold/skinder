@@ -5,6 +5,9 @@ import sqlite3
 
 import pytest
 
+from skinder.ownership import DatabaseOwnership
+from skinder.user import UserStore
+
 
 async def finish(client, session_id):
     for _ in range(500):
@@ -371,6 +374,36 @@ async def test_shutdown_reaps_running_child_and_keeps_interrupted_session(backen
         session = (await client.get(f"/api/matches/{session_id}")).json()
         assert session["status"] == "failed"
         assert "interrupted" in session["error"]
+
+
+async def test_shutdown_persistence_failure_still_reaps_child_and_releases_database(
+    backend, monkeypatch,
+):
+    def fail_write(*args, **kwargs):
+        raise RuntimeError("Database write failed")
+
+    backend.configure(sleep=30)
+    with (
+        monkeypatch.context() as patch,
+        pytest.raises(RuntimeError, match="Database write failed"),
+    ):
+        async with backend.client() as client:
+            response = await client.post(
+                "/api/matches", json={"task": "Review changes", "agent": "codex"}
+            )
+            session_id = response.json()["id"]
+            pid = await wait_for_process(backend)
+            patch.setattr(UserStore, "finish_match_session", fail_write)
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    owner = DatabaseOwnership(backend.user_db_path)
+    owner.acquire()
+    owner.release()
+    async with backend.client() as client:
+        session = (await client.get(f"/api/matches/{session_id}")).json()
+        assert session["status"] == "failed"
+        assert session["recommendations"] == []
 
 
 async def test_missing_codex_leaves_browsing_and_profile_usable(backend, monkeypatch):

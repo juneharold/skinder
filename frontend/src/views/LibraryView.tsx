@@ -24,6 +24,7 @@ export default function LibraryView({
   const writeBusy = saved.busy;
   const savedIds = new Set(saved.items.map((item) => item.skill.id));
   const loadState = view === "saved" ? saved.loadState : catalog.loadState;
+  // Explore uses server-wide categories/results; Saved is a complete collection filtered locally.
   const categories = view === "saved"
     ? [...new Set(saved.items.map((item) => item.skill.category))].sort()
     : catalog.categories;
@@ -62,6 +63,7 @@ export default function LibraryView({
             value={q}
             placeholder="Search skills, authors, or tags"
             onChange={(event) =>
+              // Typing replaces history so Back does not step through every keystroke.
               onFilters({ q: event.target.value }, true)
             }
           />

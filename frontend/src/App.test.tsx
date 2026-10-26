@@ -442,6 +442,46 @@ describe("skill discovery", () => {
     expect(backend.getMatchRequests()).toEqual([]);
   });
 
+  it.each(["failed", "cancelled"] as const)("retries a %s task even when all previous cards were reviewed", async (status) => {
+    const item = skill("design", "Thoughtful Design");
+    const session = sessionFor([item], {
+      status,
+      feedback: [{
+        id: "choice-1", session_id: "session-1", skill_id: item.id,
+        action: "pass", reason: null, created_at: "2026-10-27T01:00:00Z",
+      }],
+    });
+    const backend = installBackend({ skills: [item], session });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Retry matching" }));
+    expect(await screen.findByRole("button", { name: "Change task" })).toBeVisible();
+    expect(backend.getSession()).toMatchObject({
+      id: session.id, task: session.task, status: "completed", feedback: session.feedback,
+    });
+    expect(screen.queryByRole("dialog", { name: "Edit task" })).not.toBeInTheDocument();
+  });
+
+  it("offers task editing when every available skill has been reviewed", async () => {
+    const item = skill("design", "Thoughtful Design");
+    const session = sessionFor([item], {
+      feedback: [{
+        id: "choice-1", session_id: "session-1", skill_id: item.id,
+        action: "pass", reason: null, created_at: "2026-10-27T01:00:00Z",
+      }],
+    });
+    const backend = installBackend({ skills: [item], session });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Change task" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit task" });
+    expect(within(dialog).getByRole("textbox", { name: /What are you working on/ })).toHaveValue(session.task);
+    expect(backend.getSession()).toEqual(session);
+    expect(backend.getMatchRequests()).toEqual([]);
+  });
+
   it("locks task submission while a match request is pending", async () => {
     const backend = installBackend({ session: null });
     const match = deferred<Awaited<ReturnType<typeof api.match>>>();
@@ -537,6 +577,36 @@ describe("skill discovery", () => {
 
     expect(backend.getSession()?.status).toBe("cancelled");
     expect(screen.getByRole("heading", { name: "Thoughtful Design" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save this skill" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Stop matching" })).not.toBeInTheDocument();
+  });
+
+  it("continues polling after a failed cancellation invalidates an outstanding poll", async () => {
+    vi.useFakeTimers();
+    const item = skill("design", "Thoughtful Design");
+    const running = sessionFor([item], { status: "running" });
+    installBackend({ skills: [item], session: running });
+    const stalePoll = deferred<Awaited<ReturnType<typeof api.session>>>();
+    vi.mocked(api.session)
+      .mockReturnValueOnce(stalePoll.promise)
+      .mockResolvedValue(sessionFor([item]));
+    vi.mocked(api.cancel).mockRejectedValueOnce(new Error("Cancellation failed."));
+    await act(async () => { render(<App />); });
+
+    await act(async () => { await vi.advanceTimersToNextTimerAsync(); });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Stop matching" }));
+    });
+    expect(screen.getByRole("button", { name: "Retry cancellation" })).toBeEnabled();
+
+    await act(async () => {
+      stalePoll.resolve(running);
+      await stalePoll.promise;
+    });
+    expect(screen.getByRole("button", { name: "Stop matching" })).toBeEnabled();
+    await act(async () => { await vi.advanceTimersToNextTimerAsync(); });
+
+    expect(screen.getByRole("heading", { name: item.name })).toBeVisible();
     expect(screen.getByRole("button", { name: "Save this skill" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Stop matching" })).not.toBeInTheDocument();
   });

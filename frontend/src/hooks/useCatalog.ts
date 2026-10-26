@@ -43,6 +43,7 @@ export function useCatalog({ q, category, cacheSkills }: CatalogOptions): Catalo
     abort.current?.abort();
     const controller = new AbortController();
     abort.current = controller;
+    // Filters change before the debounced request starts; reject old pages in that gap.
     const current = () => !controller.signal.aborted &&
       requestVersion === version.current && currentFilter.current === filterKey;
     if (offset) setLoadingMore(true);
@@ -53,10 +54,12 @@ export function useCatalog({ q, category, cacheSkills }: CatalogOptions): Catalo
         q, category: category === "All skills" ? undefined : category, offset, limit: 50,
       }, controller.signal);
       if (!current()) return;
+      // Populate details before publishing IDs; the library resolves every ID through this cache.
       cacheSkills(next.skills);
       setIds((previous) => [...new Set([
         ...(offset ? previous : []), ...next.skills.map((skill) => skill.id),
       ])]);
+      // A single page cannot provide the complete filter choices or result count.
       setCategories(next.categories);
       setTotal(next.total ?? 0);
       setHasMore(next.has_more ?? false);
@@ -64,11 +67,13 @@ export function useCatalog({ q, category, cacheSkills }: CatalogOptions): Catalo
       setLoadError("");
     } catch (error) {
       if (!current()) return;
-      if (offset) setMoreError(errorMessage(error));
-      else {
-        setLoadState("error");
-        setLoadError(errorMessage(error));
+      if (offset) {
+        // Keep previously loaded cards usable while offering a retry for the missing page.
+        setMoreError(errorMessage(error));
+        return;
       }
+      setLoadState("error");
+      setLoadError(errorMessage(error));
     } finally {
       if (current()) setLoadingMore(false);
     }

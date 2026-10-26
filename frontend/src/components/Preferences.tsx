@@ -12,8 +12,10 @@ export default function Preferences({
   onSave: (profile: Profile) => Promise<void>;
   onClose: () => void;
 }) {
+  // Keep edits local to this opening; failed saves must not reset them from profile props.
   const [draft, setDraft] = useState(profile);
   const pending = useRef(false);
+  // Closing leaves the parent's save running; do not update this dialog after unmount.
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;

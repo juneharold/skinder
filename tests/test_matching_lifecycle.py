@@ -1,4 +1,6 @@
 import asyncio
+import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -11,6 +13,7 @@ from test_catalog_store import example_skill
 
 from skinder.app import create_app
 from skinder.catalog import CatalogStore
+from skinder.matcher import terminate
 from skinder.matching import MatchServiceError
 from skinder.models import CodexStatus, MatchInput
 from skinder.ownership import DatabaseOwnership
@@ -18,6 +21,7 @@ from skinder.sources import SourceEnricher
 from skinder.work import run_sync
 
 
+# Explicit gates place cancellation inside an active match without depending on machine speed.
 class WaitingMatcher:
     def __init__(self):
         self.entered = asyncio.Event()
@@ -38,6 +42,25 @@ class MetadataOnly:
     async def enrich(self, skills):
         from skinder.sources import match_metadata
         return [match_metadata(skill) for skill in skills]
+
+
+async def test_termination_reaps_child_that_ignores_graceful_shutdown():
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c",
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print('ready', flush=True); time.sleep(30)",
+        stdout=asyncio.subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        assert await asyncio.wait_for(process.stdout.readline(), 3) == b"ready\n"
+        await asyncio.wait_for(terminate(process), 5)
+        assert process.returncode == -signal.SIGKILL
+        with pytest.raises(ProcessLookupError):
+            os.kill(process.pid, 0)
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
 
 
 @asynccontextmanager

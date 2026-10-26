@@ -12,6 +12,7 @@ DatabaseKind = Literal["user", "catalog"]
 
 
 def sqlite_engine(url: URL) -> Engine:
+    # Pooled connections can be checked out by different workers; each operation owns its session.
     engine = create_engine(url, connect_args={"timeout": 30, "check_same_thread": False})
 
     @event.listens_for(engine, "connect")
@@ -20,7 +21,9 @@ def sqlite_engine(url: URL) -> Engine:
         dbapi_connection.isolation_level = None
         cursor = dbapi_connection.cursor()
         try:
+            # Readers should remain usable while background sync or user writes hold the writer.
             cursor.execute("PRAGMA journal_mode=WAL")
+            # SQLite requires foreign-key enforcement on every new connection.
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()
@@ -49,10 +52,12 @@ def create_database(path: str | Path, kind: DatabaseKind) -> Engine:
     path.parent.mkdir(parents=True, exist_ok=True)
     engine = sqlite_engine(URL.create("sqlite", database=str(path)))
     try:
+        # Reserve the writer before Alembic reads its version so concurrent opens cannot race.
         with (
             engine.connect().execution_options(sqlite_begin_mode="IMMEDIATE") as connection,
             connection.begin(),
         ):
+            # Schema changes and their version marker must commit or roll back together.
             config.attributes["connection"] = connection
             command.upgrade(config, "head")
     except BaseException:

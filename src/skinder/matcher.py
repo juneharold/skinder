@@ -18,19 +18,22 @@ class MatchError(RuntimeError):
 
 
 async def terminate(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is None:
+    if process.returncode is not None:
+        return
+    # The CLI can spawn children; stopping only its PID would leave that work running.
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(process.wait(), 3)
+    except TimeoutError:
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(process.wait(), 3)
-        except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            await process.wait()
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
 
 
 def codex_environment() -> dict[str, str]:
     env = os.environ.copy()
+    # Use the local CLI login without inheriting a parent agent session or API-key override.
     for key in (
         "CODEX_THREAD_ID",
         "CODEX_SESSION_ID",
@@ -121,6 +124,7 @@ class CodexMatcher:
                 "Choose IDs only from eligible_skills; never invent or repeat an ID.",
                 encoding="utf-8",
             )
+            # Recommendations must not inherit user instructions or access tools from CLI config.
             args = [
                 executable,
                 "exec",
@@ -177,6 +181,7 @@ class CodexMatcher:
             args.append("-")
             process = None
             try:
+                # CLI diagnostics may contain sensitive data; only the result file is consumed.
                 process = await asyncio.create_subprocess_exec(
                     *args,
                     stdin=asyncio.subprocess.PIPE,
@@ -186,6 +191,7 @@ class CodexMatcher:
                     env=codex_environment(),
                     start_new_session=True,
                 )
+                # Keep task text and preferences off the command line exposed by process listings.
                 await asyncio.wait_for(
                     process.communicate(json.dumps(request, ensure_ascii=False).encode()),
                     self.timeout,
@@ -207,5 +213,6 @@ class CodexMatcher:
                     "Could not start or read Codex. Check your local installation."
                 ) from exc
             finally:
+                # Wait for subprocess cleanup before TemporaryDirectory removes its working files.
                 if process is not None:
                     await terminate(process)

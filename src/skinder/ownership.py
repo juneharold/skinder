@@ -7,6 +7,7 @@ from typing import BinaryIO
 
 class DatabaseOwnership:
     def __init__(self, database: Path) -> None:
+        # Symlink aliases of one database must contend for the same ownership lock.
         database = database.resolve()
         self.path = database.with_name(database.name + ".lock")
         self._file: BinaryIO | None = None

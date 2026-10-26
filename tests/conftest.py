@@ -43,6 +43,7 @@ def backend(tmp_path, monkeypatch):
         catalog.upsert(Skill.model_validate(skill))
     control = tmp_path / "control.json"
     control.write_text("{}")
+    # A real child exercises signals and cleanup without invoking Codex or consuming model usage.
     fake = tmp_path / "codex"
     fake.write_text(
         f"#!{sys.executable}\n"
@@ -87,6 +88,7 @@ pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(
 
     @asynccontextmanager
     async def client(timeout=180, frontend_path=None, retriever=None, enricher=None):
+        # Reopening the same files with a fresh app lets restart tests exercise persisted recovery.
         app = create_app(
             user_db_path=user_db_path,
             catalog_db_path=catalog_db_path,

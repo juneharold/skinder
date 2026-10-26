@@ -1,5 +1,6 @@
 import type { LoadState } from "../lib/async";
 
+// Views own loading/empty layouts; this shared notice provides recovery without replacing them.
 export default function LoadNotice({ label, retryLabel = label, state, error, onRetry }: {
   label: string;
   retryLabel?: string;

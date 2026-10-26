@@ -14,6 +14,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
+# Personal data and the replaceable catalog have separate databases and migration histories.
 class UserBase(DeclarativeBase):
     pass
 
@@ -43,6 +44,7 @@ class MatchSessionRecord(UserBase):
     updated_at: Mapped[str] = mapped_column(Text)
 
 
+# This cumulative history authorizes feedback even after a newer batch replaces the displayed one.
 class MatchSessionSkillRecord(UserBase):
     __tablename__ = "match_session_skills"
 
@@ -64,11 +66,13 @@ class FeedbackRecord(UserBase):
     created_at: Mapped[str] = mapped_column(Text)
 
 
+# Skill IDs cross the database boundary, so user records cannot reference catalog rows as foreign keys.
 class BookmarkRecord(UserBase):
     __tablename__ = "bookmarks"
 
     skill_id: Mapped[str] = mapped_column(Text, primary_key=True)
     saved_at: Mapped[str] = mapped_column(Text)
+    # None denotes an independent save; otherwise undo may transfer or remove the bookmark.
     feedback_id: Mapped[str | None] = mapped_column(Text)
 
 
@@ -76,6 +80,7 @@ class CatalogSkillRecord(CatalogBase):
     __tablename__ = "catalog_skills"
 
     id: Mapped[str] = mapped_column(Text, primary_key=True)
+    # Preserve the full API payload while separate columns support filtering and retrieval.
     data: Mapped[str] = mapped_column(Text)
     provenance: Mapped[str] = mapped_column(Text)
     name: Mapped[str] = mapped_column(Text)
@@ -136,6 +141,7 @@ class SkillEmbeddingRecord(CatalogBase):
     __tablename__ = "skill_embeddings"
     __table_args__ = (
         UniqueConstraint("skill_id", "text_hash", "model_fingerprint"),
+        # Published search indexes retain vector IDs; deleted IDs must never identify new vectors.
         {"sqlite_autoincrement": True},
     )
 

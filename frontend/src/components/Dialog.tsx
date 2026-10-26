@@ -17,6 +17,7 @@ export default function Dialog({
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const dialog = ref.current!;
+    // Capture focus before showModal moves it, so closing can return to the invoking control.
     const opener =
       document.activeElement instanceof HTMLElement
         ? document.activeElement
@@ -35,21 +36,22 @@ export default function Dialog({
       ref={ref}
       className={`dialog ${className}`}
       onCancel={(event) => {
+        // React owns removal so Escape follows the same close guard and cleanup as the button.
         event.preventDefault();
         if (!closeDisabled) onClose();
       }}
       aria-label={title}
       onClick={(event) => {
-        if (!closeDisabled && event.target === event.currentTarget) {
-          const box = event.currentTarget.getBoundingClientRect();
-          if (
-            event.clientX < box.left ||
-            event.clientX > box.right ||
-            event.clientY < box.top ||
-            event.clientY > box.bottom
-          )
-            onClose();
-        }
+        if (closeDisabled || event.target !== event.currentTarget) return;
+        // Dialog padding also targets the dialog; only a click outside its box is backdrop.
+        const box = event.currentTarget.getBoundingClientRect();
+        if (
+          event.clientX < box.left ||
+          event.clientX > box.right ||
+          event.clientY < box.top ||
+          event.clientY > box.bottom
+        )
+          onClose();
       }}
     >
       <div className="dialog-heading">

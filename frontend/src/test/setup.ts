@@ -7,6 +7,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
 });
+// Model modal visibility only; these stubs do not emulate the browser's native focus trap.
 HTMLDialogElement.prototype.showModal = function () {
   this.setAttribute("open", "");
 };

@@ -11,6 +11,7 @@ export default defineConfig({
         changeOrigin: true,
         configure(proxy) {
           proxy.on("proxyReq", (proxyRequest, request) => {
+            // Satisfy the backend's origin check for our dev pages without accepting foreign origins.
             if (
               ["http://127.0.0.1:5174", "http://localhost:5174"].includes(
                 request.headers.origin ?? "",

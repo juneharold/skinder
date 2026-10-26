@@ -7,6 +7,7 @@ export type ActionError = {
   message: string;
   label: string;
   retry: () => void;
+  // Route a bookmark failure to its original skill even if a different detail dialog opens.
   skillId?: string;
   kind?: "bookmark";
 };
@@ -40,6 +41,7 @@ export function useSavedSkills({ canWrite, onNotice }: SavedSkillsOptions) {
   const reload = useCallback(async () => {
     const requestVersion = ++loadVersion.current;
     const generation = version.current;
+    // Both newer reloads and intervening writes can make this response obsolete.
     const current = () => requestVersion === loadVersion.current && generation === version.current;
     setLoadState("loading");
     try {
@@ -59,6 +61,7 @@ export function useSavedSkills({ canWrite, onNotice }: SavedSkillsOptions) {
   }, [reload]);
 
   async function mutate(label: string, operation: () => Promise<void>, skill?: Skill) {
+    // Bookmarks, reviews, and undo share full collection responses, so serialize their writes.
     if (writing.current || !canWrite()) return;
     writing.current = true;
     // Reads started before or during a mutation cannot replace its saved collection.
@@ -77,6 +80,7 @@ export function useSavedSkills({ canWrite, onNotice }: SavedSkillsOptions) {
         retry: () => void mutate(label, operation, skill),
       });
     } finally {
+      // Also reject reads begun during the write, including when its response was lost.
       version.current++;
       writing.current = false;
       setBusy(false);

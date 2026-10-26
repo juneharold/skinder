@@ -437,6 +437,22 @@ code {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.full-task {
+  margin: -12px 0 24px;
+  font-size: 14px;
+}
+.full-task summary {
+  cursor: pointer;
+  min-height: 44px;
+  padding: 10px 0;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.full-task p {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .sidebar-section {
   padding: 23px 0;
   border-top: 1px solid var(--line);
@@ -617,7 +633,7 @@ code {
   padding: 42px 0 32px 25px;
 }
 .progress-sidebar .eyebrow {
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.095em;
 }
 .progress-count {
@@ -796,7 +812,7 @@ kbd {
   white-space: nowrap;
 }
 .catalog-top .eyebrow {
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.08em;
 }
 .catalog-card h2 {
@@ -834,7 +850,7 @@ kbd {
   margin-bottom: 24px;
 }
 .tag-row span {
-  font-size: 11px;
+  font-size: 12px;
   border: 1px solid var(--line);
   border-radius: 2px;
   padding: 3px 7px;
@@ -1235,7 +1251,7 @@ kbd {
     font-size: 22px;
   }
   .connection {
-    font-size: 11px;
+    font-size: 12px;
     margin-left: auto;
   }
   .header-preferences {
@@ -1259,7 +1275,7 @@ kbd {
     padding: 36px 4px 48px;
   }
   .welcome-intro .eyebrow {
-    font-size: 11px;
+    font-size: 12px;
     margin-bottom: 16px;
   }
   .welcome-intro h1 {
@@ -1335,7 +1351,7 @@ kbd {
     gap: 12px;
   }
   .progress-sidebar .eyebrow {
-    font-size: 10px;
+    font-size: 12px;
   }
   .progress-count {
     font-size: 17px;
@@ -1388,7 +1404,7 @@ kbd {
     font-size: 15px;
   }
   .fit-section h3 {
-    font-size: 11px;
+    font-size: 12px;
   }
   .card-index-bottom {
     font-size: 18px;
@@ -1466,7 +1482,7 @@ kbd {
   .site-footer {
     flex-direction: column;
     gap: 7px;
-    font-size: 11px;
+    font-size: 12px;
     padding: 20px 0;
   }
   .setup-notice {
@@ -1527,7 +1543,7 @@ kbd {
     width: calc(100% - 24px);
   }
   .connection {
-    font-size: 10px;
+    font-size: 12px;
     gap: 5px;
   }
   .header-preferences {

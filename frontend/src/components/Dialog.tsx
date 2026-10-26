@@ -6,11 +6,13 @@ export default function Dialog({
   children,
   onClose,
   className = "",
+  closeDisabled = false,
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
   className?: string;
+  closeDisabled?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -34,11 +36,11 @@ export default function Dialog({
       className={`dialog ${className}`}
       onCancel={(event) => {
         event.preventDefault();
-        onClose();
+        if (!closeDisabled) onClose();
       }}
       aria-label={title}
       onClick={(event) => {
-        if (event.target === event.currentTarget) {
+        if (!closeDisabled && event.target === event.currentTarget) {
           const box = event.currentTarget.getBoundingClientRect();
           if (
             event.clientX < box.left ||
@@ -55,6 +57,7 @@ export default function Dialog({
         <button
           className="icon-button"
           onClick={onClose}
+          disabled={closeDisabled}
           aria-label="Close dialog"
         >
           <X size={21} />

@@ -441,6 +441,11 @@ code {
   margin: -12px 0 24px;
   font-size: 14px;
 }
+.task-sidebar h1.long-task {
+  font-size: 18px;
+  letter-spacing: -0.02em;
+  line-height: 1.5;
+}
 .full-task summary {
   cursor: pointer;
   min-height: 44px;

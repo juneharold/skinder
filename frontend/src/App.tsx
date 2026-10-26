@@ -749,7 +749,7 @@ export default function App() {
               <div className="discover-layout">
                 <aside className="task-sidebar">
                   <span className="eyebrow">Current task</span>
-                  <h1>
+                  <h1 className={session.task.length > 80 ? "long-task" : undefined}>
                     {session.task.length > 120
                       ? `${session.task.slice(0, 120).trimEnd()}…`
                       : session.task}

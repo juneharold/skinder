@@ -270,7 +270,7 @@ def test_cli_exit_codes_and_indexing_after_pause(catalog, monkeypatch, tmp_path,
     from skinder import sync as module
 
     def skills(request):
-        assert request.url.params["limit"] == "50"
+        assert 1 <= int(request.url.params["limit"]) <= 48
         if interrupted:
             raise KeyboardInterrupt
         return page([skill_row()])

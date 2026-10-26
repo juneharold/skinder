@@ -38,6 +38,23 @@ describe("skill discovery", () => {
     );
   });
 
+  it("can find another batch when the reviewed catalog page has no candidates left", async () => {
+    const skills = Array.from({ length: 51 }, (_, index) => skill(`skill-${index}`, `Skill ${index}`));
+    const feedback = skills.slice(0, 50).map((item, index) => ({
+      id: `choice-${index}`, session_id: "session-1", skill_id: item.id,
+      action: "pass" as const, reason: null, created_at: "2026-10-27T00:00:00Z",
+    }));
+    installBackend({ skills, session: sessionFor([skills[0]], { feedback }) });
+    vi.mocked(api.match).mockResolvedValue(sessionFor([skills[50]], { feedback }));
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Find more for this task" }));
+    expect(await screen.findByRole("heading", { name: "Skill 50" })).toBeVisible();
+    expect(api.skill).toHaveBeenCalledWith("skill-50");
+    expect(screen.queryByRole("heading", { name: "All available skills reviewed." })).not.toBeInTheDocument();
+  });
+
   it("ignores an old next page after the search changes, even if it ignores cancellation", async () => {
     window.history.replaceState({}, "", "/?view=explore");
     const first = skill("alpha", "Alpha Skill");
@@ -126,7 +143,7 @@ describe("skill discovery", () => {
     expect(within(dialog).getByText(/License unknown.*Source revision unknown/)).toBeVisible();
     expect(within(dialog).getByText(/workflow has not been verified/)).toBeVisible();
     expect(within(dialog).getByText(/Setup requirements have not been verified/)).toBeVisible();
-    expect(within(dialog).getByText(/No source evidence/)).toBeVisible();
+    expect(within(dialog).getByText(/No reviewed working-style traits/)).toBeVisible();
     expect(within(dialog).getByRole("link", { name: "View on SkillsMP" })).toHaveAttribute("href", imported.provider_url);
     expect(within(dialog).queryByRole("button", { name: "Copy installation command" })).not.toBeInTheDocument();
     expect(within(dialog).queryByText(/npx skills/)).not.toBeInTheDocument();
@@ -147,6 +164,7 @@ describe("skill discovery", () => {
     const backend = installBackend({ session: null });
     vi.mocked(api.health).mockResolvedValue({
       status: "ok", catalog_count: backend.skills.length,
+      indexed_count: backend.skills.length, retrieval_mode: "hybrid",
       codex: { installed: false, authenticated: false, message: "Install Codex." },
     });
     const user = userEvent.setup();

@@ -219,7 +219,7 @@ export default function SkillDetail({
         </details>
       )}
       {!skill.evidence.length && (
-        <p className="small muted">No source evidence is available to verify working style.</p>
+        <p className="small muted">No reviewed working-style traits are recorded.</p>
       )}
       <div className="detail-footer">
         <span>

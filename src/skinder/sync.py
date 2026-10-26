@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import logging
 import re
 import time
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from .models import InstallCommands, Skill
 BASE = "https://skillsmp.com"
 TAXONOMY_LIMIT = 1000
 DIMENSIONS = ("language", "category", "occupation")
+logger = logging.getLogger(__name__)
 
 
 def now():
@@ -246,7 +248,14 @@ class Sync:
                 self.sleep(max(2 ** (attempt + 1), self.state.get("retry_after", 0) - time.time()))
                 continue
             if response.status_code != 200:
-                raise Paused(f"Unexpected provider response HTTP {response.status_code} for {path}")
+                detail = ""
+                try:
+                    error = response.json().get("error")
+                    if isinstance(error, str):
+                        detail = ": " + error[:200]
+                except (ValueError, AttributeError):
+                    pass
+                raise Paused(f"Unexpected provider response HTTP {response.status_code} for {path}{detail}")
             return response
 
     def discover(self):
@@ -320,7 +329,8 @@ class Sync:
     def page(self, key, data):
         try:
             response = self.request("/api/skills", {
-                **data["filters"], "page": data["page"], "limit": 50, "sortBy": data["sort"],
+                # The website listing endpoint permits 48, unlike REST search's limit of 50.
+                **data["filters"], "page": data["page"], "limit": 48, "sortBy": data["sort"],
             })
         except Paused as exc:
             if not str(exc).startswith("Request budget reached"):
@@ -374,6 +384,8 @@ class Sync:
         terminal_cap = data["capped"] and all(x in data["filters"] for x in DIMENSIONS)
         status = "pending" if has_next else "unresolved" if terminal_cap else "completed"
         self.checkpoint(key, data, status)
+        logger.info("SkillsMP page %s: %s rows; added %s, updated %s, duplicate observations %s",
+                    page, len(rows), self.state["added"], self.state["updated"], self.state["duplicates"])
 
     def run(self):
         self.state.update(status="running", last_error=None)
@@ -422,6 +434,10 @@ def main(argv=None):
     group.add_argument("--index-only", action="store_true")
     group.add_argument("--status", action="store_true")
     args = parser.parse_args(argv)
+    if not logger.handlers:
+        logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
     catalog = CatalogStore(args.db)
     if args.status:
         print(json.dumps(sync_status(catalog), indent=2))

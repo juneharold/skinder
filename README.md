@@ -39,7 +39,7 @@ uv run best-effort-full-sync --index-only
 
 The sync starts with public category, occupation, and language lists. It paginates each partition, splits capped searches using remaining filters, also checks recently updated results, and deduplicates skills by repository and path. It checkpoints progress, respects provider limits, and can take hours or longer. Rerunning resumes unfinished work; after a completed pass, the next invocation starts a new refresh. Existing skills and bookmarks are never removed just because a later crawl misses them.
 
-This is **best-effort-full-sync**, not a guarantee that every SkillsMP listing was obtained. Provider caps, undiscovered taxonomy, changing results, and access failures remain visible in the report. A quota/access interruption pauses the crawl. Use `--max-requests 10` for a bounded trial; the budget includes taxonomy requests and retries. Use `--db PATH` or `SKINDER_CATALOG_DB_PATH` to select a catalog database.
+This is **best-effort-full-sync**, not a guarantee that every SkillsMP listing was obtained. Provider caps, undiscovered taxonomy, changing results, and access failures remain visible in the report. A quota/access interruption pauses the crawl. Use `--max-requests 10` for a bounded trial; the budget includes taxonomy requests and retries. A paused run exits with code 2 after indexing available records; Ctrl-C checkpoints and exits with code 130 without starting indexing. Use `--db PATH` or `SKINDER_CATALOG_DB_PATH` to select a catalog database. The website listing endpoint currently permits 48 records per page, which differs from the documented REST search endpoint.
 
 The first indexing run downloads the pinned multilingual E5-small model (about 470 MB). FastEmbed runs it locally, SQLite FTS5 supplies keyword rankings, and a persistent USearch index supplies vector candidates. Changed metadata is re-embedded; unchanged records reuse their vectors. A failed index build preserves the previous published index. Until an index is ready, matching uses keyword retrieval and the app identifies that reduced mode.
 
@@ -85,6 +85,12 @@ npm --prefix frontend run build
 ```
 
 Backend tests use real temporary SQLite databases and subprocesses that simulate the external Codex boundary. Automated checks do not consume model usage. Frontend tests exercise user interactions. Live evaluation is separate and uses your signed-in Codex allowance.
+
+The [hybrid retrieval results](evaluation/hybrid-retrieval-results.json) record a bounded live import of 96 distinct SkillsMP entries, cached source retrieval, a real Codex recommendation, and a 100,000-vector synthetic benchmark. This validates the implemented flow, not complete provider coverage or general recommendation quality. To repeat the index benchmark without model or provider calls:
+
+```sh
+uv run python scripts/benchmark_retrieval.py --count 100000 --queries 100 --output .data/retrieval-benchmark.json
+```
 
 The [live evaluation report](evaluation/REPORT.md) records six authored scenarios, their actual results, a no-match timeout that led to a prompt correction, and the successful checks afterward. These examples are not an independent benchmark. To repeat them without replacing the recorded results:
 

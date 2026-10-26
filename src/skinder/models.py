@@ -3,9 +3,6 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Agent = Literal["codex", "claude-code"]
-Category = Literal[
-    "Development", "Design", "Writing", "Research", "Documents", "Data", "Productivity", "Marketing"
-]
 
 
 class Model(BaseModel):
@@ -34,25 +31,30 @@ class Skill(Model):
     id: str
     name: str
     slug: str
-    description: str = Field(max_length=300)
-    category: Category
+    description: str
+    category: str
     author: str
     repository: str
     source_url: str
-    revision: str
-    license: str
-    compatibility: list[Agent]
+    revision: str | None
+    license: str | None
+    compatibility: list[Agent] | None
     requirements: list[str]
     tags: list[str]
     workflow: list[str]
     output_style: list[str]
     evidence: list[Evidence]
     install_commands: InstallCommands
+    provenance: Literal["bundled", "skillsmp"] = "bundled"
+    provider_url: str | None = None
+    content_language: str | None = None
 
 
 class Catalog(Model):
     skills: list[Skill]
     categories: list[str]
+    total: int = 0
+    has_more: bool = False
 
 
 class Recommendation(Model):
@@ -117,6 +119,9 @@ class Health(Model):
     status: Literal["ok"] = "ok"
     catalog_count: int
     codex: CodexStatus
+    indexed_count: int = 0
+    retrieval_mode: Literal["hybrid", "keyword-only"] = "keyword-only"
+    sync_status: dict | None = None
 
 
 class SavedItem(Model):

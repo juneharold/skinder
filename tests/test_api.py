@@ -40,7 +40,7 @@ async def feedback(client, session, skill_id="skill-0", action="save", reason=No
         },
     )
     assert response.status_code == 200, response.text
-    return response.json()
+    return response.json()["feedback"]
 
 
 async def test_catalog_health_and_profile_persist_without_matching(backend):
@@ -411,3 +411,150 @@ async def test_undo_new_save_does_not_restore_explicitly_removed_bookmark(backen
         await match(client, task="Review recent changes")
         events = json.loads((backend.root / "request.json").read_text())["recent_feedback"]
         assert any(event["task"] == first["task"] and event["action"] == "save" for event in events)
+
+
+async def test_direct_saves_are_idempotent_persisted_and_not_preference_events(backend):
+    async with backend.client() as client:
+        assert (await client.put("/api/saved/missing")).status_code == 404
+        saved = (await client.put("/api/saved/skill-0")).json()
+        assert [item["skill"]["id"] for item in saved["items"]] == ["skill-0"]
+        assert (await client.put("/api/saved/skill-0")).json() == saved
+        assert (await client.get("/api/matches/current")).json() is None
+    async with backend.client() as client:
+        assert (await client.get("/api/saved")).json() == saved
+        session = await match(client)
+        assert session["feedback"] == []
+        request = json.loads((backend.root / "request.json").read_text())
+        assert request["recent_feedback"] == []
+        assert (await client.delete("/api/saved/skill-0")).json() == {"items": []}
+        assert (await client.delete("/api/saved/skill-0")).json() == {"items": []}
+        recreated = (await client.put("/api/saved/skill-0")).json()
+        assert recreated["items"][0]["saved_at"] > saved["items"][0]["saved_at"]
+
+
+@pytest.mark.parametrize("direct_first", [True, False])
+async def test_undo_preserves_independent_save_and_original_timestamp(backend, direct_first):
+    async with backend.client() as client:
+        session = await match(client)
+        if direct_first:
+            original = (await client.put("/api/saved/skill-0")).json()
+        decision = await feedback(client, session)
+        if not direct_first:
+            original = (await client.get("/api/saved")).json()
+        assert (await client.put("/api/saved/skill-0")).json() == original
+        assert (await client.delete(f"/api/feedback/{decision['id']}")).json() == original
+        assert (await client.get(f"/api/matches/{session['id']}")).json()["feedback"] == []
+
+
+async def test_feedback_responses_include_current_saved_collection_even_on_retry(backend):
+    async with backend.client() as client:
+        independent = (await client.put("/api/saved/skill-4")).json()["items"][0]
+        session = await match(client)
+        value = {"session_id": session["id"], "skill_id": "skill-0", "action": "save"}
+        result = (await client.post("/api/feedback", json=value)).json()
+        assert result["feedback"]["skill_id"] == "skill-0"
+        assert result["saved"] == (await client.get("/api/saved")).json()
+        assert {item["skill"]["id"] for item in result["saved"]["items"]} == {"skill-0", "skill-4"}
+        remaining = {"items": [independent]}
+        assert (await client.delete("/api/saved/skill-0")).json() == remaining
+        retried = (await client.post("/api/feedback", json=value)).json()
+        assert retried == {"feedback": result["feedback"], "saved": remaining}
+        assert (
+            await client.delete(f"/api/feedback/{result['feedback']['id']}")
+        ).json() == remaining
+        assert (await client.delete("/api/feedback/missing")).json() == remaining
+
+
+async def test_old_feedback_cannot_remove_independent_resave(backend):
+    async with backend.client() as client:
+        session = await match(client)
+        decision = await feedback(client, session)
+        await client.delete("/api/saved/skill-0")
+        independent = (await client.put("/api/saved/skill-0")).json()
+        assert (await client.delete(f"/api/feedback/{decision['id']}")).json() == independent
+
+
+async def test_removed_independent_save_does_not_protect_later_deck_save(backend):
+    async with backend.client() as client:
+        await client.put("/api/saved/skill-0")
+        await client.delete("/api/saved/skill-0")
+        session = await match(client)
+        decision = await feedback(client, session)
+        assert (await client.delete(f"/api/feedback/{decision['id']}")).json() == {"items": []}
+
+
+@pytest.mark.parametrize("status", ["pending", "running"])
+async def test_matching_blocks_only_new_feedback_and_undo_for_that_session(backend, status):
+    async with backend.client() as client:
+        other = await match(client, task="Review another task")
+        session = await match(client)
+        decision = await feedback(client, session)
+        await client.delete("/api/saved/skill-0")
+        backend.configure(sleep=30)
+        response = await client.post(
+            "/api/matches",
+            json={"task": session["task"], "agent": session["agent"], "session_id": session["id"]},
+        )
+        assert response.status_code == 202
+        with sqlite3.connect(backend.db_path) as db:
+            db.execute("UPDATE sessions SET status=? WHERE id=?", (status, session["id"]))
+        value = {"session_id": session["id"], "skill_id": "skill-1", "action": "save"}
+        assert (await client.post("/api/feedback", json=value)).status_code == 409
+        assert (await client.delete(f"/api/feedback/{decision['id']}")).status_code == 409
+        value["skill_id"] = "skill-0"
+        retry = await client.post("/api/feedback", json=value)
+        assert retry.status_code == 200
+        assert retry.json() == {"feedback": decision, "saved": {"items": []}}
+        assert (await client.delete("/api/feedback/missing")).json() == {"items": []}
+        independent = (await client.put("/api/saved/skill-2")).json()
+        assert [item["skill"]["id"] for item in independent["items"]] == ["skill-2"]
+        assert (await client.delete("/api/saved/skill-2")).json() == {"items": []}
+        other_decision = await feedback(client, other)
+        assert (await client.delete(f"/api/feedback/{other_decision['id']}")).json() == {
+            "items": []
+        }
+        current = (await client.get(f"/api/matches/{session['id']}")).json()
+        assert current["feedback"] == [decision]
+        with sqlite3.connect(backend.db_path) as db:
+            db.execute("UPDATE sessions SET status='running' WHERE id=?", (session["id"],))
+        await client.post(f"/api/matches/{session['id']}/cancel")
+        assert (await client.delete(f"/api/feedback/{decision['id']}")).status_code == 200
+
+
+async def test_populated_legacy_bookmarks_migrate_without_changing_other_data(backend):
+    async with backend.client() as client:
+        session = await match(client)
+        first = await feedback(client, session)
+        second = await feedback(client, session, "skill-1")
+        profile = (await client.get("/api/profile")).json()
+        profile["communication"] = "concise"
+        await client.put("/api/profile", json=profile)
+        saved = (await client.get("/api/saved")).json()
+    with sqlite3.connect(backend.db_path) as db:
+        db.executescript("""
+            BEGIN;
+            ALTER TABLE bookmarks RENAME TO bookmarks_nullable;
+            CREATE TABLE bookmarks (
+                skill_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, feedback_id TEXT NOT NULL
+            );
+            INSERT INTO bookmarks SELECT * FROM bookmarks_nullable;
+            DROP TABLE bookmarks_nullable;
+            COMMIT;
+        """)
+        tables = ["profile", "sessions", "session_skills", "feedback", "bookmarks"]
+        before = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+    async with backend.client() as client:
+        assert (await client.get("/api/saved")).json() == saved
+        assert (await client.get("/api/profile")).json() == profile
+        with sqlite3.connect(backend.db_path) as db:
+            after = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+        assert after == before
+        # A migrated deck bookmark can become independent without changing its timestamp.
+        assert (await client.put("/api/saved/skill-0")).json() == saved
+        await client.delete(f"/api/feedback/{first['id']}")
+        remaining = (await client.delete(f"/api/feedback/{second['id']}")).json()
+        assert remaining == {
+            "items": [item for item in saved["items"] if item["skill"]["id"] == "skill-0"]
+        }
+    async with backend.client() as client:
+        assert (await client.get("/api/saved")).json() == remaining

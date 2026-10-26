@@ -35,9 +35,22 @@ class Store:
                 UNIQUE(session_id, skill_id)
             );
             CREATE TABLE IF NOT EXISTS bookmarks (
-                skill_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, feedback_id TEXT NOT NULL
+                skill_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, feedback_id TEXT
             );
         """)
+        columns = self.db.execute("PRAGMA table_info(bookmarks)").fetchall()
+        if any(column["name"] == "feedback_id" and column["notnull"] for column in columns):
+            with self.db:
+                self.db.execute("BEGIN")
+                self.db.execute(
+                    "CREATE TABLE bookmarks_new ("
+                    "skill_id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, feedback_id TEXT)"
+                )
+                self.db.execute(
+                    "INSERT INTO bookmarks_new SELECT skill_id, saved_at, feedback_id FROM bookmarks"
+                )
+                self.db.execute("DROP TABLE bookmarks")
+                self.db.execute("ALTER TABLE bookmarks_new RENAME TO bookmarks")
         with self.db:
             self.db.execute(
                 "UPDATE sessions SET status='failed', error=?, updated_at=? "
@@ -139,6 +152,7 @@ class Store:
             if previous["action"] == value.action and previous["reason"] == value.reason:
                 return Feedback.model_validate(dict(previous))
             raise ValueError("Undo the existing feedback before changing it.")
+        self.require_feedback_idle(value.session_id)
         result = Feedback(**value.model_dump(), id=str(uuid4()), created_at=now())
         with self.db:
             self.db.execute(
@@ -159,11 +173,16 @@ class Store:
                 )
         return result
 
+    def require_feedback_idle(self, session_id):
+        if self.session(session_id).status in ("pending", "running"):
+            raise ValueError("Wait for matching to finish or cancel it before changing feedback.")
+
     def undo(self, feedback_id):
         with self.db:
             row = self.db.execute("SELECT * FROM feedback WHERE id=?", (feedback_id,)).fetchone()
             if not row:
                 return
+            self.require_feedback_idle(row["session_id"])
             self.db.execute("DELETE FROM feedback WHERE id=?", (feedback_id,))
             bookmark = self.db.execute(
                 "SELECT * FROM bookmarks WHERE feedback_id=?", (feedback_id,)
@@ -184,6 +203,14 @@ class Store:
 
     def saved(self):
         return self.db.execute("SELECT * FROM bookmarks ORDER BY saved_at DESC").fetchall()
+
+    def save(self, skill_id):
+        with self.db:
+            self.db.execute(
+                "INSERT INTO bookmarks VALUES (?,?,NULL) "
+                "ON CONFLICT(skill_id) DO UPDATE SET feedback_id=NULL",
+                (skill_id, now()),
+            )
 
     def unsave(self, skill_id):
         with self.db:

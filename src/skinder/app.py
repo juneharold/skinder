@@ -13,11 +13,10 @@ from pydantic import ValidationError
 
 from .matcher import CodexMatcher, MatchError
 from .models import (
-    OK,
     Catalog,
     Error,
-    Feedback,
     FeedbackInput,
+    FeedbackResult,
     Health,
     MatchInput,
     MatchResult,
@@ -237,18 +236,22 @@ def create_app(*, db_path=None, catalog_path=None, matcher=None, frontend_path=N
                     await active_task
         return get_session(session_id)
 
-    @app.post("/api/feedback", response_model=Feedback)
+    @app.post("/api/feedback", response_model=FeedbackResult)
     async def add_feedback(value: FeedbackInput):
         get_session(value.session_id)
         try:
-            return store.feedback(value)
+            feedback = store.feedback(value)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+        return FeedbackResult(feedback=feedback, saved=await get_saved())
 
-    @app.delete("/api/feedback/{feedback_id}", response_model=OK)
+    @app.delete("/api/feedback/{feedback_id}", response_model=Saved)
     async def undo_feedback(feedback_id: str):
-        store.undo(feedback_id)
-        return OK()
+        try:
+            store.undo(feedback_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return await get_saved()
 
     @app.get("/api/saved", response_model=Saved)
     async def get_saved():
@@ -260,10 +263,17 @@ def create_app(*, db_path=None, catalog_path=None, matcher=None, frontend_path=N
             ]
         )
 
-    @app.delete("/api/saved/{skill_id}", response_model=OK)
+    @app.put("/api/saved/{skill_id}", response_model=Saved)
+    async def put_saved(skill_id: str):
+        if skill_id not in catalog:
+            raise HTTPException(404, "Skill not found.")
+        store.save(skill_id)
+        return await get_saved()
+
+    @app.delete("/api/saved/{skill_id}", response_model=Saved)
     async def delete_saved(skill_id: str):
         store.unsave(skill_id)
-        return OK()
+        return await get_saved()
 
     if frontend_path.is_dir():
         assets = frontend_path / "assets"

@@ -606,7 +606,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Feedback"
+                  "$ref": "#/components/schemas/FeedbackResult"
                 }
               }
             }
@@ -675,7 +675,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OK"
+                  "$ref": "#/components/schemas/Saved"
                 }
               }
             }
@@ -782,6 +782,73 @@
       }
     },
     "/api/saved/{skill_id}": {
+      "put": {
+        "summary": "Put Saved",
+        "operationId": "put_saved_api_saved__skill_id__put",
+        "parameters": [
+          {
+            "name": "skill_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Skill Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Saved"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          }
+        }
+      },
       "delete": {
         "summary": "Delete Saved",
         "operationId": "delete_saved_api_saved__skill_id__delete",
@@ -802,7 +869,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OK"
+                  "$ref": "#/components/schemas/Saved"
                 }
               }
             }
@@ -1033,6 +1100,23 @@
         ],
         "title": "FeedbackInput"
       },
+      "FeedbackResult": {
+        "properties": {
+          "feedback": {
+            "$ref": "#/components/schemas/Feedback"
+          },
+          "saved": {
+            "$ref": "#/components/schemas/Saved"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "feedback",
+          "saved"
+        ],
+        "title": "FeedbackResult"
+      },
       "Health": {
         "properties": {
           "status": {
@@ -1199,19 +1283,6 @@
           "updated_at"
         ],
         "title": "MatchSession"
-      },
-      "OK": {
-        "properties": {
-          "ok": {
-            "type": "boolean",
-            "const": true,
-            "title": "Ok",
-            "default": true
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "title": "OK"
       },
       "Profile": {
         "properties": {

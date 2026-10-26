@@ -128,8 +128,9 @@ class Saved(Model):
     items: list[SavedItem]
 
 
-class OK(Model):
-    ok: Literal[True] = True
+class FeedbackResult(Model):
+    feedback: Feedback
+    saved: Saved
 
 
 class Error(Model):

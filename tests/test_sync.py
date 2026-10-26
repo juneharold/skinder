@@ -1,6 +1,8 @@
 """Offline provider-contract tests assert durable catalog and crawl outcomes."""
 
 import json
+from datetime import UTC, datetime
+from email.utils import format_datetime
 from itertools import pairwise
 
 import httpx
@@ -45,6 +47,19 @@ class Provider:
         return result if isinstance(result, httpx.Response) else httpx.Response(200, json=result)
 
 
+class Clock:
+    def __init__(self):
+        self.elapsed = 1_800_000_000.0
+        self.sleeps = []
+
+    def time(self):
+        return self.elapsed
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.elapsed += seconds
+
+
 def run(catalog, provider, **kwargs):
     return Sync(catalog, provider.client, sleep=lambda _: None, **kwargs).run()
 
@@ -52,6 +67,13 @@ def run(catalog, provider, **kwargs):
 @pytest.fixture
 def catalog(tmp_path):
     return CatalogStore(tmp_path / "catalog.sqlite3")
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr("skinder.sync.time.time", clock.time)
+    return clock
 
 
 def test_status_read_does_not_create_sync_state(catalog):
@@ -203,20 +225,96 @@ def test_request_budget_includes_discovery_and_resumes_next_page(catalog):
     assert second["status"] == "completed" and catalog.count() == 2
 
 
-def test_quota_pauses_without_skipping_page_and_resume_respects_retry_after(catalog):
+@pytest.mark.parametrize("retry_after, gaps", [
+    (None, [2, 4, 8]),
+    ("1", [2, 4, 8]),
+    ("10", [10, 10, 10]),
+    ("date", [10, 10, 10]),
+    ("invalid", [2, 4, 8]),
+    ("past-date", [2, 4, 8]),
+])
+def test_rate_limits_retry_same_page_and_finish(catalog, clock, retry_after, gaps):
+    attempts = []
+
+    def skills(request):
+        number = int(request.url.params["page"])
+        if number == 2:
+            attempts.append((clock.time(), request.url))
+            if len(attempts) <= 3:
+                value = retry_after
+                if value in ("date", "past-date"):
+                    deadline = clock.time() + (10 if value == "date" else -10)
+                    value = format_datetime(datetime.fromtimestamp(deadline, UTC), usegmt=True)
+                return httpx.Response(429, headers={"Retry-After": value} if value else {})
+        return page([skill_row(str(number))], number, more=number == 1)
+
+    provider = Provider(skills)
+    status = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
+
+    assert status["status"] == "completed"
+    assert catalog.count() == 2 and status["added"] == 2
+    assert len({url for _, url in attempts[:4]}) == 1
+    assert [second[0] - first[0] for first, second in pairwise(attempts[:4])] == gaps
+    assert status["requests"] == len(provider.calls)
+
+
+def test_quota_pauses_without_skipping_page_and_resume_respects_retry_after(catalog, clock):
     provider = Provider(lambda _: httpx.Response(429, headers={"Retry-After": "10"}))
-    status = run(catalog, provider)
+    status = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
     assert status["status"] == "paused" and "429" in status["last_error"]
     assert status["partitions"]["pending"] == 4 and catalog.count() == 0
+    requests = [r for r in provider.calls if r.url.path == "/api/skills"]
+    assert len(requests) == 4 and len({r.url for r in requests}) == 1
+    assert status["retry_after"] == clock.time() + 10
+
     provider.skills = lambda _: page([skill_row()])
-    sleeps = []
-    resumed = Sync(catalog, provider.client, sleep=sleeps.append).run()
-    assert sleeps[0] > 9
+    clock.sleeps.clear()
+    next_call = len(provider.calls)
+    resumed = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
+    assert clock.sleeps[0] == 10
+    assert provider.calls[next_call].url == requests[-1].url
     assert resumed["status"] == "completed" and catalog.count() == 1
 
 
-def test_transient_failures_retry_at_most_three_times(catalog):
-    provider = Provider(lambda _: httpx.Response(503))
+def test_request_budget_stops_rate_limit_retries_before_sleeping(catalog, clock):
+    provider = Provider(lambda _: httpx.Response(429, headers={"Retry-After": "10"}))
+    status = Sync(catalog, provider.client, max_requests=4,
+                  sleep=clock.sleep, monotonic=clock.time).run()
+
+    assert status["status"] == "paused" and status["requests"] == 4
+    assert "budget" in status["last_error"].lower()
+    assert clock.sleeps == [2, 2, 2]
+    assert catalog.count() == 0 and status["partitions"]["failed"] == 0
+    assert status["retry_after"] == clock.time() + 10
+
+    failed_url = provider.calls[-1].url
+    provider.skills = lambda _: page([skill_row()])
+    resumed_at = []
+    original = provider.client.get
+
+    def get(*args, **kwargs):
+        resumed_at.append(clock.time())
+        return original(*args, **kwargs)
+
+    provider.client.get = get
+    resumed = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
+    assert provider.calls[4].url == failed_url
+    assert resumed_at[0] == status["retry_after"]
+    assert resumed["status"] == "completed" and catalog.count() == 1
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_access_failures_pause_without_retrying(catalog, status_code):
+    provider = Provider(lambda _: httpx.Response(status_code))
+    status = run(catalog, provider)
+    assert status["status"] == "paused" and str(status_code) in status["last_error"]
+    assert len([r for r in provider.calls if r.url.path == "/api/skills"]) == 1
+    assert catalog.count() == 0
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 503])
+def test_transient_failures_retry_at_most_three_times(catalog, status_code):
+    provider = Provider(lambda _: httpx.Response(status_code))
     status = run(catalog, provider)
     assert status["status"] == "paused"
     assert len([r for r in provider.calls if r.url.path == "/api/skills"]) == 4

@@ -235,9 +235,13 @@ class Sync:
         for attempt in range(4):
             if self.max_requests is not None and self.calls >= self.max_requests:
                 raise Paused("Request budget reached; rerun to resume")
-            delay = max(0, self.state.get("retry_after", 0) - time.time())
+            # Wait once for the longest of backoff, provider cooldown, and normal pacing.
+            delay = max(4 ** attempt if attempt else 0,
+                        self.state.get("retry_after", 0) - time.time())
             if self.last_call is not None:
                 delay = max(delay, 2 - (self.monotonic() - self.last_call))
+            if attempt:
+                logger.info("Retrying SkillsMP %s in %.1fs (retry %s/3)", path, delay, attempt)
             if delay:
                 self.sleep(delay)
             self.calls += 1
@@ -249,7 +253,6 @@ class Sync:
             except httpx.TransportError as exc:
                 if attempt == 3:
                     raise Paused(f"Transport failure: {exc}") from exc
-                self.sleep(2 ** (attempt + 1))
                 continue
             retry_after = response.headers.get("Retry-After")
             if retry_after:
@@ -263,13 +266,12 @@ class Sync:
                 # Persist an absolute deadline so a paused process also respects Retry-After.
                 self.state["retry_after"] = time.time() + max(0, delay)
                 self.save()
-            if response.status_code in (401, 403, 429):
-                # Access/quota responses need a later run rather than immediate repeated attempts.
+            if response.status_code in (401, 403):
+                # Authentication/authorization failures will not improve with retries.
                 raise Paused(f"Provider access/quota response HTTP {response.status_code}")
-            if response.status_code >= 500 or response.status_code == 408:
+            if response.status_code >= 500 or response.status_code in (408, 429):
                 if attempt == 3:
-                    raise Paused(f"Provider unavailable: HTTP {response.status_code}")
-                self.sleep(max(2 ** (attempt + 1), self.state.get("retry_after", 0) - time.time()))
+                    raise Paused(f"Provider retries exhausted: HTTP {response.status_code}")
                 continue
             if response.status_code != 200:
                 detail = ""
@@ -429,9 +431,6 @@ class Sync:
         self.state.update(status="running", last_error=None)
         self.save()
         try:
-            delay = max(0, self.state.get("retry_after", 0) - time.time())
-            if delay:
-                self.sleep(delay)
             # Seed every dimension before ingestion so early capped partitions can be refined.
             while any(path not in self.state["discovery_seen"] for path in (
                 "/categories", "/occupations", "/openapi.json",

@@ -10,7 +10,7 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from .database import create_database
-from .models import Agent, Feedback, FeedbackInput, MatchSession, Profile, Recommendation
+from .models import Agent, Engine, Feedback, FeedbackInput, MatchSession, Profile, Recommendation
 from .orm import (
     BookmarkRecord,
     FeedbackRecord,
@@ -88,7 +88,7 @@ class UserStore:
                 .order_by(FeedbackRecord.created_at)
             )
             return MatchSession(
-                id=row.id, task=row.task, agent=row.agent, status=row.status,
+                id=row.id, task=row.task, agent=row.agent, engine=row.engine, status=row.status,
                 recommendations=json.loads(row.recommendations),
                 feedback=[Feedback.model_validate(item, from_attributes=True) for item in feedback],
                 error=row.error, created_at=row.created_at, updated_at=row.updated_at,
@@ -103,6 +103,7 @@ class UserStore:
 
     def start_match_session(
         self, task: str, agent: Agent, session_id: str | None = None,
+        *, engine: Engine = "codex",
     ) -> MatchSession | None:
         timestamp = now()
         with self._write_session() as db:
@@ -116,7 +117,7 @@ class UserStore:
             else:
                 session_id = str(uuid4())
                 db.add(MatchSessionRecord(
-                    id=session_id, task=task, agent=agent, status="running",
+                    id=session_id, task=task, agent=agent, engine=engine, status="running",
                     recommendations="[]", created_at=timestamp, updated_at=timestamp,
                 ))
         return self.get_match_session(session_id)

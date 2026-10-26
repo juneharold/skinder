@@ -158,5 +158,4 @@ async def test_claude_process_has_no_tools_inherited_keys_or_persistent_session(
         assert not [key for key in env if key.startswith(("ANTHROPIC_", "CLAUDE_"))
                     and key != "CLAUDE_CONFIG_DIR"]
         assert "CLAUDECODE" not in env
-    assert (backend.root / "claude-instructions.txt").read_text()
     assert not os.path.exists((backend.root / "claude-cwd").read_text())

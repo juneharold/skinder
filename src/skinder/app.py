@@ -11,10 +11,13 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .catalog import CatalogStore
+from .claude_matcher import ClaudeMatcher
 from .matcher import CodexMatcher
 from .matching import Enricher, Matcher, MatchService, MatchServiceError, Retriever
 from .models import (
     Catalog,
+    Engine,
+    EngineStatus,
     Error,
     FeedbackInput,
     FeedbackResult,
@@ -37,7 +40,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def create_app(
     *, user_db_path: str | Path | None = None, catalog_db_path: str | Path | None = None,
-    matcher: Matcher | None = None, frontend_path: str | Path | None = None,
+    matchers: dict[Engine, Matcher] | None = None, frontend_path: str | Path | None = None,
     retriever: Retriever | None = None, enricher: Enricher | None = None,
 ) -> FastAPI:
     user_db_path = Path(
@@ -47,7 +50,9 @@ def create_app(
         "SKINDER_CATALOG_DB_PATH", user_db_path.with_name("catalog.sqlite3")
     ))
     frontend_path = Path(frontend_path or ROOT / "frontend" / "dist")
-    matcher = matcher or CodexMatcher()
+    matchers = matchers if matchers is not None else {
+        "codex": CodexMatcher(), "claude-code": ClaudeMatcher(),
+    }
     user_store: UserStore
     catalog_store: CatalogStore
     search: Retriever
@@ -74,7 +79,7 @@ def create_app(
             cleanup.callback(catalog_store.close)
             search = retriever or HybridRetriever(catalog_store)
             sources = enricher or SourceEnricher(catalog_store)
-            service = MatchService(user_store, catalog_store, matcher, search, sources)
+            service = MatchService(user_store, catalog_store, matchers, search, sources)
             app.state.user_store = user_store
             app.state.catalog_store = catalog_store
             app.state.match_service = service
@@ -153,7 +158,22 @@ def create_app(
                     "sync_status": sync_status(catalog_store), **search.status()}
 
         status = await work.run(snapshot)
-        return Health(codex=await matcher.health(), **status)
+
+        async def engine_health(engine: Engine, matcher: Matcher) -> EngineStatus:
+            try:
+                return await matcher.health()
+            except Exception:  # noqa: BLE001
+                # A broken connection must not hide the other engine's status.
+                name = "Codex" if engine == "codex" else "Claude Code"
+                return EngineStatus(
+                    installed=True, authenticated=False, ready=False,
+                    message=f"Could not check {name}. Check your local installation and retry.",
+                )
+
+        results = await asyncio.gather(*(
+            engine_health(engine, matcher) for engine, matcher in matchers.items()
+        ))
+        return Health(engines=dict(zip(matchers, results, strict=True)), **status)
 
     @app.get("/api/catalog", response_model=Catalog)
     async def get_catalog(

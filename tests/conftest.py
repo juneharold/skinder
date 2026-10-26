@@ -82,10 +82,12 @@ pathlib.Path(sys.argv[sys.argv.index("--output-last-message") + 1]).write_text(
 import json, os, pathlib, sys, time
 root = pathlib.Path(os.environ["SKINDER_FAKE_CODEX"])
 config = json.loads((root / "claude-control.json").read_text())
-(root / "claude-check-env.json").write_text(json.dumps(dict(os.environ)))
+environment = {key: value for key, value in os.environ.items()
+    if key.startswith(("ANTHROPIC_", "CLAUDE_")) or key == "CLAUDECODE"}
+(root / "claude-check-env.json").write_text(json.dumps(environment))
 if sys.argv[1:] == ["--help"]:
     print(config.get("help", "--print --output-format --json-schema --tools --strict-mcp-config "
-        "--mcp-config --setting-sources --settings --system-prompt-file --no-session-persistence "
+        "--mcp-config --setting-sources --settings --system-prompt --no-session-persistence "
         "--disable-slash-commands --safe-mode --no-chrome"))
     sys.exit(0)
 if "auth" in sys.argv and "status" in sys.argv:
@@ -95,11 +97,8 @@ if "auth" in sys.argv and "status" in sys.argv:
 request = json.load(sys.stdin)
 (root / "claude-request.json").write_text(json.dumps(request))
 (root / "claude-args.json").write_text(json.dumps(sys.argv[1:]))
-(root / "claude-env.json").write_text(json.dumps(dict(os.environ)))
+(root / "claude-env.json").write_text(json.dumps(environment))
 (root / "claude-cwd").write_text(os.getcwd())
-if "--system-prompt-file" in sys.argv:
-    instructions = pathlib.Path(sys.argv[sys.argv.index("--system-prompt-file") + 1])
-    (root / "claude-instructions.txt").write_text(instructions.read_text())
 (root / "claude-pid").write_text(str(os.getpid()))
 if config.get("sleep"):
     time.sleep(config["sleep"])

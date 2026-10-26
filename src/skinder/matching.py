@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from .catalog import CatalogStore
 from .matcher import MatchError
-from .models import Agent, CodexStatus, MatchInput, MatchResult, MatchSession, Skill
+from .models import Agent, Engine, EngineStatus, MatchInput, MatchResult, MatchSession, Skill
 from .retrieval import RetrievalStatus
 from .sources import bounded_request, match_metadata
 from .user import UserStore
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class Matcher(Protocol):
-    async def health(self) -> CodexStatus: ...
+    async def health(self) -> EngineStatus: ...
     async def match(self, request: dict[str, Any]) -> str: ...
 
 
@@ -45,12 +45,12 @@ class MatchServiceError(Exception):
 
 class MatchService:
     def __init__(
-        self, users: UserStore, catalog: CatalogStore, matcher: Matcher,
+        self, users: UserStore, catalog: CatalogStore, matchers: dict[Engine, Matcher],
         retriever: Retriever, enricher: Enricher,
     ) -> None:
         self.users = users
         self.catalog = catalog
-        self.matcher = matcher
+        self.matchers = matchers
         self.retriever = retriever
         self.enricher = enricher
         # Ownership excludes other servers; this lock serializes jobs within this server.
@@ -68,8 +68,12 @@ class MatchService:
     def _prepare(self, value: MatchInput) -> tuple[MatchSession, dict[str, Any], list[dict[str, Any]]]:
         if value.session_id:
             previous = self.get_session(value.session_id)
-            if previous.task != value.task or previous.agent != value.agent:
-                raise MatchServiceError(409, "A continuation must use the same task and target agent.")
+            if (previous.task, previous.agent, previous.engine) != (
+                value.task, value.agent, value.engine,
+            ):
+                raise MatchServiceError(
+                    409, "A continuation must use the same task, target agent, and engine.",
+                )
         profile = self.users.get_profile().model_dump()
         # A task can target a different agent from the saved profile default.
         profile["agent"] = value.agent
@@ -78,7 +82,9 @@ class MatchService:
             skill = self.catalog.get(event["skill_id"])
             if skill:
                 feedback.append({**event, "skill": match_metadata(skill)})
-        session = self.users.start_match_session(value.task, value.agent, value.session_id)
+        session = self.users.start_match_session(
+            value.task, value.agent, value.session_id, engine=value.engine,
+        )
         assert session is not None  # The continuation was validated before this write.
         return session, profile, feedback
 
@@ -92,6 +98,8 @@ class MatchService:
                 raise MatchServiceError(503, "Matching was interrupted by shutdown.")
             if self._active is not None and not self._active.done():
                 raise MatchServiceError(409, "A match is already running. Wait for it or cancel it first.")
+            if value.engine not in self.matchers:
+                raise MatchServiceError(503, "The selected recommendation engine is unavailable.")
             session, profile, feedback = await run_sync(self._prepare, value)
             self._session_id = session.id
             self._active = asyncio.create_task(self._run(session, profile, feedback))
@@ -154,9 +162,11 @@ class MatchService:
         self, session: MatchSession, profile: dict[str, Any], feedback: list[dict[str, Any]],
     ) -> None:
         stage = "retrieval"
+        matcher = self.matchers[session.engine]
+        engine_name = "Codex" if session.engine == "codex" else "Claude Code"
         try:
             # Retrieval and source enrichment share the matcher's overall time budget.
-            async with asyncio.timeout(getattr(self.matcher, "timeout", 180)):
+            async with asyncio.timeout(getattr(matcher, "timeout", 180)):
                 candidates = await run_sync(self._search, session)
                 stage = "enrichment"
                 enriched = await self.enricher.enrich(candidates[:40])
@@ -165,7 +175,7 @@ class MatchService:
                 result = MatchResult(recommendations=[])
                 if request["eligible_skills"]:
                     stage = "matcher"
-                    raw = await self.matcher.match(request)
+                    raw = await matcher.match(request)
                     stage = "validation"
                     try:
                         result = MatchResult.model_validate_json(raw, strict=True)
@@ -186,7 +196,7 @@ class MatchService:
         except MatchError as exc:
             await self._fail(session.id, str(exc))
         except InvalidRecommendations:
-            await self._fail(session.id, "Codex returned invalid recommendations. Try again.")
+            await self._fail(session.id, f"{engine_name} returned invalid recommendations. Try again.")
         except Exception as exc:  # noqa: BLE001
             self._diagnose(session.id, stage, exc)
             await self._fail(session.id, "Matching failed unexpectedly. Try again.")

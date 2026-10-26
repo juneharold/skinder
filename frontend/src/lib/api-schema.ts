@@ -231,12 +231,14 @@ export interface components {
              */
             has_more: boolean;
         };
-        /** CodexStatus */
-        CodexStatus: {
+        /** EngineStatus */
+        EngineStatus: {
             /** Installed */
             installed: boolean;
             /** Authenticated */
             authenticated: boolean;
+            /** Ready */
+            ready: boolean;
             /** Message */
             message: string;
         };
@@ -299,7 +301,10 @@ export interface components {
             status: "ok";
             /** Catalog Count */
             catalog_count: number;
-            codex: components["schemas"]["CodexStatus"];
+            /** Engines */
+            engines: {
+                [key: string]: components["schemas"]["EngineStatus"];
+            };
             /**
              * Indexed Count
              * @default 0
@@ -332,6 +337,12 @@ export interface components {
              * @enum {string}
              */
             agent: "codex" | "claude-code";
+            /**
+             * Engine
+             * @default codex
+             * @enum {string}
+             */
+            engine: "codex" | "claude-code";
             /** Session Id */
             session_id?: string | null;
         };
@@ -346,6 +357,11 @@ export interface components {
              * @enum {string}
              */
             agent: "codex" | "claude-code";
+            /**
+             * Engine
+             * @enum {string}
+             */
+            engine: "codex" | "claude-code";
             /**
              * Status
              * @enum {string}

@@ -3,6 +3,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Agent = Literal["codex", "claude-code"]
+Engine = Literal["codex", "claude-code"]
 
 
 class Model(BaseModel):
@@ -92,6 +93,7 @@ class Feedback(FeedbackInput):
 class MatchInput(Model):
     task: str = Field(min_length=3, max_length=4000)
     agent: Agent
+    engine: Engine = "codex"
     session_id: str | None = None
 
     @field_validator("task", mode="before")
@@ -105,6 +107,7 @@ class MatchSession(Model):
     id: str
     task: str
     agent: Agent
+    engine: Engine
     status: Literal["pending", "running", "completed", "failed", "cancelled"]
     recommendations: list[Recommendation]
     feedback: list[Feedback]
@@ -113,16 +116,17 @@ class MatchSession(Model):
     updated_at: str
 
 
-class CodexStatus(Model):
+class EngineStatus(Model):
     installed: bool
     authenticated: bool
+    ready: bool
     message: str
 
 
 class Health(Model):
     status: Literal["ok"] = "ok"
     catalog_count: int
-    codex: CodexStatus
+    engines: dict[Engine, EngineStatus]
     indexed_count: int = 0
     retrieval_mode: Literal["hybrid", "keyword-only"] = "keyword-only"
     sync_status: dict | None = None

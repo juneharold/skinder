@@ -37,6 +37,7 @@ class MatchSessionRecord(UserBase):
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     task: Mapped[str] = mapped_column(Text)
     agent: Mapped[str] = mapped_column(Text)
+    engine: Mapped[str] = mapped_column(Text, server_default=text("'codex'"))
     status: Mapped[str] = mapped_column(Text)
     recommendations: Mapped[str] = mapped_column(Text, server_default=text("'[]'"))
     error: Mapped[str | None] = mapped_column(Text)

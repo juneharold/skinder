@@ -171,8 +171,8 @@ class Store:
             if bookmark:
                 other = self.db.execute(
                     "SELECT id FROM feedback WHERE skill_id=? AND action='save' "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (row["skill_id"],),
+                    "AND created_at>=? ORDER BY created_at DESC LIMIT 1",
+                    (row["skill_id"], bookmark["saved_at"]),
                 ).fetchone()
                 if other:
                     self.db.execute(

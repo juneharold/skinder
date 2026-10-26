@@ -395,3 +395,19 @@ async def test_codex_process_is_configured_without_tools_or_inherited_instructio
     ):
         assert overrides[f"features.{feature}"] == "false"
     assert not os.path.exists(args[args.index("--cd") + 1])
+
+
+async def test_undo_new_save_does_not_restore_explicitly_removed_bookmark(backend):
+    async with backend.client() as client:
+        first = await match(client)
+        old_save = await feedback(client, first)
+        await client.delete("/api/saved/skill-0")
+        second = await match(client, task="Review another codebase")
+        new_save = await feedback(client, second)
+        await client.delete(f"/api/feedback/{new_save['id']}")
+        assert (await client.get("/api/saved")).json()["items"] == []
+        old_session = (await client.get(f"/api/matches/{first['id']}")).json()
+        assert old_session["feedback"] == [old_save]
+        await match(client, task="Review recent changes")
+        events = json.loads((backend.root / "request.json").read_text())["recent_feedback"]
+        assert any(event["task"] == first["task"] and event["action"] == "save" for event in events)

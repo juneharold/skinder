@@ -9,6 +9,7 @@ export type Recommendation = components["schemas"]["Recommendation"];
 export type Feedback = components["schemas"]["Feedback"];
 export type PassReason = NonNullable<Feedback["reason"]>;
 export type MatchSession = components["schemas"]["MatchSession"];
+export type Engine = MatchSession["engine"];
 export type Health = components["schemas"]["Health"];
 export type SavedItem = components["schemas"]["SavedItem"];
 export type Saved = components["schemas"]["Saved"];

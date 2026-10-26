@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import type { Agent, Feedback, MatchSession, PassReason, Recommendation, Skill } from "../lib/types";
+import type { Agent, Engine, Feedback, MatchSession, PassReason, Recommendation, Skill } from "../lib/types";
 import { useSavedSkills, type SavedSkillsState } from "./useSavedSkills";
 import { errorMessage, type LoadState } from "../lib/async";
 
 type MatchRequest = {
   task: string;
   agent: Agent;
+  engine: Engine;
   sessionId?: string;
   baseline: MatchSession | null;
   uncertain?: boolean;
 };
 type MatchSessionOptions = {
-  canStart: boolean;
+  canStart: (engine: Engine) => boolean;
   onStarted: () => void;
   onReviewed: (action: "choice" | "undo") => void;
   onNotice: (message: string) => void;
@@ -29,11 +30,13 @@ export type MatchSessionController = {
   matching: boolean;
   starting: boolean;
   cancelling: boolean;
-  canMatch: boolean;
+  canMatch: (engine: Engine) => boolean;
+  canRetryMatch: boolean;
+  retryEngine: Engine | undefined;
   pollError: string;
   matchError: string | undefined;
   retryMatch: () => void;
-  start: (task: string, agent: Agent) => void;
+  start: (task: string, agent: Agent, engine: Engine) => void;
   more: () => void;
   choose: (skill: Skill, action: "save" | "pass", reason?: PassReason | null) => void;
   undo: () => void;
@@ -63,7 +66,7 @@ export function useMatchSession({
   const [pollError, setPollError] = useState("");
   const saved = useSavedSkills({ canWrite: () => !startGuard.current, onNotice });
   const matching = isMatching(session);
-  const canMatch = canStart && loadState === "ready";
+  const canMatch = (engine: Engine) => canStart(engine) && loadState === "ready";
 
   const adoptSession = useCallback((next: MatchSession | null) => {
     // Commands and retries need the latest session before React commits its next render.
@@ -121,17 +124,18 @@ export function useMatchSession({
 
   async function reconcile(request: MatchRequest) {
     const next = request.sessionId ? await api.session(request.sessionId) : await api.current();
+    if (!next || next.task !== request.task || next.agent !== request.agent || next.engine !== request.engine)
+      return null;
     // Continuations keep their ID; a new task needs a different session with the requested brief.
     const changed = request.sessionId
-      ? next && (next.updated_at !== request.baseline?.updated_at || isMatching(next))
-      : next && next.id !== request.baseline?.id &&
-        next.task === request.task && next.agent === request.agent;
+      ? next.id === request.sessionId && (next.updated_at !== request.baseline?.updated_at || isMatching(next))
+      : next.id !== request.baseline?.id;
     return changed ? next : null;
   }
 
   async function startMatch(request: MatchRequest) {
     // Refs enforce mutual exclusion before React commits the busy indicators.
-    if (startGuard.current || saved.isWriting() || isMatching(currentSession.current) || !canMatch) return;
+    if (startGuard.current || saved.isWriting() || isMatching(currentSession.current) || !canMatch(request.engine)) return;
     startGuard.current = true;
     setStarting(true);
     setMatchError(null);
@@ -142,7 +146,7 @@ export function useMatchSession({
       if (!next) {
         request = { ...request, uncertain: false };
         try {
-          next = await api.match(request.task, request.agent, request.sessionId);
+          next = await api.match(request.task, request.agent, request.engine, request.sessionId);
         } catch (error) {
           if (error instanceof ApiError) throw error;
           // A lost response may hide an accepted job; reconcile before submitting again.
@@ -163,13 +167,13 @@ export function useMatchSession({
     }
   }
 
-  function start(task: string, agent: Agent) {
-    void startMatch({ task, agent, baseline: currentSession.current });
+  function start(task: string, agent: Agent, engine: Engine) {
+    void startMatch({ task, agent, engine, baseline: currentSession.current });
   }
   function more() {
     const current = currentSession.current;
     if (current) void startMatch({
-      task: current.task, agent: current.agent, sessionId: current.id, baseline: current,
+      task: current.task, agent: current.agent, engine: current.engine, sessionId: current.id, baseline: current,
     });
   }
 
@@ -254,6 +258,8 @@ export function useMatchSession({
     session, loadState, loadError, reload, saved,
     matching, starting, cancelling, canMatch, pollError,
     matchError: matchError?.message,
+    canRetryMatch: !!matchError && canMatch(matchError.request.engine),
+    retryEngine: matchError?.request.engine,
     retryMatch: () => { if (matchError) void startMatch(matchError.request); },
     start, more, choose, undo, cancel,
     canEdit: () => !!currentSession.current && !startGuard.current &&

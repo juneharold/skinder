@@ -1,5 +1,6 @@
 import type {
   Agent,
+  Engine,
   Catalog,
   FeedbackResult,
   Health,
@@ -57,10 +58,10 @@ export const api = {
   saveProfile: (profile: Profile) =>
     request<Profile>("/profile", { method: "PUT", body: body(profile) }),
   current: () => request<MatchSession | null>("/matches/current"),
-  match: (task: string, agent: Agent, session_id?: string) =>
+  match: (task: string, agent: Agent, engine: Engine, session_id?: string) =>
     request<MatchSession>("/matches", {
       method: "POST",
-      body: body({ task, agent, ...(session_id ? { session_id } : {}) }),
+      body: body({ task, agent, engine, ...(session_id ? { session_id } : {}) }),
     }),
   session: (id: string) =>
     request<MatchSession>(`/matches/${encodeURIComponent(id)}`),

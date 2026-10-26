@@ -126,6 +126,10 @@ export default function DiscoverView({
                 {session.agent === "codex" ? "Codex" : "Claude Code"}
               </strong>
             </div>
+            <div className="sidebar-section">
+              <span className="field-label">Recommendation engine</span>
+              <strong>{session.engine === "codex" ? "Codex" : "Claude Code"}</strong>
+            </div>
             <div className="sidebar-actions">
               <button
                 disabled={preferencesDisabled}
@@ -214,7 +218,7 @@ export default function DiscoverView({
                     <p>Matching failed. {session.error}</p>
                     {currentSkill && (
                       <button
-                        disabled={!canMatch || writeBusy}
+                        disabled={!canMatch(session.engine) || writeBusy}
                         onClick={more}
                       >
                         Retry matching
@@ -335,7 +339,7 @@ export default function DiscoverView({
                       className="primary-button"
                       disabled={
                         writeBusy ||
-                        ((retryMatching || canContinue) && !canMatch)
+                        ((retryMatching || canContinue) && !canMatch(session.engine))
                       }
                       onClick={retryMatching || canContinue ? more : onEditTask}
                     >

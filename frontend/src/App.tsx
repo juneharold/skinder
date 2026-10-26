@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Diamond, SlidersHorizontal } from "lucide-react";
 import { api } from "./lib/api";
-import { defaultProfile, type Agent, type Health, type Profile, type Skill } from "./lib/types";
+import { defaultProfile, type Agent, type Engine, type Health, type Profile, type Skill } from "./lib/types";
 import { errorMessage as message, type LoadState } from "./lib/async";
 import Preferences from "./components/Preferences";
 import SkillDetail from "./components/SkillDetail";
@@ -37,6 +37,8 @@ export default function App() {
   // Task edits stay separate from the active session until matching accepts the new brief.
   const [task, setTask] = useState("");
   const [agent, setAgent] = useState<Agent>("codex");
+  const [engine, setEngine] = useState<Engine>("codex");
+  const taskEdited = useRef(false);
   const [editOpen, setEditOpen] = useState(false);
   const [preferencesOpen, setPreferencesOpen] = useState(false);
   const preferenceGeneration = useRef(0);
@@ -48,10 +50,9 @@ export default function App() {
   const [showPassReasons, setShowPassReasons] = useState(false);
   const deckRef = useRef<HTMLDivElement>(null);
   const focusAfterMatching = useRef(false);
-  const connected = !!health?.codex.installed && !!health?.codex.authenticated;
   const matches = useMatchSession({
-    // Codex runs matching even when the requested skills target Claude Code.
-    canStart: loads.profile === "ready" && loads.health === "ready" && !profileBusy && connected,
+    canStart: (requestedEngine) => loads.profile === "ready" && loads.health === "ready" &&
+      !profileBusy && !!health?.engines[requestedEngine].ready,
     onStarted: () => {
       focusAfterMatching.current = true;
       setEditOpen(false);
@@ -64,6 +65,9 @@ export default function App() {
     onNotice: setToast,
   });
   const { session, matching, starting: matchBusy, canMatch, saved } = matches;
+  const activeEngine = editOpen || !session ? engine : session.engine;
+  const engineName = activeEngine === "codex" ? "Codex" : "Claude Code";
+  const connected = !!health?.engines[activeEngine].ready;
   const writeBusy = saved.busy;
   const actionError = saved.error;
   const cache = useSkillCache();
@@ -90,7 +94,7 @@ export default function App() {
           const next = await api.profile();
           if (!current()) return;
           setProfile(next);
-          setAgent(next.agent);
+          if (!taskEdited.current) setAgent(next.agent);
         }
         if (resource === "health") {
           const next = await api.health();
@@ -150,12 +154,14 @@ export default function App() {
   }
   function submitTask(event: React.FormEvent) {
     event.preventDefault();
-    if (task.trim().length >= 3) matches.start(task.trim(), agent);
+    if (task.trim().length >= 3) matches.start(task.trim(), agent, engine);
   }
   function editTask() {
     if (!session || !matches.canEdit()) return;
+    taskEdited.current = true;
     setTask(session.task);
     setAgent(session.agent);
+    setEngine(session.engine);
     setEditOpen(true);
   }
   function openPreferences() {
@@ -187,13 +193,13 @@ export default function App() {
     }
   }
   const resourceNotice = (resource: Resource) => (
-    <LoadNotice label={resource === "health" ? "the Codex connection" : "preferences"} retryLabel={resource === "health" ? "connection" : "preferences"} state={loads[resource]} error={loadErrors[resource] ?? ""} onRetry={() => void load(resource)} />
+    <LoadNotice label={resource === "health" ? `the ${engineName} connection` : "preferences"} retryLabel={resource === "health" ? "connection" : "preferences"} state={loads[resource]} error={loadErrors[resource] ?? ""} onRetry={() => void load(resource)} />
   );
   const matchNotice = matches.matchError && (
     <div className="error-notice" role="alert">
-      <p>Matching could not finish. {matches.matchError}</p>
+      <p>Matching with {matches.retryEngine === "codex" ? "Codex" : "Claude Code"} could not finish. {matches.matchError}</p>
       <button
-        disabled={matchBusy}
+        disabled={matchBusy || !matches.canRetryMatch}
         onClick={matches.retryMatch}
       >
         Retry matching
@@ -216,22 +222,39 @@ export default function App() {
         onChange={(event) => setTask(event.target.value)}
         placeholder="For example, review the accessibility of my app."
       />
-      <label className="field-label" htmlFor="target-agent">
-        Target agent
-      </label>
-      <select
-        id="target-agent"
-        value={agent}
-        disabled={matchBusy || loads.profile !== "ready"}
-        onChange={(event) => setAgent(event.target.value as Agent)}
-      >
-        <option value="codex">Codex</option>
-        <option value="claude-code">Claude Code</option>
-      </select>
+      <div className="task-options">
+        <div>
+          <label className="field-label" htmlFor="target-agent">Target agent</label>
+          <select
+            id="target-agent"
+            value={agent}
+            disabled={matchBusy || loads.profile !== "ready"}
+            onChange={(event) => {
+              taskEdited.current = true;
+              setAgent(event.target.value as Agent);
+            }}
+          >
+            <option value="codex">Codex</option>
+            <option value="claude-code">Claude Code</option>
+          </select>
+        </div>
+        <div>
+          <label className="field-label" htmlFor="recommendation-engine">Recommendation engine</label>
+          <select
+            id="recommendation-engine"
+            value={engine}
+            disabled={matchBusy}
+            onChange={(event) => setEngine(event.target.value as Engine)}
+          >
+            <option value="codex">Codex</option>
+            <option value="claude-code">Claude Code</option>
+          </select>
+        </div>
+      </div>
       <button
         className="primary-button"
         disabled={
-          !canMatch ||
+          !canMatch(engine) ||
           matchBusy ||
           matching ||
           writeBusy ||
@@ -280,10 +303,10 @@ export default function App() {
         </nav>
         <span className="connection" role="status">
           {loads.health === "loading"
-            ? "Checking Codex"
+            ? `Checking ${engineName}`
             : connected
-              ? "Codex connected"
-              : "Codex unavailable"}
+              ? `${engineName} connected`
+              : `${engineName} unavailable`}
         </span>
         <button
           className="icon-button header-preferences"
@@ -298,9 +321,9 @@ export default function App() {
         {loads.health === "ready" && !connected && (
           <div className="setup-notice">
             <div>
-              <strong>Connect Codex to find matches.</strong>
+              <strong>Connect {engineName} to find matches.</strong>
               <p>
-                Install the Codex CLI and sign in with <code>codex login</code>.
+                Install the {engineName} CLI and sign in with <code>{activeEngine === "codex" ? "codex login" : "claude auth login"}</code>.
                 You can still explore and save skills.
               </p>
             </div>

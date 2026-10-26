@@ -265,6 +265,16 @@ code {
   display: grid;
   gap: var(--space-xs);
 }
+.task-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-md);
+  margin-top: var(--space-md);
+}
+.task-options select {
+  width: 100%;
+  margin-top: var(--space-xs);
+}
 .field-label {
   font-size: var(--text-sm);
   font-weight: 600;

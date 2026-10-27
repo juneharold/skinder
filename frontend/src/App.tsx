@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Diamond, SlidersHorizontal } from "lucide-react";
 import { api } from "./lib/api";
-import { defaultProfile, type Agent, type Engine, type Health, type Profile, type Skill } from "./lib/types";
+import { defaultProfile, type Agent, type Health, type Profile, type Skill } from "./lib/types";
 import { errorMessage as message, type LoadState } from "./lib/async";
 import Preferences from "./components/Preferences";
 import SkillDetail from "./components/SkillDetail";
@@ -10,6 +10,7 @@ import LoadNotice from "./components/LoadNotice";
 import DiscoverView from "./views/DiscoverView";
 import LibraryView from "./views/LibraryView";
 import { useMatchSession } from "./hooks/useMatchSession";
+import { useAuth } from "./hooks/useAuth";
 import { useCatalog } from "./hooks/useCatalog";
 import { useRecommendedSkills, useSkillCache } from "./hooks/useSkillCache";
 
@@ -27,17 +28,28 @@ function readLocation() {
 }
 
 export default function App() {
+  const auth = useAuth();
+  if (auth.loading && !auth.user) return (
+    <div className="app-shell">
+      <header className="site-header"><span className="brand">skinder</span></header>
+      <main><p role="status">Checking sign-in…</p></main>
+    </div>
+  );
+  // Changing identity unmounts personal state and invalidates outstanding reads and polls.
+  return <AccountApp key={auth.user?.id ?? "guest"} auth={auth} />;
+}
+
+function AccountApp({ auth }: { auth: ReturnType<typeof useAuth> }) {
   const [location, setLocation] = useState(readLocation);
   const { view, q, category } = location;
   const [profile, setProfile] = useState<Profile>(defaultProfile);
   const [health, setHealth] = useState<Health | null>(null);
   const loadVersions = useRef<Record<Resource, number>>({ profile: 0, health: 0 });
-  const [loads, setLoads] = useState<Record<Resource, LoadState>>({ profile: "loading", health: "loading" });
+  const [loads, setLoads] = useState<Record<Resource, LoadState>>({ profile: auth.user ? "loading" : "idle", health: "loading" });
   const [loadErrors, setLoadErrors] = useState<Partial<Record<Resource, string>>>({});
   // Task edits stay separate from the active session until matching accepts the new brief.
   const [task, setTask] = useState("");
   const [agent, setAgent] = useState<Agent>("codex");
-  const [engine, setEngine] = useState<Engine>("codex");
   const taskEdited = useRef(false);
   const [editOpen, setEditOpen] = useState(false);
   const [preferencesOpen, setPreferencesOpen] = useState(false);
@@ -51,8 +63,9 @@ export default function App() {
   const deckRef = useRef<HTMLDivElement>(null);
   const focusAfterMatching = useRef(false);
   const matches = useMatchSession({
-    canStart: (requestedEngine) => loads.profile === "ready" && loads.health === "ready" &&
-      !profileBusy && !!health?.engines[requestedEngine].ready,
+    enabled: !!auth.user,
+    canStart: () => !!auth.user && loads.profile === "ready" && loads.health === "ready" &&
+      !profileBusy && !!health?.matching_available,
     onStarted: () => {
       focusAfterMatching.current = true;
       setEditOpen(false);
@@ -65,10 +78,7 @@ export default function App() {
     onNotice: setToast,
   });
   const { session, matching, starting: matchBusy, canMatch, saved } = matches;
-  const activeEngine = editOpen || !session ? engine : session.engine;
-  const engineName = activeEngine === "codex" ? "Codex" : "Claude Code";
-  const engineStatus = health?.engines[activeEngine];
-  const connected = !!engineStatus?.ready;
+  const connected = !!health?.matching_available;
   const writeBusy = saved.busy;
   const actionError = saved.error;
   const cache = useSkillCache();
@@ -86,6 +96,7 @@ export default function App() {
   );
   const load = useCallback(
     async (resource: Resource) => {
+      if (resource === "profile" && !auth.user) return;
       const requestVersion = ++loadVersions.current[resource];
       setLoads((previous) => ({ ...previous, [resource]: "loading" }));
       const current = () =>
@@ -113,12 +124,16 @@ export default function App() {
         }));
       }
     },
-    [],
+    [auth.user?.id],
   );
   useEffect(() => {
     (
       ["profile", "health"] as Resource[]
     ).forEach((resource) => void load(resource));
+    return () => {
+      loadVersions.current.profile++;
+      loadVersions.current.health++;
+    };
   }, [load]);
   useEffect(() => {
     const pop = () => setLocation(readLocation());
@@ -155,22 +170,22 @@ export default function App() {
   }
   function submitTask(event: React.FormEvent) {
     event.preventDefault();
-    if (task.trim().length >= 3) matches.start(task.trim(), agent, engine);
+    if (task.trim().length >= 3) matches.start(task.trim(), agent);
   }
   function editTask() {
     if (!session || !matches.canEdit()) return;
     taskEdited.current = true;
     setTask(session.task);
     setAgent(session.agent);
-    setEngine(session.engine);
     setEditOpen(true);
   }
   function openPreferences() {
+    if (!auth.user) return;
     preferenceGeneration.current++;
     setPreferencesOpen(true);
   }
   async function savePreferences(draft: Profile) {
-    if (profileGuard.current) return;
+    if (!auth.user || profileGuard.current) return;
     profileGuard.current = true;
     setProfileBusy(true);
     setProfileError(null);
@@ -194,11 +209,11 @@ export default function App() {
     }
   }
   const resourceNotice = (resource: Resource) => (
-    <LoadNotice label={resource === "health" ? `the ${engineName} connection` : "preferences"} retryLabel={resource === "health" ? "connection" : "preferences"} state={loads[resource]} error={loadErrors[resource] ?? ""} onRetry={() => void load(resource)} />
+    <LoadNotice label={resource === "health" ? "matching availability" : "preferences"} retryLabel={resource === "health" ? "connection" : "preferences"} state={loads[resource]} error={loadErrors[resource] ?? ""} onRetry={() => void load(resource)} />
   );
   const matchNotice = matches.matchError && (
     <div className="error-notice" role="alert">
-      <p>Matching with {matches.retryEngine === "codex" ? "Codex" : "Claude Code"} could not finish. {matches.matchError}</p>
+      <p>Matching could not finish. {matches.matchError}</p>
       <button
         disabled={matchBusy || !matches.canRetryMatch}
         onClick={matches.retryMatch}
@@ -239,23 +254,11 @@ export default function App() {
             <option value="claude-code">Claude Code</option>
           </select>
         </div>
-        <div>
-          <label className="field-label" htmlFor="recommendation-engine">Recommendation engine</label>
-          <select
-            id="recommendation-engine"
-            value={engine}
-            disabled={matchBusy}
-            onChange={(event) => setEngine(event.target.value as Engine)}
-          >
-            <option value="codex">Codex</option>
-            <option value="claude-code">Claude Code</option>
-          </select>
-        </div>
       </div>
       <button
         className="primary-button"
         disabled={
-          !canMatch(engine) ||
+          !canMatch() ||
           matchBusy ||
           matching ||
           writeBusy ||
@@ -303,12 +306,16 @@ export default function App() {
           ))}
         </nav>
         <span className="connection" role="status">
-          {loads.health === "loading"
-            ? `Checking ${engineName}`
-            : connected
-              ? `${engineName} connected`
-              : `${engineName} unavailable`}
+          {loads.health === "loading" ? "Checking matching" : connected ? "Matching available" : "Matching unavailable"}
         </span>
+        <div className="account-controls">
+          {auth.loading ? <span className="small muted">Checking sign-in…</span> : auth.user ? <>
+            <span className="account-name">@{auth.user.login}</span>
+            <button className="text-button" disabled={auth.busy} onClick={() => void auth.logout()}>
+              {auth.busy ? "Signing out…" : "Sign out"}
+            </button>
+          </> : <a className="text-button" href="/api/auth/github">Sign in with GitHub</a>}
+        </div>
         <button
           className="icon-button header-preferences"
           aria-label="Preferences"
@@ -319,20 +326,21 @@ export default function App() {
         </button>
       </header>
       <main>
+        {auth.error && <div className="error-notice" role="alert">
+          <p>{auth.error}</p>
+          <button onClick={() => void auth.reload()}>Check sign-in</button>
+        </div>}
+        {!auth.user && !auth.loading && view === "explore" && <p className="status-notice">
+          Browse freely. <a href="/api/auth/github">Sign in with GitHub</a> to save skills and get recommendations.
+        </p>}
         {loads.health === "ready" && !connected && (
           <div className="setup-notice">
             <div>
-              <strong>Connect {engineName} to find matches.</strong>
-              <p>{engineStatus?.message}</p>
-              <p>
-                {!engineStatus?.installed && <>
-                  Install the {engineName} CLI and sign in with <code>{activeEngine === "codex" ? "codex login" : "claude auth login"}</code>.{" "}
-                </>}
-                You can still explore and save skills.
-              </p>
+              <strong>Matching is temporarily unavailable.</strong>
+              <p>You can still explore the catalog and manage your saved skills.</p>
             </div>
             <button onClick={() => void load("health")}>
-              Recheck connection
+              Check availability
             </button>
           </div>
         )}
@@ -377,7 +385,19 @@ export default function App() {
               </button>
             </div>
           )}
-        {view === "discover" ? (
+        {!auth.user && view !== "explore" ? (
+          <section className="welcome-layout">
+            <div className="welcome-intro">
+              <h1>{view === "saved" ? "Your saved skills" : "Find skills for your task"}</h1>
+              <p>{auth.loading ? "Checking sign-in…" : view === "saved"
+                ? "Sign in to see your collection."
+                : "Sign in to match skills to your task and working style."}</p>
+            </div>
+            {!auth.loading && <a className="primary-button" href="/api/auth/github">Continue with GitHub</a>}
+            <a className="explore-link" href={url({ ...location, view: "explore" })}
+              onClick={(event) => { event.preventDefault(); navigate({ view: "explore" }); }}>Explore the catalog</a>
+          </section>
+        ) : view === "discover" ? (
           <DiscoverView
             matches={matches}
             skillsById={cache.skillsById}

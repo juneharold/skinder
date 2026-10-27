@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import App from "./App";
 import { api } from "./lib/api";
-import { deferred, installBackend, readyEngines, savedItem, sessionFor, skill } from "./test/fixtures";
+import { deferred, installBackend, readyHealth, savedItem, sessionFor, skill } from "./test/fixtures";
 
 beforeEach(() => vi.restoreAllMocks());
 afterEach(() => vi.restoreAllMocks());
@@ -154,18 +154,18 @@ describe("skill discovery", () => {
     installBackend();
     vi.mocked(api.health).mockResolvedValue({
       status: "ok", catalog_count: 3, indexed_count: 0, retrieval_mode: "keyword-only",
-      engines: readyEngines,
+      model: readyHealth.model, matching_available: true,
     });
     render(<App />);
     expect(await screen.findByText(/Search is using keywords only/)).toBeVisible();
   });
 
-  it("keeps catalog bookmarks usable when Codex is unavailable", async () => {
+  it("keeps catalog bookmarks usable when matching is unavailable", async () => {
     const backend = installBackend({ session: null });
     vi.mocked(api.health).mockResolvedValue({
       status: "ok", catalog_count: backend.skills.length,
       indexed_count: backend.skills.length, retrieval_mode: "hybrid",
-      engines: { ...readyEngines, codex: { installed: false, authenticated: false, ready: false, message: "Install Codex." } },
+      model: readyHealth.model, matching_available: false,
     });
     const user = userEvent.setup();
     render(<App />);
@@ -390,7 +390,7 @@ describe("skill discovery", () => {
     expect(api.match).toHaveBeenCalledWith(
       "Review interviews for checkout problems",
       "codex",
-      "codex",
+      expect.any(String),
       undefined,
     );
     expect(backend.getSession()?.task).toBe("Review interviews for checkout problems");
@@ -404,7 +404,7 @@ describe("skill discovery", () => {
     expect(api.match).toHaveBeenLastCalledWith(
       "Review interviews for checkout problems",
       "codex",
-      "codex",
+      expect.any(String),
       "session-2",
     );
   });
@@ -554,7 +554,7 @@ describe("skill discovery", () => {
 
     expect(await screen.findByRole("heading", { name: "Thoughtful Design" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Plan an onboarding flow" })).toBeVisible();
-    expect(backend.getMatchRequests()).toEqual([{ task: "Plan an onboarding flow", agent: "codex", engine: "codex" }]);
+    expect(backend.getMatchRequests()).toEqual([{ task: "Plan an onboarding flow", agent: "codex" }]);
     expect(screen.queryByRole("button", { name: "Retry matching" })).not.toBeInTheDocument();
   });
 

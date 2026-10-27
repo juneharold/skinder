@@ -1,25 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import type { Agent, Engine, Feedback, MatchSession, PassReason, Recommendation, Skill } from "../lib/types";
+import type { Agent, Feedback, MatchSession, PassReason, Recommendation, Skill } from "../lib/types";
 import { useSavedSkills, type SavedSkillsState } from "./useSavedSkills";
 import { errorMessage, type LoadState } from "../lib/async";
 
 type MatchRequest = {
   task: string;
   agent: Agent;
-  engine: Engine;
+  key: string;
   sessionId?: string;
   baseline: MatchSession | null;
-  uncertain?: boolean;
 };
 type MatchSessionOptions = {
-  canStart: (engine: Engine) => boolean;
+  enabled: boolean;
+  canStart: () => boolean;
   onStarted: () => void;
   onReviewed: (action: "choice" | "undo") => void;
   onNotice: (message: string) => void;
 };
 const isMatching = (session: MatchSession | null) =>
-  session?.status === "pending" || session?.status === "running";
+  session?.status === "queued" || session?.status === "running";
 
 export type MatchSessionController = {
   session: MatchSession | null;
@@ -30,13 +30,12 @@ export type MatchSessionController = {
   matching: boolean;
   starting: boolean;
   cancelling: boolean;
-  canMatch: (engine: Engine) => boolean;
+  canMatch: () => boolean;
   canRetryMatch: boolean;
-  retryEngine: Engine | undefined;
   pollError: string;
   matchError: string | undefined;
   retryMatch: () => void;
-  start: (task: string, agent: Agent, engine: Engine) => void;
+  start: (task: string, agent: Agent) => void;
   more: () => void;
   choose: (skill: Skill, action: "save" | "pass", reason?: PassReason | null) => void;
   undo: () => void;
@@ -49,14 +48,14 @@ export type MatchSessionController = {
 };
 
 export function useMatchSession({
-  canStart, onStarted, onReviewed, onNotice,
+  enabled, canStart, onStarted, onReviewed, onNotice,
 }: MatchSessionOptions): MatchSessionController {
   const [session, setSession] = useState<MatchSession | null>(null);
   const currentSession = useRef<MatchSession | null>(null);
   // Match/cancel attempts and successful reviews invalidate older initial reads and polls.
   const version = useRef(0);
   const loadVersion = useRef(0);
-  const [loadState, setLoadState] = useState<LoadState>("loading");
+  const [loadState, setLoadState] = useState<LoadState>(enabled ? "loading" : "idle");
   const [loadError, setLoadError] = useState("");
   const [starting, setStarting] = useState(false);
   const startGuard = useRef(false);
@@ -64,9 +63,9 @@ export function useMatchSession({
   const cancelGuard = useRef(false);
   const [matchError, setMatchError] = useState<{ message: string; request: MatchRequest } | null>(null);
   const [pollError, setPollError] = useState("");
-  const saved = useSavedSkills({ canWrite: () => !startGuard.current, onNotice });
+  const saved = useSavedSkills({ enabled, canWrite: () => !startGuard.current, onNotice });
   const matching = isMatching(session);
-  const canMatch = (engine: Engine) => canStart(engine) && loadState === "ready";
+  const canMatch = () => enabled && canStart() && loadState === "ready";
 
   const adoptSession = useCallback((next: MatchSession | null) => {
     // Commands and retries need the latest session before React commits its next render.
@@ -74,6 +73,7 @@ export function useMatchSession({
     setSession(next);
   }, []);
   const reload = useCallback(async () => {
+    if (!enabled) return;
     const requestVersion = ++loadVersion.current;
     const generation = version.current;
     const current = () => requestVersion === loadVersion.current && generation === version.current;
@@ -89,9 +89,10 @@ export function useMatchSession({
       setLoadState("error");
       setLoadError(errorMessage(error));
     }
-  }, [adoptSession]);
+  }, [adoptSession, enabled]);
   useEffect(() => {
     void reload();
+    return () => { version.current++; loadVersion.current++; };
   }, [reload]);
 
   useEffect(() => {
@@ -124,36 +125,32 @@ export function useMatchSession({
 
   async function reconcile(request: MatchRequest) {
     const next = request.sessionId ? await api.session(request.sessionId) : await api.current();
-    if (!next || next.task !== request.task || next.agent !== request.agent || next.engine !== request.engine)
+    if (!next || next.task !== request.task || next.agent !== request.agent)
       return null;
     // Continuations keep their ID; a new task needs a different session with the requested brief.
     const changed = request.sessionId
-      ? next.id === request.sessionId && (next.updated_at !== request.baseline?.updated_at || isMatching(next))
+      ? next.id === request.sessionId && (next.latest_job.id !== request.baseline?.latest_job.id || isMatching(next))
       : next.id !== request.baseline?.id;
     return changed ? next : null;
   }
 
   async function startMatch(request: MatchRequest) {
     // Refs enforce mutual exclusion before React commits the busy indicators.
-    if (startGuard.current || saved.isWriting() || isMatching(currentSession.current) || !canMatch(request.engine)) return;
+    if (startGuard.current || saved.isWriting() || isMatching(currentSession.current) || !canMatch()) return;
     startGuard.current = true;
     setStarting(true);
     setMatchError(null);
     const generation = ++version.current;
     try {
-      let next: MatchSession | null = null;
-      if (request.uncertain) next = await reconcile(request);
-      if (!next) {
-        request = { ...request, uncertain: false };
-        try {
-          next = await api.match(request.task, request.agent, request.engine, request.sessionId);
-        } catch (error) {
-          if (error instanceof ApiError) throw error;
-          // A lost response may hide an accepted job; reconcile before submitting again.
-          request = { ...request, uncertain: true };
-          next = await reconcile(request);
-          if (!next) throw error;
-        }
+      let next: MatchSession | null;
+      // Retrying the same key retrieves the accepted job even if reconciliation is unavailable.
+      try {
+        next = await api.match(request.task, request.agent, request.key, request.sessionId);
+      } catch (error) {
+        if (error instanceof ApiError) throw error;
+        // A lost response may hide an accepted job; reconcile before offering a retry.
+        next = await reconcile(request);
+        if (!next) throw error;
       }
       if (generation !== version.current) return;
       adoptSession(next);
@@ -167,13 +164,13 @@ export function useMatchSession({
     }
   }
 
-  function start(task: string, agent: Agent, engine: Engine) {
-    void startMatch({ task, agent, engine, baseline: currentSession.current });
+  function start(task: string, agent: Agent) {
+    void startMatch({ task, agent, key: crypto.randomUUID(), baseline: currentSession.current });
   }
   function more() {
     const current = currentSession.current;
     if (current) void startMatch({
-      task: current.task, agent: current.agent, engine: current.engine, sessionId: current.id, baseline: current,
+      task: current.task, agent: current.agent, key: crypto.randomUUID(), sessionId: current.id, baseline: current,
     });
   }
 
@@ -228,25 +225,27 @@ export function useMatchSession({
     });
   }
 
-  async function cancel() {
+  async function cancel(target?: { jobId: string; sessionId: string }) {
     const current = currentSession.current;
     if (!current || cancelGuard.current || startGuard.current) return;
+    const requested = target ?? { jobId: current.latest_job.id, sessionId: current.id };
     cancelGuard.current = true;
     setCancelling(true);
     const generation = ++version.current;
     try {
-      const next = await api.cancel(current.id);
+      const next = await api.cancel(requested.jobId);
       if (generation !== version.current) return;
       // A poll started during cancellation must not restore the session's running state.
       version.current++;
-      adoptSession(next);
+      if (currentSession.current?.id === requested.sessionId) adoptSession(next);
       setPollError("");
       saved.setError((previous) => previous?.label === "Retry cancellation" ? null : previous);
     } catch (error) {
+      if (generation !== version.current) return;
       saved.setError({
         message: `Could not stop matching: ${errorMessage(error)}`,
         label: "Retry cancellation",
-        retry: () => void cancel(),
+        retry: () => void cancel(requested),
       });
     } finally {
       cancelGuard.current = false;
@@ -258,8 +257,7 @@ export function useMatchSession({
     session, loadState, loadError, reload, saved,
     matching, starting, cancelling, canMatch, pollError,
     matchError: matchError?.message,
-    canRetryMatch: !!matchError && canMatch(matchError.request.engine),
-    retryEngine: matchError?.request.engine,
+    canRetryMatch: !!matchError && canMatch(),
     retryMatch: () => { if (matchError) void startMatch(matchError.request); },
     start, more, choose, undo, cancel,
     canEdit: () => !!currentSession.current && !startGuard.current &&

@@ -13,6 +13,7 @@ export type ActionError = {
 };
 
 type SavedSkillsOptions = {
+  enabled: boolean;
   canWrite: () => boolean;
   onNotice: (message: string) => void;
 };
@@ -28,9 +29,9 @@ export type SavedSkillsState = {
   dismissError: () => void;
 };
 
-export function useSavedSkills({ canWrite, onNotice }: SavedSkillsOptions) {
+export function useSavedSkills({ enabled, canWrite, onNotice }: SavedSkillsOptions) {
   const [items, setItems] = useState<SavedItem[]>([]);
-  const [loadState, setLoadState] = useState<LoadState>("loading");
+  const [loadState, setLoadState] = useState<LoadState>(enabled ? "loading" : "idle");
   const [loadError, setLoadError] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ActionError | null>(null);
@@ -39,6 +40,7 @@ export function useSavedSkills({ canWrite, onNotice }: SavedSkillsOptions) {
   const loadVersion = useRef(0);
 
   const reload = useCallback(async () => {
+    if (!enabled) return;
     const requestVersion = ++loadVersion.current;
     const generation = version.current;
     // Both newer reloads and intervening writes can make this response obsolete.
@@ -55,14 +57,15 @@ export function useSavedSkills({ canWrite, onNotice }: SavedSkillsOptions) {
       setLoadState("error");
       setLoadError(errorMessage(error));
     }
-  }, []);
+  }, [enabled]);
   useEffect(() => {
     void reload();
+    return () => { version.current++; loadVersion.current++; };
   }, [reload]);
 
   async function mutate(label: string, operation: () => Promise<void>, skill?: Skill) {
     // Bookmarks, reviews, and undo share full collection responses, so serialize their writes.
-    if (writing.current || !canWrite()) return;
+    if (!enabled || writing.current || !canWrite()) return;
     writing.current = true;
     // Reads started before or during a mutation cannot replace its saved collection.
     version.current++;

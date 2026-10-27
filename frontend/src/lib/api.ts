@@ -1,6 +1,6 @@
 import type {
   Agent,
-  Engine,
+  AuthState,
   Catalog,
   FeedbackResult,
   Health,
@@ -19,15 +19,27 @@ export class ApiError extends Error {
   }
 }
 
+export const AUTH_EXPIRED_EVENT = "skinder:auth-expired";
+let csrfToken: string | null = null;
+export function setCsrfToken(value: string | null) { csrfToken = value; }
+
 // Retry policy belongs to each operation; a write may succeed before its response is lost.
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const writing = options.method && !["GET", "HEAD"].includes(options.method);
+  if (writing && !csrfToken) throw new ApiError("Sign in to continue.", 401);
   const response = await fetch(`/api${path}`, {
     ...options,
+    credentials: "same-origin",
     headers: {
+      ...(writing ? { "X-CSRF-Token": csrfToken! } : {}),
       ...(options.body ? { "Content-Type": "application/json" } : {}),
       ...options.headers,
     },
   });
+  if (response.status === 401) {
+    csrfToken = null;
+    window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     const detail = payload?.detail;
@@ -38,10 +50,13 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       response.status,
     );
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 const body = (value: unknown) => JSON.stringify(value);
 export const api = {
+  me: () => request<AuthState>("/auth/me"),
+  logout: () => request<void>("/auth/logout", { method: "POST" }),
   health: () => request<Health>("/health"),
   catalog: (
     filters: { q?: string; category?: string; offset?: number; limit?: number } = {},
@@ -58,15 +73,16 @@ export const api = {
   saveProfile: (profile: Profile) =>
     request<Profile>("/profile", { method: "PUT", body: body(profile) }),
   current: () => request<MatchSession | null>("/matches/current"),
-  match: (task: string, agent: Agent, engine: Engine, session_id?: string) =>
+  match: (task: string, agent: Agent, idempotencyKey: string, session_id?: string) =>
     request<MatchSession>("/matches", {
       method: "POST",
-      body: body({ task, agent, engine, ...(session_id ? { session_id } : {}) }),
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: body({ task, agent, ...(session_id ? { session_id } : {}) }),
     }),
   session: (id: string) =>
     request<MatchSession>(`/matches/${encodeURIComponent(id)}`),
   cancel: (id: string) =>
-    request<MatchSession>(`/matches/${encodeURIComponent(id)}/cancel`, {
+    request<MatchSession>(`/jobs/${encodeURIComponent(id)}/cancel`, {
       method: "POST",
     }),
   feedback: (

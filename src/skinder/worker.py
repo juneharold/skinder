@@ -10,6 +10,7 @@ from uuid import uuid4
 from sqlalchemy.exc import SQLAlchemyError
 
 from .database import Database
+from .diagnostics import configure_logging
 from .jobs import JobStore
 from .models import MatchResult
 from .provider import LetsurMatcher, ProviderError, ProviderOutcome, build_request
@@ -31,11 +32,12 @@ class Worker:
     def stop(self):
         self.stopping.set()
 
-    async def _heartbeat(self, job):
+    async def _heartbeat(self, job, execution):
         while True:
             await asyncio.sleep(self.settings.job_heartbeat_seconds)
             try:
                 if not await run_sync(self.jobs.heartbeat, job.id, job.lease_token):
+                    execution.cancel()
                     return
             except SQLAlchemyError:
                 # A failed renewal cannot extend authority; the database lease fences writes.
@@ -58,7 +60,7 @@ class Worker:
                     return False
 
     async def execute(self, job):
-        heartbeat = asyncio.create_task(self._heartbeat(job))
+        heartbeat = asyncio.create_task(self._heartbeat(job, asyncio.current_task()))
         timings = {}
         dispatched = False
         stage = "retrieval"
@@ -125,6 +127,7 @@ class Worker:
         try:
             while not self.stopping.is_set():
                 try:
+                    await run_sync(self.jobs.reap)
                     await self.matcher.pricing(self.settings.letsur_model)
                     await run_sync(self.jobs.worker_heartbeat, self.id, True)
                     self.active = {task for task in self.active if not task.done()}
@@ -175,5 +178,5 @@ async def serve(settings):
 
 def main():
     settings = load_settings("worker")
-    logging.basicConfig(level=settings.log_level)
+    configure_logging(settings.log_level)
     asyncio.run(serve(settings))

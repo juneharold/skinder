@@ -104,7 +104,7 @@ class LetsurMatcher:
             body = exc.body if isinstance(exc.body, dict) else {}
             return ProviderOutcome(error_code="provider_outcome_unknown" if exc.status_code >= 500 else "provider_rejected",
                 unknown=exc.status_code >= 500, error_ref=body.get("error_ref"))
-        outcome = ProviderOutcome(request_id=getattr(response, "_request_id", None))
+        outcome = ProviderOutcome(request_id=getattr(response, "_request_id", None) or response.id)
         usage = response.usage
         if usage:
             outcome.input_tokens, outcome.output_tokens = usage.prompt_tokens, usage.completion_tokens

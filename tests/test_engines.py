@@ -42,6 +42,7 @@ async def test_provider_validates_output_and_preserves_exact_cost(settings):
     result = await provider.match(build_request({}, settings.letsur_model, settings), set())
     assert result.result.recommendations == []
     assert result.cost == Decimal("0.00021400")
+    assert result.request_id == "test"
     assert (result.input_tokens, result.output_tokens) == (42, 13)
     await provider.close()
 

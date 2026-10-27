@@ -121,8 +121,8 @@ class JobStore:
                 skill = session.get(CatalogSkillRecord, event["skill_id"])
                 if skill:
                     event["skill"] = match_metadata(Skill.model_validate(skill.data))
-            seen = list(session.scalars(select(MatchSessionSkillRecord.skill_id).where(
-                MatchSessionSkillRecord.user_id == user_id, MatchSessionSkillRecord.session_id == row.id)))
+            seen = list(session.scalars(select(FeedbackRecord.skill_id).where(
+                FeedbackRecord.user_id == user_id, FeedbackRecord.session_id == row.id)))
             job = MatchJobRecord(id=new_id(), user_id=user_id, session_id=row.id,
                 idempotency_key=idempotency_key, request_hash=digest, status="queued",
                 input={"task": value.task, "agent": value.agent, "profile": profile,
@@ -157,33 +157,42 @@ class JobStore:
         job.lease_token += 1
         job.lease_expires_at = None
 
+    def reap(self):
+        """Recover expired work even while the model or its pricing is unavailable."""
+        with self.db.db_sessions.begin() as session:
+            session.execute(text("SELECT pg_advisory_xact_lock(73519002)"))
+            self._reap(session)
+
+    def _reap(self, session):
+        now = self._now(session)
+        expired = list(session.scalars(select(MatchJobRecord.id).where(
+            ((MatchJobRecord.status == "running") & ((MatchJobRecord.lease_expires_at <= now) |
+                (MatchJobRecord.deadline_at <= now))) |
+            ((MatchJobRecord.status == "queued") &
+                (MatchJobRecord.created_at <= now - timedelta(seconds=self.settings.queue_timeout_seconds))))))
+        for job_id in expired:
+            job = self._job(session, job_id)
+            now = self._now(session)
+            if job.status not in {"queued", "running"}:
+                continue
+            if job.status == "running" and job.lease_expires_at > now and job.deadline_at > now:
+                continue
+            if job.status == "queued" and job.created_at > now - timedelta(seconds=self.settings.queue_timeout_seconds):
+                continue
+            if job.dispatch_started:
+                self._terminal(job, now, "provider_outcome_unknown")
+            elif (job.status == "queued" or job.claim_count >= self.settings.max_job_claims or
+                  (job.deadline_at and job.deadline_at <= now)):
+                self._terminal(job, now, "job_expired")
+            else:
+                job.status, job.worker_id, job.lease_expires_at = "queued", None, None
+                job.lease_token += 1
+        session.flush()
+
     def claim(self, worker_id: str):
         with self.db.db_sessions.begin() as session:
             session.execute(text("SELECT pg_advisory_xact_lock(73519002)"))
-            now = self._now(session)
-            expired = list(session.scalars(select(MatchJobRecord.id).where(
-                ((MatchJobRecord.status == "running") & ((MatchJobRecord.lease_expires_at <= now) |
-                    (MatchJobRecord.deadline_at <= now))) |
-                ((MatchJobRecord.status == "queued") &
-                    (MatchJobRecord.created_at <= now - timedelta(seconds=self.settings.queue_timeout_seconds))))))
-            for job_id in expired:
-                job = self._job(session, job_id)
-                now = self._now(session)
-                if job.status not in {"queued", "running"}:
-                    continue
-                if job.status == "running" and job.lease_expires_at > now and job.deadline_at > now:
-                    continue
-                if job.status == "queued" and job.created_at > now - timedelta(seconds=self.settings.queue_timeout_seconds):
-                    continue
-                if job.dispatch_started:
-                    self._terminal(job, now, "provider_outcome_unknown")
-                elif (job.status == "queued" or job.claim_count >= self.settings.max_job_claims or
-                      (job.deadline_at and job.deadline_at <= now)):
-                    self._terminal(job, now, "job_expired")
-                else:
-                    job.status, job.worker_id, job.lease_expires_at = "queued", None, None
-                    job.lease_token += 1
-            session.flush()
+            self._reap(session)
             live = session.scalar(select(func.count()).select_from(MatchJobRecord).where(
                 MatchJobRecord.status == "running"))
             if live >= self.settings.max_concurrent_jobs:

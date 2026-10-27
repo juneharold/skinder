@@ -472,3 +472,23 @@ async def test_quote_heavy_sources_trim_to_full_provider_envelope(db, users, sto
     assert supplied["profile"] == profile.model_dump()
     assert supplied["eligible_skills"][0]["source_excerpt"] == ""
     assert supplied["eligible_skills"][0]["source_truncated"] is True
+
+
+async def test_queued_job_keeps_its_prompt_when_worker_code_changes(db, users, stores, monkeypatch):
+    from skinder import provider
+    store = stores[0]
+    public = submit(store, users[0])
+    with db.db_sessions() as session:
+        original = session.get(MatchJobRecord, public.latest_job.id).input['instructions']
+    monkeypatch.setattr(provider, 'MATCH_INSTRUCTIONS', 'Changed after this job was accepted.')
+
+    class CaptureMatcher(Matcher):
+        async def match(self, request, eligible):
+            self.instructions = request['messages'][0]['content']
+            return await super().match(request, eligible)
+
+    matcher = CaptureMatcher()
+    worker = Worker(store, Retriever(), Enricher(), matcher)
+    assert await worker.run_once()
+    assert matcher.instructions == original
+    assert store.users.get_match_session(users[0].id, public.id).status == 'completed'

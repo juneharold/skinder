@@ -47,7 +47,7 @@ def eligibility(statement, agent: Agent | None, excluded: Iterable[str]):
 class CatalogStore:
     def __init__(self, database: Database, settings: Settings | None = None) -> None:
         self.database = database
-        self.settings = settings or Settings(_env_file=None)
+        self.settings = settings or database.settings
         self.engine = database.engine
         self.db_sessions = database.db_sessions
 

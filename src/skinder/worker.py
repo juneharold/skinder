@@ -79,13 +79,14 @@ class Worker:
                 stage, start = "provider", monotonic()
                 # Trim against the complete serialized envelope, including escaped message
                 # content. The exact bounded payload is saved before paid dispatch.
+                instructions = job.input.get("instructions")
                 data = bounded_request(job.input["task"], job.input["profile"],
                     job.input["feedback"], enriched, self.settings,
-                    request_size=lambda value: request_size(value, job.model, self.settings))
+                    request_size=lambda value: request_size(value, job.model, self.settings, instructions))
                 if not data["eligible_skills"]:
                     outcome = ProviderOutcome(result=MatchResult(recommendations=[]))
                 else:
-                    request = build_request(data, job.model, self.settings)
+                    request = build_request(data, job.model, self.settings, instructions)
                     pricing = await self.matcher.pricing(job.model)
                     if not await run_sync(self.jobs.dispatch, job.id, job.lease_token, request, pricing):
                         return

@@ -167,3 +167,17 @@ def test_logout_revokes_session(backend):
     assert backend.client.post('/api/auth/logout').status_code == 204
     assert backend.client.get('/api/auth/me').json()['user'] is None
     assert backend.client.get('/api/profile').status_code == 401
+
+
+def test_request_logs_omit_query_values_and_resource_identifiers(backend, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger='skinder.http')
+    backend.client.get('/health/live?code=synthetic-oauth-secret')
+    backend.client.get('/api/skills/synthetic-private-identifier')
+    records = [record for record in caplog.records if record.name == 'skinder.http']
+    assert [(record.route, record.status) for record in records] == [
+        ('/health/live', 200), ('/api/skills/{skill_id}', 404)]
+    from skinder.diagnostics import JsonFormatter
+    output = '\n'.join(JsonFormatter().format(record) for record in records)
+    assert 'synthetic-oauth-secret' not in output
+    assert 'synthetic-private-identifier' not in output

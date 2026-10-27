@@ -4,9 +4,25 @@ from decimal import Decimal
 from uuid import uuid4
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import (BigInteger, Boolean, CheckConstraint, Computed, Date, DateTime, Float,
-    ForeignKey, ForeignKeyConstraint, Identity, Index, Integer, Numeric, Text,
-    UniqueConstraint, func, text)
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Computed,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Identity,
+    Index,
+    Integer,
+    Numeric,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -98,7 +114,7 @@ class MatchJobRecord(Base):
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     budget_date: Mapped[date | None] = mapped_column(Date)
-    reserved_units: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal("0"))
+    reserved_units: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal(0))
     reservation_reconciled: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -106,6 +122,7 @@ class ProviderAttemptRecord(Base):
     __tablename__ = "provider_attempts"
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_id)
     job_id: Mapped[str] = mapped_column(ForeignKey("match_jobs.id", ondelete="CASCADE"), unique=True)
+    lease_token: Mapped[int] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(Text, default="dispatched")
     model: Mapped[str] = mapped_column(Text)
     request_id: Mapped[str | None] = mapped_column(Text)
@@ -124,8 +141,8 @@ class DailyUsageRecord(Base):
     __tablename__ = "daily_usage"
     __table_args__ = (CheckConstraint("spent >= 0 AND reserved >= 0"),)
     day: Mapped[date] = mapped_column(Date, primary_key=True)
-    spent: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal("0"))
-    reserved: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal("0"))
+    spent: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal(0))
+    reserved: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=Decimal(0))
 
 
 class UserDailyUsageRecord(Base):

@@ -14,8 +14,8 @@ from sqlalchemy.dialects.postgresql import insert
 from .catalog import CatalogStore
 from .models import Skill
 from .orm import CatalogSkillRecord, SourceCacheRecord
-from .work import run_sync
 from .settings import Settings
+from .work import run_sync
 
 MAX_FILE_BYTES = 256 * 1024
 # Cached downloads may be larger than the excerpts included in matching requests.

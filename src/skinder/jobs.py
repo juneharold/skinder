@@ -7,9 +7,9 @@ from uuid import UUID
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 
-from .database import Database
+from .database import JOB_ADMISSION_LOCK, Database
 from .matcher import PROMPT_VERSION
-from .models import MatchInput, Profile, Skill
+from .models import MatchInput, Profile, Recommendation, Skill
 from .orm import (
     CatalogSkillRecord,
     DailyUsageRecord,
@@ -76,7 +76,10 @@ class JobStore:
                 from .models import Job
                 return result.model_copy(update={"status": previous.status, "latest_job": Job(
                     id=previous.id, status=previous.status, model=previous.model,
-                    error_code=previous.error_code, error=previous.error), "error": previous.error})
+                    error_code=previous.error_code, error=previous.error), "error": previous.error,
+                    "recommendations": [Recommendation.model_validate(item) for item in (
+                        previous.result if previous.status == "completed"
+                        else previous.input.get("previous_recommendations", []))]})
             active = session.scalar(select(MatchJobRecord.id).where(MatchJobRecord.user_id == user_id,
                 MatchJobRecord.status.in_(["queued", "running"])))
             if active:
@@ -126,7 +129,8 @@ class JobStore:
             job = MatchJobRecord(id=new_id(), user_id=user_id, session_id=row.id,
                 idempotency_key=idempotency_key, request_hash=digest, status="queued",
                 input={"task": value.task, "agent": value.agent, "profile": profile,
-                       "feedback": feedback, "seen_ids": seen}, model=self.settings.letsur_model,
+                       "feedback": feedback, "seen_ids": seen,
+                       "previous_recommendations": row.recommendations}, model=self.settings.letsur_model,
                 prompt_version=PROMPT_VERSION)
             session.add(job)
             session.flush()
@@ -160,7 +164,7 @@ class JobStore:
     def reap(self):
         """Recover expired work even while the model or its pricing is unavailable."""
         with self.db.db_sessions.begin() as session:
-            session.execute(text("SELECT pg_advisory_xact_lock(73519002)"))
+            session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": JOB_ADMISSION_LOCK})
             self._reap(session)
 
     def _reap(self, session):
@@ -191,7 +195,7 @@ class JobStore:
 
     def claim(self, worker_id: str):
         with self.db.db_sessions.begin() as session:
-            session.execute(text("SELECT pg_advisory_xact_lock(73519002)"))
+            session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": JOB_ADMISSION_LOCK})
             self._reap(session)
             live = session.scalar(select(func.count()).select_from(MatchJobRecord).where(
                 MatchJobRecord.status == "running"))
@@ -242,7 +246,8 @@ class JobStore:
             usage.reserved += reserve
             job.dispatch_started, job.provider_request = True, request
             job.budget_date, job.reserved_units = day, reserve
-            session.add(ProviderAttemptRecord(job_id=job.id, model=job.model, pricing=pricing.as_dict()))
+            session.add(ProviderAttemptRecord(job_id=job.id, lease_token=token,
+                                             model=job.model, pricing=pricing.as_dict()))
             return True
 
     def finish(self, job_id, token, outcome: ProviderOutcome, timings=None):
@@ -251,7 +256,7 @@ class JobStore:
             now = self._now(session)
             attempt = session.scalar(select(ProviderAttemptRecord).where(ProviderAttemptRecord.job_id == job_id))
             # Usage is safe to reconcile after cancellation or lease expiry; it never publishes output.
-            if attempt and attempt.finished_at is None:
+            if attempt and attempt.lease_token == token and attempt.finished_at is None:
                 attempt.finished_at, attempt.status = now, "failed" if outcome.error_code else "completed"
                 attempt.request_id, attempt.error_type, attempt.error_ref = outcome.request_id, outcome.error_code, outcome.error_ref
                 attempt.input_tokens, attempt.output_tokens = outcome.input_tokens, outcome.output_tokens

@@ -20,6 +20,7 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://skinder:skinder@postgres:5432/skinder
+      SKINDER_EMBEDDING_MODEL_DIR: /opt/skinder/models/e5-small
     command: ["skinder-migrate"]
     depends_on:
       postgres:
@@ -31,6 +32,7 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://skinder:skinder@postgres:5432/skinder
+      SKINDER_EMBEDDING_MODEL_DIR: /opt/skinder/models/e5-small
       SKINDER_HOST: 0.0.0.0
       PORT: 8742
     command: ["skinder"]
@@ -46,6 +48,7 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://skinder:skinder@postgres:5432/skinder
+      SKINDER_EMBEDDING_MODEL_DIR: /opt/skinder/models/e5-small
     command: ["skinder-worker"]
     depends_on:
       migrate:
@@ -57,6 +60,7 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://skinder:skinder@postgres:5432/skinder
+      SKINDER_EMBEDDING_MODEL_DIR: /opt/skinder/models/e5-small
     command: ["best-effort-full-sync"]
     profiles: [ops]
     depends_on:

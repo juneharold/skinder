@@ -479,12 +479,12 @@ def test_cli_exit_codes_and_indexing_after_pause(catalog, monkeypatch, tmp_path,
 
 def test_advisory_lock_excludes_other_writers_and_releases_without_transaction(catalog):
     from sqlalchemy import text
+
     from skinder.sync import writer_lock
 
     with writer_lock(catalog):
-        with pytest.raises(RuntimeError, match="Another catalog"):
-            with writer_lock(catalog):
-                pytest.fail("Concurrent writer entered")
+        with pytest.raises(RuntimeError, match="Another catalog"), writer_lock(catalog):
+            pytest.fail("Concurrent writer entered")
         with catalog.engine.connect() as connection:
             assert connection.scalar(text("SELECT count(*) FROM pg_stat_activity a JOIN pg_locks l ON a.pid=l.pid "
                 "WHERE l.locktype='advisory' AND l.objid=73519002 "

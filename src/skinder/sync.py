@@ -16,14 +16,14 @@ from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
 from sqlalchemy import Integer, cast, create_engine, delete, func, or_, select, text, update
-from sqlalchemy.pool import NullPool
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.pool import NullPool
 
 from .catalog import CatalogStore, stable_id
-from .database import Database
-from .settings import Settings, load_settings
+from .database import CATALOG_MAINTENANCE_LOCK, Database
 from .models import InstallCommands, Skill
 from .orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
+from .settings import Settings, load_settings
 
 BASE = "https://skillsmp.com"
 TAXONOMY_LIMIT = 1000
@@ -474,13 +474,13 @@ def writer_lock(catalog: CatalogStore):
         connect_args={"connect_timeout": catalog.settings.db_connect_timeout_seconds})
     try:
         with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-            acquired = connection.scalar(text("SELECT pg_try_advisory_lock(73519002)"))
+            acquired = connection.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": CATALOG_MAINTENANCE_LOCK})
             if not acquired:
                 raise RuntimeError("Another catalog sync/index writer is active.")
             try:
                 yield
             finally:
-                connection.execute(text("SELECT pg_advisory_unlock(73519002)"))
+                connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": CATALOG_MAINTENANCE_LOCK})
     finally:
         lock_engine.dispose()
 

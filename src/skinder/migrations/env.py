@@ -1,7 +1,7 @@
 from alembic import context
 from sqlalchemy import text
 
-from skinder.database import Database
+from skinder.database import MIGRATION_LOCK, Database
 from skinder.orm import Base
 from skinder.settings import load_settings
 
@@ -21,7 +21,7 @@ else:
     database = Database(load_settings("migrate"))
     try:
         with database.engine.begin() as connection:
-            connection.execute(text("SELECT pg_advisory_xact_lock(73519001)"))
+            connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": MIGRATION_LOCK})
             run(connection)
     finally:
         database.close()

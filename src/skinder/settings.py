@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 class Settings(BaseSettings):
@@ -40,7 +41,7 @@ class Settings(BaseSettings):
     letsur_timeout_seconds: float = Field(120, gt=0)
     max_prompt_bytes: int = Field(65536, ge=8192)
     max_output_tokens: int = Field(8192, gt=0)
-    daily_budget_units: Decimal = Field(Decimal("5"), gt=0)
+    daily_budget_units: Decimal = Field(Decimal(5), gt=0)
     matches_per_user_per_day: int = Field(10, gt=0)
     max_concurrent_jobs: int = Field(4, gt=0)
     worker_poll_seconds: float = Field(1, gt=0)
@@ -85,7 +86,7 @@ class Settings(BaseSettings):
                 parsed = make_url(value)
                 if parsed.drivername not in {"postgres", "postgresql", "postgresql+psycopg"}:
                     raise ValueError
-            except Exception:
+            except (ArgumentError, ValueError):
                 raise ValueError("DATABASE_URL must be a PostgreSQL connection URL") from None
         return self
 

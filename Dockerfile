@@ -12,7 +12,7 @@ FROM python:3.12-slim-bookworm AS python-build
 COPY --from=uv /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev
 RUN .venv/bin/python -c "from skinder.retrieval import prepare_model; prepare_model('/opt/skinder/models/e5-small')"
@@ -28,6 +28,7 @@ RUN apt-get update \
     && groupadd --system skinder \
     && useradd --system --gid skinder --home-dir /app skinder
 WORKDIR /app
+COPY --chown=skinder:skinder LICENSE ./LICENSE
 COPY --from=python-build --chown=skinder:skinder /app/.venv /app/.venv
 COPY --from=python-build --chown=skinder:skinder /app/src /app/src
 COPY --from=python-build --chown=skinder:skinder /opt/skinder/models/e5-small /opt/skinder/models/e5-small

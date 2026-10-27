@@ -117,3 +117,7 @@ For development outside containers, configuration, Railway deployment, and test 
 | [Worker](src/skinder/worker.py) and [jobs](src/skinder/jobs.py) | Matching orchestration, recovery, cancellation, and budget accounting. |
 | [Retrieval](src/skinder/retrieval.py) and [sources](src/skinder/sources.py) | Candidate selection and bounded source evidence. |
 | [Catalog sync](src/skinder/sync.py) | SkillsMP imports, request budgets, and resumable checkpoints. |
+
+## License
+
+Skinder is licensed under the [MIT License](LICENSE). Third-party dependencies, fonts, models, and skill content remain subject to their respective licenses and terms.

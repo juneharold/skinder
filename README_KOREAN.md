@@ -117,3 +117,7 @@ docker compose --profile ops run --rm ingest
 | [워커](src/skinder/worker.py), [작업 관리](src/skinder/jobs.py) | 추천 처리 흐름, 복구, 취소, 예산 관리. |
 | [검색](src/skinder/retrieval.py), [원본 처리](src/skinder/sources.py) | 후보 선정과 크기를 제한한 근거 자료 수집. |
 | [카탈로그 동기화](src/skinder/sync.py) | SkillsMP 수집, 요청 예산, 중단 후 이어받기. |
+
+## 라이선스
+
+Skinder는 [MIT 라이선스](LICENSE)로 배포됩니다. 외부 의존성, 글꼴, 모델, 스킬 콘텐츠에는 각각의 라이선스와 이용 약관이 적용됩니다.

@@ -6,6 +6,8 @@ build-backend = "hatchling.build"
 name = "skinder"
 version = "0.1.0"
 description = "Find agent skills that fit your task and working style."
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "pydantic>=2.10,<3",

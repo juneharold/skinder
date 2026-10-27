@@ -3,7 +3,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Agent = Literal["codex", "claude-code"]
-Engine = Literal["codex", "claude-code"]
+JobStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 
 
 class Model(BaseModel):
@@ -93,7 +93,6 @@ class Feedback(FeedbackInput):
 class MatchInput(Model):
     task: str = Field(min_length=3, max_length=4000)
     agent: Agent
-    engine: Engine = "codex"
     session_id: str | None = None
 
     @field_validator("task", mode="before")
@@ -103,12 +102,20 @@ class MatchInput(Model):
         return value.strip() if isinstance(value, str) else value
 
 
+class Job(Model):
+    id: str
+    status: JobStatus
+    model: str
+    error_code: str | None = None
+    error: str | None = None
+
+
 class MatchSession(Model):
     id: str
     task: str
     agent: Agent
-    engine: Engine
-    status: Literal["pending", "running", "completed", "failed", "cancelled"]
+    status: JobStatus
+    latest_job: Job
     recommendations: list[Recommendation]
     feedback: list[Feedback]
     error: str | None
@@ -116,17 +123,22 @@ class MatchSession(Model):
     updated_at: str
 
 
-class EngineStatus(Model):
-    installed: bool
-    authenticated: bool
-    ready: bool
-    message: str
+class User(Model):
+    id: str
+    login: str
+    avatar_url: str | None = None
+
+
+class AuthState(Model):
+    user: User | None = None
+    csrf_token: str | None = None
 
 
 class Health(Model):
     status: Literal["ok"] = "ok"
     catalog_count: int
-    engines: dict[Engine, EngineStatus]
+    model: str
+    matching_available: bool = False
     indexed_count: int = 0
     retrieval_mode: Literal["hybrid", "keyword-only"] = "keyword-only"
     sync_status: dict | None = None

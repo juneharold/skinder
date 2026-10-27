@@ -1,66 +1,57 @@
-"""SQLite engine configuration and versioned database initialization."""
-
-from pathlib import Path
-from typing import Literal
+"""Connection pools and explicit migrations. Opening a store never changes schema."""
+import re
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import URL, create_engine, event
-from sqlalchemy.engine import Engine
+from sqlalchemy import create_engine, make_url, text
+from sqlalchemy.orm import sessionmaker
 
-DatabaseKind = Literal["user", "catalog"]
-
-
-def sqlite_engine(url: URL) -> Engine:
-    # Pooled connections can be checked out by different workers; each operation owns its session.
-    engine = create_engine(url, connect_args={"timeout": 30, "check_same_thread": False})
-
-    @event.listens_for(engine, "connect")
-    def configure_connection(dbapi_connection, _record):
-        # Explicit BEGIN also makes SQLite schema changes transactional on Python 3.11.
-        dbapi_connection.isolation_level = None
-        cursor = dbapi_connection.cursor()
-        try:
-            # Readers should remain usable while background sync or user writes hold the writer.
-            cursor.execute("PRAGMA journal_mode=WAL")
-            # SQLite requires foreign-key enforcement on every new connection.
-            cursor.execute("PRAGMA foreign_keys=ON")
-        finally:
-            cursor.close()
-
-    @event.listens_for(engine, "begin")
-    def begin(connection):
-        mode = connection.get_execution_options().get("sqlite_begin_mode", "DEFERRED")
-        if mode not in {"DEFERRED", "IMMEDIATE"}:
-            raise ValueError("Unsupported SQLite transaction mode")
-        connection.exec_driver_sql(f"BEGIN {mode}")
-
-    return engine
+from .settings import Settings, load_settings
 
 
-def migration_config(kind: DatabaseKind) -> Config:
-    if kind not in {"user", "catalog"}:
-        raise ValueError("Database kind must be 'user' or 'catalog'")
+class Database:
+    def __init__(self, settings: Settings, *, schema: str | None = None):
+        settings.require("migrate")
+        url = make_url(settings.database_url.get_secret_value()).set(drivername="postgresql+psycopg")
+        args = {"connect_timeout": settings.db_connect_timeout_seconds}
+        if schema is not None:
+            if not re.fullmatch(r"test_[a-f0-9]+", schema):
+                raise ValueError("Only isolated test schemas may override search_path")
+            args["options"] = f"-csearch_path={schema},public"
+        self.schema = schema
+        self.engine = create_engine(url, pool_pre_ping=True, pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow, pool_timeout=settings.db_pool_timeout_seconds,
+            connect_args=args, hide_parameters=True)
+        self.db_sessions = sessionmaker(self.engine, expire_on_commit=False)
+
+    def check_schema(self) -> None:
+        with self.engine.connect() as connection:
+            version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            if version != "0001_hosted":
+                raise RuntimeError("Database schema is not current. Run skinder-migrate.")
+
+    def close(self) -> None:
+        self.engine.dispose()
+
+
+def migration_config() -> Config:
     config = Config()
-    config.set_main_option("script_location", f"skinder:migrations/{kind}")
+    config.set_main_option("script_location", "skinder:migrations")
     return config
 
 
-def create_database(path: str | Path, kind: DatabaseKind) -> Engine:
-    config = migration_config(kind)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    engine = sqlite_engine(URL.create("sqlite", database=str(path)))
+def migrate(database: Database) -> None:
+    config = migration_config()
+    with database.engine.begin() as connection:
+        connection.execute(text("SELECT pg_advisory_xact_lock(73519001)"))
+        config.attributes["connection"] = connection
+        config.attributes["schema"] = database.schema
+        command.upgrade(config, "head")
+
+
+def main() -> None:
+    database = Database(load_settings("migrate"))
     try:
-        # Reserve the writer before Alembic reads its version so concurrent opens cannot race.
-        with (
-            engine.connect().execution_options(sqlite_begin_mode="IMMEDIATE") as connection,
-            connection.begin(),
-        ):
-            # Schema changes and their version marker must commit or roll back together.
-            config.attributes["connection"] = connection
-            command.upgrade(config, "head")
-    except BaseException:
-        engine.dispose()
-        raise
-    return engine
+        migrate(database)
+    finally:
+        database.close()

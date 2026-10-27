@@ -8,6 +8,9 @@ from sqlalchemy.orm import sessionmaker
 
 from .settings import Settings, load_settings
 
+MIGRATION_LOCK = 73519001
+CATALOG_MAINTENANCE_LOCK = 73519002
+JOB_ADMISSION_LOCK = 73519003
 
 class Database:
     def __init__(self, settings: Settings, *, schema: str | None = None):
@@ -43,7 +46,7 @@ def migration_config() -> Config:
 def migrate(database: Database) -> None:
     config = migration_config()
     with database.engine.begin() as connection:
-        connection.execute(text("SELECT pg_advisory_xact_lock(73519001)"))
+        connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": MIGRATION_LOCK})
         config.attributes["connection"] = connection
         config.attributes["schema"] = database.schema
         command.upgrade(config, "head")

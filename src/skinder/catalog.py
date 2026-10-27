@@ -76,11 +76,12 @@ class CatalogStore:
                 return "unchanged"
             if previous and previous.data == payload and previous.source_updated_at == source_updated_at:
                 return "unchanged"
-            values = dict(id=skill.id, data=payload, provenance=skill.provenance, name=skill.name,
-                          description=skill.description, tags=" ".join(skill.tags), author=skill.author,
-                          category=skill.category, compatibility=skill.compatibility,
-                          retrieval_text=content, text_hash=hashlib.sha256(content.encode()).hexdigest(),
-                          source_updated_at=source_updated_at)
+            values = {"id": skill.id, "data": payload, "provenance": skill.provenance,
+                      "name": skill.name, "description": skill.description, "tags": " ".join(skill.tags),
+                      "author": skill.author, "category": skill.category,
+                      "compatibility": skill.compatibility, "retrieval_text": content,
+                      "text_hash": hashlib.sha256(content.encode()).hexdigest(),
+                      "source_updated_at": source_updated_at}
             statement = insert(CatalogSkillRecord).values(**values)
             session.execute(statement.on_conflict_do_update(index_elements=["id"],
                 set_={key: getattr(statement.excluded, key) for key in values if key != "id"}))

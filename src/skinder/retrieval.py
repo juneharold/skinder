@@ -242,7 +242,7 @@ class HybridRetriever:
                         self._model_failed = True
                         raise
                 semantic = self._semantic(query, agent, excluded)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - semantic failures retain keyword retrieval
                 # Exception bodies can contain SQL parameters or private task text.
                 logger.warning("Semantic search unavailable (%s)", type(exc).__name__)
         scores, skills = {}, {}

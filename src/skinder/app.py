@@ -4,22 +4,35 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from uuid import UUID
+from typing import Annotated
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.sessions import SessionMiddleware
 
 from .auth import AuthService, create_auth_router
 from .catalog import CatalogStore
 from .database import Database
 from .jobs import JobError, JobStore
-from .models import (Catalog, Error, FeedbackInput, FeedbackResult, Health, MatchInput,
-                     MatchSession, Profile, Saved, Skill, User)
+from .models import (
+    Catalog,
+    Error,
+    FeedbackInput,
+    FeedbackResult,
+    Health,
+    MatchInput,
+    MatchSession,
+    Profile,
+    Saved,
+    Skill,
+    User,
+)
 from .orm import FeedbackRecord, WorkerRecord
 from .retrieval import HybridRetriever
 from .settings import Settings, load_settings
@@ -102,7 +115,7 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
     async def ready():
         try:
             await work.run(database.check_schema)
-        except Exception:
+        except (SQLAlchemyError, RuntimeError):
             return JSONResponse({'status': 'unavailable'}, 503)
         return {'status': 'ok'}
 
@@ -132,31 +145,31 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
         return skill
 
     @app.get('/api/profile', response_model=Profile)
-    async def get_profile(user: User = Depends(auth.require_user)):
+    async def get_profile(user: Annotated[User, Depends(auth.require_user)]):
         return await work.run(users.get_profile, user.id)
 
     @app.put('/api/profile', response_model=Profile)
-    async def put_profile(profile: Profile, user: User = Depends(auth.require_csrf)):
+    async def put_profile(profile: Profile, user: Annotated[User, Depends(auth.require_csrf)]):
         return await work.run(users.set_profile, user.id, profile)
 
     @app.post('/api/matches', response_model=MatchSession, status_code=202)
-    async def start_match(value: MatchInput, user: User = Depends(auth.require_csrf),
+    async def start_match(value: MatchInput, user: Annotated[User, Depends(auth.require_csrf)],
                           idempotency_key: str = Header(min_length=1, max_length=128)):
         return await work.run(jobs.submit, user.id, value, idempotency_key)
 
     @app.get('/api/matches/current', response_model=MatchSession | None)
-    async def current_match(user: User = Depends(auth.require_user)):
+    async def current_match(user: Annotated[User, Depends(auth.require_user)]):
         return await work.run(users.get_current_match_session, user.id)
 
     @app.get('/api/matches/{session_id}', response_model=MatchSession)
-    async def get_match(session_id: UUID, user: User = Depends(auth.require_user)):
+    async def get_match(session_id: UUID, user: Annotated[User, Depends(auth.require_user)]):
         result = await work.run(users.get_match_session, user.id, str(session_id))
         if result is None:
             raise HTTPException(404, 'Task session not found.')
         return result
 
     @app.post('/api/jobs/{job_id}/cancel', response_model=MatchSession)
-    async def cancel_match(job_id: UUID, user: User = Depends(auth.require_csrf)):
+    async def cancel_match(job_id: UUID, user: Annotated[User, Depends(auth.require_csrf)]):
         return await work.run(jobs.cancel, user.id, str(job_id))
 
     def saved_collection(user_id: str):
@@ -165,7 +178,7 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
                             if (skill := catalog.get(row['skill_id'])) is not None])
 
     @app.post('/api/feedback', response_model=FeedbackResult)
-    async def add_feedback(value: FeedbackInput, user: User = Depends(auth.require_csrf)):
+    async def add_feedback(value: FeedbackInput, user: Annotated[User, Depends(auth.require_csrf)]):
         def save():
             if users.get_match_session(user.id, value.session_id) is None:
                 raise HTTPException(404, 'Task session not found.')
@@ -177,7 +190,7 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
         return await work.run(save)
 
     @app.delete('/api/feedback/{feedback_id}', response_model=Saved)
-    async def undo_feedback(feedback_id: UUID, user: User = Depends(auth.require_csrf)):
+    async def undo_feedback(feedback_id: UUID, user: Annotated[User, Depends(auth.require_csrf)]):
         def undo():
             with database.db_sessions() as session:
                 owned = session.scalar(select(FeedbackRecord.id).where(
@@ -192,11 +205,11 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
         return await work.run(undo)
 
     @app.get('/api/saved', response_model=Saved)
-    async def get_saved(user: User = Depends(auth.require_user)):
+    async def get_saved(user: Annotated[User, Depends(auth.require_user)]):
         return await work.run(saved_collection, user.id)
 
     @app.put('/api/saved/{skill_id}', response_model=Saved)
-    async def put_saved(skill_id: str, user: User = Depends(auth.require_csrf)):
+    async def put_saved(skill_id: str, user: Annotated[User, Depends(auth.require_csrf)]):
         def save():
             if catalog.get(skill_id) is None:
                 raise HTTPException(404, 'Skill not found.')
@@ -205,7 +218,7 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
         return await work.run(save)
 
     @app.delete('/api/saved/{skill_id}', response_model=Saved)
-    async def remove_saved(skill_id: str, user: User = Depends(auth.require_csrf)):
+    async def remove_saved(skill_id: str, user: Annotated[User, Depends(auth.require_csrf)]):
         def remove():
             users.remove_bookmark(user.id, skill_id)
             return saved_collection(user.id)

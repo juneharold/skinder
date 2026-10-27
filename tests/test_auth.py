@@ -60,7 +60,7 @@ def login(client):
     response = client.get("/api/auth/github")
     assert response.status_code == 302
     query = parse_qs(urlsplit(response.headers["location"]).query)
-    return query, client.get("/api/auth/github/callback", params={"state": query["state"][0], "code": "test-code"})
+    return query, client.get("/api/auth/callback", params={"state": query["state"][0], "code": "test-code"})
 
 
 def test_oauth_state_pkce_and_opaque_login_session(auth, client, db, settings):
@@ -69,7 +69,7 @@ def test_oauth_state_pkce_and_opaque_login_session(auth, client, db, settings):
     assert response.status_code == 303
     assert query["scope"] == ["read:user"]
     assert query["code_challenge_method"] == ["S256"]
-    assert query["redirect_uri"] == [settings.app_origin + "/api/auth/github/callback"]
+    assert query["redirect_uri"] == [settings.app_origin + "/api/auth/callback"]
     exchange = parse_qs(calls[0].content.decode())
     assert exchange["client_id"] == [settings.github_client_id]
     verifier = exchange["code_verifier"][0]
@@ -98,7 +98,7 @@ def test_callback_rejects_missing_or_incorrect_state_before_http(auth, client, d
     params = {"code": "sensitive-code"}
     if state:
         params["state"] = state
-    response = client.get("/api/auth/github/callback", params=params)
+    response = client.get("/api/auth/callback", params=params)
     assert response.status_code == 400
     assert calls == []
     assert client.get("/api/auth/me").json()["user"] is None
@@ -114,7 +114,7 @@ def test_callback_rejects_expired_flow(auth, client, monkeypatch):
     import skinder.auth as module
     now = module.time()
     monkeypatch.setattr(module, "time", lambda: now + 601)
-    assert client.get("/api/auth/github/callback", params={"state": state, "code": "code"}).status_code == 400
+    assert client.get("/api/auth/callback", params={"state": state, "code": "code"}).status_code == 400
     assert calls == []
 
 
@@ -128,7 +128,7 @@ def test_oauth_failures_do_not_create_session(auth, client, failure):
     params = {"state": state, "code": "sensitive-code"}
     if failure == "denied":
         params.update(error="access_denied", error_description="sensitive-provider-details")
-    response = client.get("/api/auth/github/callback", params=params)
+    response = client.get("/api/auth/callback", params=params)
     assert response.status_code == 400
     assert "sensitive" not in response.text and "secret-provider-token" not in response.text
     assert client.get("/api/auth/me").json()["user"] is None

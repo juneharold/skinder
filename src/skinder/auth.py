@@ -118,12 +118,12 @@ def create_auth_router(auth: AuthService) -> APIRouter:
     async def github_login(request: Request):
         request.session.clear()
         response = await auth.github.authorize_redirect(request,
-            auth.settings.app_origin + "/api/auth/github/callback")
+            auth.settings.app_origin + "/api/auth/callback")
         request.session["oauth_started_at"] = time()
         response.headers["Cache-Control"] = "no-store"
         return response
 
-    @router.get("/github/callback")
+    @router.get("/callback")
     async def github_callback(request: Request):
         try:
             started_at = request.session.get("oauth_started_at", 0)

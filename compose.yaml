@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg18
+    environment:
+      POSTGRES_DB: skinder
+      POSTGRES_USER: skinder
+      POSTGRES_PASSWORD: skinder
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skinder -d skinder"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  migrate:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://skinder:skinder@postgres:5432/skinder
+    command: ["skinder-migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  web:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://skinder:skinder@postgres:5432/skinder
+      SKINDER_HOST: 0.0.0.0
+      PORT: 8742
+    command: ["skinder"]
+    ports:
+      - "127.0.0.1:8742:8742"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://skinder:skinder@postgres:5432/skinder
+    command: ["skinder-worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ingest:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://skinder:skinder@postgres:5432/skinder
+    command: ["best-effort-full-sync"]
+    profiles: [ops]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:

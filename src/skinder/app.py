@@ -2,7 +2,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID
 from urllib.parse import urlsplit
@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from starlette.middleware.sessions import SessionMiddleware
 
 from .auth import AuthService, create_auth_router
@@ -20,10 +20,9 @@ from .database import Database
 from .jobs import JobError, JobStore
 from .models import (Catalog, Error, FeedbackInput, FeedbackResult, Health, MatchInput,
                      MatchSession, Profile, Saved, Skill, User)
-from .orm import WorkerRecord
+from .orm import FeedbackRecord, WorkerRecord
 from .retrieval import HybridRetriever
 from .settings import Settings, load_settings
-from .sync import sync_status
 from .user import UserStore
 from .work import SyncWork, wait_for_work
 
@@ -180,6 +179,11 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
     @app.delete('/api/feedback/{feedback_id}', response_model=Saved)
     async def undo_feedback(feedback_id: UUID, user: User = Depends(auth.require_csrf)):
         def undo():
+            with database.db_sessions() as session:
+                owned = session.scalar(select(FeedbackRecord.id).where(
+                    FeedbackRecord.id == str(feedback_id), FeedbackRecord.user_id == user.id))
+            if owned is None:
+                raise HTTPException(404, 'Feedback not found.')
             try:
                 users.undo_feedback(user.id, str(feedback_id))
             except ValueError as exc:

@@ -9,17 +9,18 @@ from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 from sqlalchemy import select
-from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.dialects.postgresql import insert
 
 from .catalog import CatalogStore
 from .models import Skill
 from .orm import CatalogSkillRecord, SourceCacheRecord
 from .work import run_sync
+from .settings import Settings
 
 MAX_FILE_BYTES = 256 * 1024
 # Cached downloads may be larger than the excerpts included in matching requests.
 MAX_EXCERPT = 4000
-MAX_PROMPT_CHARS = 200_000
+MAX_PROMPT_BYTES = 65536
 CACHE_SECONDS = 7 * 24 * 60 * 60
 MATCH_FIELDS = {
     "id", "name", "description", "category", "requirements", "tags", "workflow",
@@ -74,14 +75,15 @@ def match_metadata(skill: Skill) -> dict[str, Any]:
 
 def bounded_request(
     task: str, profile: dict[str, Any], feedback: Sequence[Mapping[str, Any]],
-    candidates: Sequence[dict[str, Any]],
+    candidates: Sequence[dict[str, Any]], settings: Settings | None = None,
 ) -> dict[str, Any]:
+    settings = settings or Settings(_env_file=None)
     request = {
         "task": task, "profile": profile, "recent_feedback": list(feedback),
         "eligible_skills": [dict(item) for item in candidates[:40]],
     }
     # Trim source text, then oldest feedback, then lowest-ranked candidates; keep task/preferences.
-    while len(json.dumps(request, ensure_ascii=False)) > MAX_PROMPT_CHARS:
+    while len(json.dumps(request, ensure_ascii=False).encode("utf-8")) > settings.max_prompt_bytes:
         with_source = [item for item in request["eligible_skills"] if item.get("source_excerpt")]
         if with_source:
             longest = max(with_source, key=lambda item: len(item["source_excerpt"]))
@@ -98,12 +100,15 @@ def bounded_request(
 
 class SourceEnricher:
     def __init__(
-        self, catalog: CatalogStore, *, transport: httpx.AsyncBaseTransport | None = None,
-        timeout: float = 20,
+        self, catalog: CatalogStore, settings: Settings | None = None, *, transport: httpx.AsyncBaseTransport | None = None,
+        timeout: float | None = None,
     ) -> None:
         self.catalog = catalog
         self.transport = transport
-        self.timeout = timeout
+        self.settings = settings or catalog.settings
+        self.timeout = timeout or self.settings.source_enrichment_timeout_seconds
+        # One enricher is shared by all jobs in a worker.
+        self.semaphore = asyncio.Semaphore(self.settings.source_concurrency)
 
     def cached(self, skill: Skill) -> tuple[CachedSource | None, str | None]:
         with self.catalog.db_sessions() as session:
@@ -135,23 +140,21 @@ class SourceEnricher:
                 )},
             ))
 
-    @staticmethod
     def with_content(
-        item: dict[str, Any], row: SourceContent, status: str,
+        self, item: dict[str, Any], row: SourceContent, status: str,
     ) -> dict[str, Any]:
         # Downloaded instructions remain reference text; they do not become reviewed metadata.
         return {
-            **item, "source_status": status, "source_excerpt": row["content"][:MAX_EXCERPT],
-            "source_truncated": len(row["content"]) > MAX_EXCERPT,
+            **item, "source_status": status, "source_excerpt": row["content"][:self.settings.source_excerpt_chars],
+            "source_truncated": len(row["content"]) > self.settings.source_excerpt_chars,
             "source_fetched_at": row["fetched_at"],
         }
 
     async def enrich(self, skills: Sequence[Skill]) -> list[dict[str, Any]]:
         results = [match_metadata(skill) for skill in skills]
-        semaphore = asyncio.Semaphore(4)
         # A redirect must not move an otherwise allowed download to another host.
         async with httpx.AsyncClient(
-            timeout=10, transport=self.transport, follow_redirects=False,
+            timeout=self.settings.source_http_timeout_seconds, transport=self.transport, follow_redirects=False,
             headers={"User-Agent": "Skinder-source-reader/1.0"},
         ) as client:
             async def read(index: int, skill: Skill) -> None:
@@ -164,7 +167,7 @@ class SourceEnricher:
                 same_source = cached and cached["source_url"] == skill.source_url
                 # Age still forces refreshes when the provider supplies no update timestamp.
                 fresh = same_source and cached["source_updated_at"] == stamp and (
-                    time.time() - cached["fetched_at"] < CACHE_SECONDS
+                    time.time() - cached["fetched_at"] < self.settings.source_cache_ttl_seconds
                 )
                 if fresh:
                     results[index] = self.with_content(item, cached, "cached")
@@ -179,13 +182,13 @@ class SourceEnricher:
                     url = raw_skill_url(skill)
                     if not url:
                         return
-                    async with semaphore, client.stream("GET", url) as response:
+                    async with self.semaphore, client.stream("GET", url) as response:
                         response.raise_for_status()
                         content = bytearray()
                         # Reject oversized instructions without buffering the entire response.
                         async for chunk in response.aiter_bytes():
                             content.extend(chunk)
-                            if len(content) > MAX_FILE_BYTES:
+                            if len(content) > self.settings.source_max_bytes:
                                 return
                         text = content.decode("utf-8-sig")
                     if not text.strip():
@@ -193,7 +196,7 @@ class SourceEnricher:
                 except (httpx.HTTPError, UnicodeError, ValueError):
                     return
                 fetched_at = time.time()
-                # SQLite waits stay off the event loop; run_sync drains writes on cancellation.
+                # Database waits stay off the event loop; run_sync drains writes on cancellation.
                 await run_sync(self._cache, skill, stamp, fetched_at, text)
                 results[index] = self.with_content(
                     item, {"content": text, "fetched_at": fetched_at}, "fetched"

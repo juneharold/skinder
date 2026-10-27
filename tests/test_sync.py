@@ -65,11 +65,6 @@ def run(catalog, provider, **kwargs):
 
 
 @pytest.fixture
-def catalog(tmp_path):
-    return CatalogStore(tmp_path / "catalog.sqlite3")
-
-
-@pytest.fixture
 def clock(monkeypatch):
     clock = Clock()
     monkeypatch.setattr("skinder.sync.time.time", clock.time)
@@ -122,8 +117,8 @@ def test_discovery_bounds_unique_pages_but_keeps_all_filters(catalog, monkeypatc
         sync.discover()
 
     with catalog.db_sessions() as session:
-        state = json.loads(session.get(SyncRunRecord, 1).data)
-        partitions = [json.loads(data) for data in session.scalars(select(SyncPartitionRecord.data))]
+        state = session.get(SyncRunRecord, 1).data
+        partitions = [data for data in session.scalars(select(SyncPartitionRecord.data))]
     assert state["discovery_pending"] == ["/categories/queued", "/categories/a"]
     assert state["discovery_seen"] == ["/categories/seen", "/categories"]
     assert state["discovered"]["category"] == ["a", "b", "queued", "seen"]
@@ -147,7 +142,7 @@ def test_expansion_waits_for_first_missing_dimension(catalog, filters, missing, 
     sync.expand(data)
 
     with catalog.db_sessions() as session:
-        queued = [json.loads(row)["filters"]
+        queued = [row["filters"]
                   for row in session.scalars(select(SyncPartitionRecord.data))]
     assert queued == [{}]
 
@@ -155,7 +150,7 @@ def test_expansion_waits_for_first_missing_dimension(catalog, filters, missing, 
     sync.expand(data)
 
     with catalog.db_sessions() as session:
-        queued = [json.loads(row)["filters"]
+        queued = [row["filters"]
                   for row in session.scalars(select(SyncPartitionRecord.data))]
     assert len(queued) == 2
     assert {} in queued
@@ -352,7 +347,7 @@ def test_bundled_data_wins_and_alias_is_recorded(catalog):
     with catalog.db_sessions() as session:
         alias = session.get(CatalogAliasRecord, ("skillsmp", "one"))
         assert alias.skill_id == bundled.id
-        assert json.loads(alias.payload)["description"] == skill_row()["description"]
+        assert alias.payload["description"] == skill_row()["description"]
 
 
 @pytest.mark.parametrize("path", ["SKILL.md", "skills/one/SKILL.md", "skills/one"])
@@ -409,7 +404,7 @@ def test_capped_expansion_only_enqueues_newly_discovered_values(catalog):
     sync.state["discovered"]["language"] = ["en"]
     key = json.dumps({"filters": {}, "sort": "stars"}, sort_keys=True)
     with catalog.db_sessions() as session:
-        data = json.loads(session.get(SyncPartitionRecord, key).data)
+        data = session.get(SyncPartitionRecord, key).data
     sync.page(key, data)
     # An unchanged expansion must do no queue writes, even on subsequent capped pages.
     original = sync.enqueue
@@ -420,7 +415,7 @@ def test_capped_expansion_only_enqueues_newly_discovered_values(catalog):
     sync.enqueue = original
     sync.add_filter("language", "ko")
     with catalog.db_sessions() as session:
-        queued = [json.loads(data) for data in session.scalars(select(SyncPartitionRecord.data))]
+        queued = [data for data in session.scalars(select(SyncPartitionRecord.data))]
     assert any(row["filters"] == {"language": "ko"} for row in queued)
     root = next(row for row in queued if row["filters"] == {} and row["sort"] == "stars")
     assert root["expanded_values"] == 2
@@ -457,6 +452,8 @@ def test_cli_exit_codes_and_indexing_after_pause(catalog, monkeypatch, tmp_path,
 
     provider = Provider(skills)
     original = module.Sync
+    monkeypatch.setattr(module, "load_settings", lambda role: catalog.settings)
+    monkeypatch.setattr(module, "Database", lambda settings: catalog.database)
     monkeypatch.setattr(module, "Sync", lambda *args, **kwargs:
                         original(*args, **kwargs, sleep=lambda _: None))
     def client(**kwargs):
@@ -469,7 +466,7 @@ def test_cli_exit_codes_and_indexing_after_pause(catalog, monkeypatch, tmp_path,
         return {"indexed_count": catalog.count()}
     monkeypatch.setitem(sys.modules, "skinder.retrieval", SimpleNamespace(index_catalog=index))
     with pytest.raises(SystemExit) as exit_info:
-        module.main(["--catalog-db-path", str(catalog.path), "--max-requests", "4"])
+        module.main(["--max-requests", "4"])
     assert exit_info.value.code == (130 if interrupted else 2)
     report = json.loads(capsys.readouterr().out)
     assert report["sync"]["status"] == "paused"
@@ -478,3 +475,20 @@ def test_cli_exit_codes_and_indexing_after_pause(catalog, monkeypatch, tmp_path,
     else:
         assert marker.read_text() == "1"
         assert report["index"]["indexed_count"] == 1
+
+
+def test_advisory_lock_excludes_other_writers_and_releases_without_transaction(catalog):
+    from sqlalchemy import text
+    from skinder.sync import writer_lock
+
+    with writer_lock(catalog):
+        with pytest.raises(RuntimeError, match="Another catalog"):
+            with writer_lock(catalog):
+                pytest.fail("Concurrent writer entered")
+        with catalog.engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM pg_stat_activity a JOIN pg_locks l ON a.pid=l.pid "
+                "WHERE l.locktype='advisory' AND l.objid=73519002 "
+                "AND a.state = 'idle in transaction'")) == 0
+    with writer_lock(catalog):
+        catalog.upsert(import_skill(skill_row()))
+    assert catalog.count() == 1

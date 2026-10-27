@@ -22,8 +22,8 @@ def example_skill(number, **changes):
     return Skill.model_validate(values)
 
 
-def test_pages_search_and_eligibility_use_persisted_catalog(tmp_path):
-    catalog_store = CatalogStore(tmp_path / "catalog.sqlite3")
+def test_pages_search_and_eligibility_use_persisted_catalog(db):
+    catalog_store = CatalogStore(db)
     for number in range(65):
         catalog_store.upsert(example_skill(number, description="PostgreSQL backups"))
     catalog_store.upsert(example_skill(70, description="Draw illustrations", category="Art"))
@@ -42,13 +42,13 @@ def test_pages_search_and_eligibility_use_persisted_catalog(tmp_path):
     matches = catalog_store.keyword_search("PostgreSQL", agent="codex", excluded=["example-1"], limit=3)
     assert len(matches) == 3
     assert not {"example-0", "example-1"} & {s.id for s in matches}
-    assert [s.id for s in CatalogStore(catalog_store.path).eligible(
+    assert [s.id for s in CatalogStore(db).eligible(
         ["example-0", "example-1", "example-2"], agent="codex", excluded=["example-1"]
     )] == ["example-2"]
 
 
-def test_repeat_import_updates_search_and_preserves_bundled_evidence(tmp_path):
-    catalog_store = CatalogStore(tmp_path / "catalog.sqlite3")
+def test_repeat_import_updates_search_and_preserves_bundled_evidence(db):
+    catalog_store = CatalogStore(db)
     original = example_skill(1, description="Apple orchards")
     assert catalog_store.upsert(original, provider_id="upstream", raw={"stars": 1}) == "added"
     assert catalog_store.upsert(original, provider_id="upstream", raw={"stars": 2}) == "unchanged"
@@ -66,8 +66,8 @@ def test_repeat_import_updates_search_and_preserves_bundled_evidence(tmp_path):
         assert session.scalar(select(func.count()).select_from(CatalogAliasRecord)) == 1
 
 
-def test_blank_queries_list_skills_but_punctuation_only_queries_do_not(tmp_path):
-    catalog_store = CatalogStore(tmp_path / "catalog.sqlite3")
+def test_blank_queries_list_skills_but_punctuation_only_queries_do_not(db):
+    catalog_store = CatalogStore(db)
     catalog_store.upsert(example_skill(1, category="Art"))
     catalog_store.upsert(example_skill(2, category="Development"))
 
@@ -93,20 +93,20 @@ def test_ids_match_bundled_directory_identity_and_survive_revision():
     )
 
 
-def test_keyword_exclusions_are_bounded_and_do_not_leak_between_sessions(tmp_path):
-    catalog_store = CatalogStore(tmp_path / "catalog.sqlite3")
+def test_keyword_exclusions_are_bounded_and_do_not_leak_between_sessions(db):
+    catalog_store = CatalogStore(db)
     catalog_store.upsert(example_skill(1, description="Database backups"))
     excluded = [f"missing-{number}" for number in range(40_000)] + ["example-1"]
     assert catalog_store.keyword_search("backups", excluded=excluded) == []
     assert [skill.id for skill in catalog_store.keyword_search("backups")] == ["example-1"]
     catalog_store.close()
-    reopened = CatalogStore(catalog_store.path)
+    reopened = CatalogStore(db)
     assert reopened.get("example-1").description == "Database backups"
     assert [skill.id for skill in reopened.keyword_search("backups")] == ["example-1"]
 
 
-def test_concurrent_imports_keep_one_skill_and_all_aliases(tmp_path):
-    catalog_store = CatalogStore(tmp_path / "catalog.sqlite3")
+def test_concurrent_imports_keep_one_skill_and_all_aliases(db):
+    catalog_store = CatalogStore(db)
     skill = example_skill(1, description="Database backups")
     ready = Barrier(8)
 
@@ -123,3 +123,27 @@ def test_concurrent_imports_keep_one_skill_and_all_aliases(tmp_path):
     assert [result.id for result in catalog_store.keyword_search("backups")] == [skill.id]
     with catalog_store.db_sessions() as session:
         assert session.scalar(select(func.count()).select_from(CatalogAliasRecord)) == 8
+
+
+def test_unicode_words_are_literal_and_search_weights_favor_name(catalog):
+    catalog.upsert(example_skill(1, name="데이터", description="Ordinary workflow"))
+    catalog.upsert(example_skill(2, name="Other", description="데이터 analysis"))
+    assert [skill.id for skill in catalog.keyword_search("데이터 | nonexistent")] == [
+        "example-1", "example-2"]
+    assert catalog.keyword_search("!!!") == []
+
+
+def test_concurrent_provider_import_cannot_replace_bundled_evidence(catalog):
+    ready = Barrier(2)
+    bundled = example_skill(1, provenance="bundled", workflow=["Reviewed instructions"])
+    imported = example_skill(1, description="Provider metadata")
+
+    def write(skill):
+        ready.wait()
+        catalog.upsert(skill, provider_id="listing" if skill.provenance == "skillsmp" else None)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        list(workers.map(write, [bundled, imported]))
+    assert catalog.get(bundled.id) == bundled
+    with catalog.db_sessions() as session:
+        assert session.get(CatalogAliasRecord, ("skillsmp", "listing")).skill_id == bundled.id

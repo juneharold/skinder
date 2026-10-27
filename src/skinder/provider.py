@@ -58,8 +58,8 @@ def amount(value) -> Decimal:
         raise ProviderError("pricing_unavailable") from None
 
 
-def build_request(data: dict, model: str, settings: Settings) -> dict:
-    request = {
+def _request_payload(data: dict, model: str, settings: Settings) -> dict:
+    return {
         "model": model,
         "messages": [{"role": "system", "content": MATCH_INSTRUCTIONS},
                      {"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
@@ -68,6 +68,14 @@ def build_request(data: dict, model: str, settings: Settings) -> dict:
             "name": "skill_recommendations", "strict": True,
             "schema": MatchResult.model_json_schema()}},
     }
+
+
+def request_size(data: dict, model: str, settings: Settings) -> int:
+    return len(json.dumps(_request_payload(data, model, settings), ensure_ascii=False).encode())
+
+
+def build_request(data: dict, model: str, settings: Settings) -> dict:
+    request = _request_payload(data, model, settings)
     if len(json.dumps(request, ensure_ascii=False).encode()) > settings.max_prompt_bytes:
         raise ProviderError("prompt_too_large")
     return request

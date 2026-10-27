@@ -492,3 +492,18 @@ def test_advisory_lock_excludes_other_writers_and_releases_without_transaction(c
     with writer_lock(catalog):
         catalog.upsert(import_skill(skill_row()))
     assert catalog.count() == 1
+
+
+def test_writer_lock_does_not_use_the_only_catalog_pool_slot(db, settings):
+    from skinder.database import Database
+    from skinder.sync import writer_lock
+
+    settings = settings.model_copy(update={"db_pool_size": 1, "db_pool_timeout_seconds": 0.2})
+    database = Database(settings, schema=db.schema)
+    catalog = CatalogStore(database, settings)
+    try:
+        with writer_lock(catalog):
+            catalog.upsert(import_skill(skill_row()))
+            assert catalog.count() == 1
+    finally:
+        database.close()

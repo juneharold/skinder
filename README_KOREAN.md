@@ -1,8 +1,10 @@
 # Skinder
 
+English Readme: [README.md](README.md)
+
 **내 작업과 일하는 방식에 맞는 에이전트 스킬을 찾아보세요.**
 
-[서비스 사용하기](https://web-production-49e9e.up.railway.app/) · [English](README.md) · [개발 가이드](docs/development.md)
+서비스 이용: https://web-production-49e9e.up.railway.app
 
 Skinder는 개발자가 자신에게 맞는 스킬을 찾도록 돕는 웹 앱입니다. 스킬은 Codex나 Claude Code 같은 코딩 에이전트가 활용하는 재사용 가능한 지침과 작업 절차입니다. 지금 하려는 일을 설명하면 추천 이유와 함께 스킬을 살펴보고, 사용해 보고 싶은 스킬을 저장할 수 있습니다.
 

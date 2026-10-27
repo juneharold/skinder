@@ -1,8 +1,10 @@
 # Skinder
 
+한국어 Readme: [README_KOREAN.md](README_KOREAN.md)
+
 **Find agent skills for your task and your way of working.**
 
-[Live demo](https://web-production-49e9e.up.railway.app/) · [한국어](README_KOREAN.md) · [Development guide](docs/development.md)
+Access it here: https://web-production-49e9e.up.railway.app
 
 Skinder helps developers discover skills: reusable instructions and workflows for coding agents such as Codex and Claude Code. Describe what you are working on, review recommendations with explanations, and save the skills you want to try.
 

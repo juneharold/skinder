@@ -353,8 +353,8 @@ describe("skill discovery", () => {
 
     const search = await screen.findByRole("textbox", { name: "Search skills" });
     expect(search).toHaveValue("Clear");
+    expect(await screen.findByRole("heading", { name: "Clear Writing" })).toBeVisible();
     expect(screen.getByLabelText("Category")).toHaveValue("Writing");
-    expect(screen.getByRole("heading", { name: "Clear Writing" })).toBeVisible();
 
     await user.click(screen.getByRole("link", { name: /^Saved/ }));
     expect(screen.getByRole("link", { name: /^Saved/ })).toHaveAttribute("aria-current", "page");

@@ -386,16 +386,18 @@ function AccountApp({ auth }: { auth: ReturnType<typeof useAuth> }) {
             </div>
           )}
         {!auth.user && view !== "explore" ? (
-          <section className="welcome-layout">
+          <section className="welcome-layout welcome-sign-in">
             <div className="welcome-intro">
               <h1>{view === "saved" ? "Your saved skills" : "Find skills for your task"}</h1>
               <p>{auth.loading ? "Checking sign-in…" : view === "saved"
                 ? "Sign in to see your collection."
                 : "Sign in to match skills to your task and working style."}</p>
             </div>
-            {!auth.loading && <a className="primary-button" href="/api/auth/github">Continue with GitHub</a>}
-            <a className="explore-link" href={url({ ...location, view: "explore" })}
-              onClick={(event) => { event.preventDefault(); navigate({ view: "explore" }); }}>Explore the catalog</a>
+            <div className="welcome-actions">
+              {!auth.loading && <a className="primary-button" href="/api/auth/github">Continue with GitHub</a>}
+              <a className="explore-link" href={url({ ...location, view: "explore" })}
+                onClick={(event) => { event.preventDefault(); navigate({ view: "explore" }); }}>Explore the catalog</a>
+            </div>
           </section>
         ) : view === "discover" ? (
           <DiscoverView

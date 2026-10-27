@@ -253,6 +253,19 @@ code {
   margin: 0 auto;
   padding: var(--space-3xl) 0;
 }
+.welcome-sign-in {
+  text-align: center;
+}
+.welcome-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-md) var(--space-lg);
+}
+.welcome-actions .explore-link {
+  margin-top: 0;
+}
 .welcome-intro h1 {
   font-size: var(--text-3xl);
   margin-bottom: var(--space-sm);
@@ -990,6 +1003,10 @@ kbd {
   }
   .welcome-intro p {
     margin-bottom: var(--space-lg);
+  }
+  .welcome-actions {
+    flex-direction: column;
+    gap: var(--space-xs);
   }
   .discover-layout {
     display: flex;

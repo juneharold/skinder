@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 
 from skinder.jobs import JobError, JobStore
-from skinder.models import MatchInput, MatchResult, Profile, Recommendation
+from skinder.models import FeedbackInput, MatchInput, MatchResult, Profile, Recommendation
 from skinder.orm import (
     DailyUsageRecord,
     MatchJobRecord,
@@ -20,7 +20,7 @@ from skinder.orm import (
     UserDailyUsageRecord,
     UserRecord,
 )
-from skinder.provider import Pricing, ProviderOutcome
+from skinder.provider import Pricing, ProviderError, ProviderOutcome
 from skinder.user import UserStore
 from skinder.worker import Worker
 
@@ -347,3 +347,103 @@ def test_cross_user_cancellation_and_invalid_ids_are_not_found(users, stores):
         submit(stores[1], users[1], session="invalid")
     assert error.value.status_code == 404
     assert stores[0].users.get_match_session(users[0].id, public.id).status == "queued"
+
+
+async def test_continuation_can_repeat_unreviewed_skills_but_excludes_feedback(db, users, stores):
+    store = stores[0]
+    public = submit(store, users[0])
+    job = store.claim("first")
+    initial = result("skill-a")
+    initial.result.recommendations.append(result("skill-b").result.recommendations[0])
+    store.finish(job.id, job.lease_token, initial)
+    store.users.add_feedback(users[0].id, FeedbackInput(
+        session_id=public.id, skill_id="skill-a", action="pass"))
+    submit(store, users[0], session=public.id)
+    class ReviewedRetriever:
+        def search(self, task, agent, excluded):
+            assert excluded == {"skill-a"}
+            return [{"id": "skill-b", "name": "Skill B"}]
+    await Worker(store, ReviewedRetriever(), Enricher(), Matcher(result("skill-b"))).run_once()
+    continued = store.users.get_match_session(users[0].id, public.id)
+    assert continued.status == "completed"
+    assert [item.skill_id for item in continued.recommendations] == ["skill-b"]
+
+
+@pytest.mark.parametrize("during_provider", [False, True])
+async def test_lost_authority_stops_local_work_and_never_publishes(db, users, stores, during_provider):
+    store = stores[0]
+    store.settings = store.settings.model_copy(update={"job_heartbeat_seconds": 0.01})
+    public = submit(store, users[0])
+    entered = asyncio.Event()
+    stopped = asyncio.Event()
+    async def hold():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+    class BlockingEnricher(Enricher):
+        async def enrich(self, skills):
+            if not during_provider:
+                await hold()
+            return skills
+    class BlockingMatcher(Matcher):
+        async def match(self, request, eligible):
+            self.calls += 1
+            await hold()
+    matcher = BlockingMatcher()
+    running = asyncio.create_task(Worker(store, Retriever(), BlockingEnricher(), matcher).run_once())
+    await asyncio.wait_for(entered.wait(), 2)
+    stores[1].cancel(users[0].id, public.latest_job.id)
+    await asyncio.wait_for(stopped.wait(), 2)
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    final = store.users.get_match_session(users[0].id, public.id)
+    assert final.status == "cancelled" and final.recommendations == []
+    assert matcher.calls == (1 if during_provider else 0)
+    with db.db_sessions() as session:
+        assert session.scalar(select(func.count()).select_from(ProviderAttemptRecord)) == (1 if during_provider else 0)
+
+
+async def test_expired_work_is_reaped_while_model_prices_are_unavailable(db, users, stores):
+    store = stores[0]
+    running_public = submit(store, users[0])
+    running = store.claim("dead-worker")
+    dispatch(store, running)
+    expire(db, running.id)
+    queued_public = submit(store, users[1])
+    with db.db_sessions.begin() as session:
+        job = session.get(MatchJobRecord, queued_public.latest_job.id)
+        job.created_at = session.scalar(select(func.clock_timestamp())) - timedelta(seconds=601)
+    class UnavailableMatcher(Matcher):
+        async def pricing(self, model):
+            worker.stop()
+            raise ProviderError("pricing_unavailable")
+    worker = Worker(store, Retriever(), Enricher(), UnavailableMatcher())
+    await worker.run()
+    assert store.users.get_match_session(users[0].id, running_public.id).latest_job.error_code == "provider_outcome_unknown"
+    assert store.users.get_match_session(users[1].id, queued_public.id).latest_job.error_code == "job_expired"
+
+
+def test_worker_logging_hides_transport_debug_payloads(monkeypatch, caplog):
+    import logging
+    from types import SimpleNamespace
+
+    import skinder.worker as module
+    async def fake_serve(settings):
+        logging.getLogger("openai").debug("private provider input")
+        logging.getLogger("httpx").debug("private request headers")
+        logging.getLogger("skinder.worker").info("worker status")
+    monkeypatch.setattr(module, "load_settings", lambda role: SimpleNamespace(log_level="DEBUG"))
+    monkeypatch.setattr(module, "serve", fake_serve)
+    old = {name: logging.getLogger(name).level for name in (
+        "openai", "httpx", "httpcore", "httpx2", "authlib", "sqlalchemy.engine")}
+    try:
+        with caplog.at_level(logging.DEBUG):
+            module.main()
+        assert "worker status" in caplog.text
+        assert "private provider input" not in caplog.text
+        assert "private request headers" not in caplog.text
+    finally:
+        for name, level in old.items():
+            logging.getLogger(name).setLevel(level)

@@ -1,161 +1,97 @@
+"""Provider transport tests use the real OpenAI client against a local mock transport."""
 import json
-import os
+from decimal import Decimal
 
+import httpx
 import pytest
-from test_api import feedback, match
+from openai import AsyncOpenAI
 
-from skinder.models import MatchInput
-
-
-@pytest.mark.parametrize("engine", ["codex", "claude-code"])
-@pytest.mark.parametrize("agent", ["codex", "claude-code"])
-async def test_engine_routes_independently_of_target_and_persists(backend, engine, agent):
-    selected = "request.json" if engine == "codex" else "claude-request.json"
-    other = "claude-request.json" if engine == "codex" else "request.json"
-    async with backend.client() as client:
-        session = await match(client, engine=engine, agent=agent)
-        assert session["status"] == "completed"
-        assert session["engine"] == engine and session["agent"] == agent
-        request = json.loads((backend.root / selected).read_text())
-        assert request["profile"]["agent"] == agent
-        assert all(agent in skill["compatibility"] for skill in request["eligible_skills"])
-        assert not (backend.root / other).exists()
-    async with backend.client() as client:
-        restored = (await client.get(f"/api/matches/{session['id']}")).json()
-        assert restored == session
-        assert not (backend.root / other).exists()
+from skinder.provider import LetsurMatcher, Pricing, ProviderError, build_request, parse_pricing
 
 
-def test_engine_default_preserves_codex_and_rejects_unknown_engine():
-    assert MatchInput(task="Review changes", agent="claude-code").engine == "codex"
-    with pytest.raises(ValueError):
-        MatchInput(task="Review changes", agent="codex", engine="unknown")
+def pricing_entry():
+    return {"id": "gpt-6.1-sol", "pricing": {"currency": "unit", "usage": [
+        {"component": "input", "unit": "token_input", "amount": 0.000002, "currency": "unit", "when": None},
+        {"component": "output", "unit": "token_output", "amount": 0.00001, "currency": "unit", "when": None}]}}
 
 
-@pytest.mark.parametrize("engine", ["codex", "claude-code"])
-async def test_continuation_requires_saved_engine_and_preserves_feedback(backend, engine):
-    other = "claude-code" if engine == "codex" else "codex"
-    async with backend.client() as client:
-        session = await match(client, engine=engine)
-        decision = await feedback(client, session)
-        response = await client.post("/api/matches", json={
-            "task": session["task"], "agent": session["agent"],
-            "engine": other, "session_id": session["id"],
-        })
-        assert response.status_code == 409
-        current = (await client.get(f"/api/matches/{session['id']}")).json()
-        assert current["recommendations"] == session["recommendations"]
-        assert current["feedback"] == [decision]
-        continued = await match(client, engine=engine, session_id=session["id"])
-        assert continued["engine"] == engine
-        assert continued["status"] == "completed"
-        assert continued["feedback"] == [decision]
-        assert "skill-0" not in {item["skill_id"] for item in continued["recommendations"]}
+def completion(content, **changes):
+    value = {"id": "test", "object": "chat.completion", "created": 0, "model": "gpt-6.1-sol",
+        "choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": json.dumps(content)}}],
+        "usage": {"prompt_tokens": 42, "completion_tokens": 13, "total_tokens": 55},
+        "estimated_cost": {"amount": "0.00021400", "currency": "unit"}}
+    value.update(changes)
+    return value
 
 
-@pytest.mark.parametrize("missing", ["codex", "claude"])
-async def test_missing_engine_does_not_block_other_engine(backend, monkeypatch, missing):
-    import shutil
-
-    original = shutil.which
-    monkeypatch.setattr("shutil.which", lambda name: None if name == missing else original(name))
-    absent = "codex" if missing == "codex" else "claude-code"
-    available = "claude-code" if absent == "codex" else "codex"
-    async with backend.client() as client:
-        health = (await client.get("/api/health")).json()["engines"]
-        assert set(health) == {"codex", "claude-code"}
-        assert health[absent]["installed"] is False and health[absent]["ready"] is False
-        assert health[available]["ready"] is True
-        assert (await match(client, engine=available))["status"] == "completed"
-        assert (await match(client, engine=absent))["status"] == "failed"
-        assert (await client.get("/api/catalog")).status_code == 200
+def matcher(settings, handler):
+    client = AsyncOpenAI(api_key="test", base_url="https://test.invalid/v1", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    return LetsurMatcher(settings, client=client)
 
 
-@pytest.mark.parametrize("configuration,authenticated", [
-    ({"auth": {"loggedIn": False}}, False),
-    ({"login_exit": 1}, False),
-    ({"auth_raw": "access_token=private-auth-output"}, False),
-    ({"help": "--print --output-format"}, False),
+async def test_provider_validates_output_and_preserves_exact_cost(settings):
+    def handler(request):
+        if request.url.path.endswith("models"):
+            return httpx.Response(200, json={"object": "list", "data": [pricing_entry()]})
+        return httpx.Response(200, json=completion({"recommendations": []}))
+    provider = matcher(settings, handler)
+    prices = await provider.pricing(settings.letsur_model)
+    assert prices == Pricing(Decimal("0.000002"), Decimal("0.00001"))
+    result = await provider.match(build_request({}, settings.letsur_model, settings), set())
+    assert result.result.recommendations == []
+    assert result.cost == Decimal("0.00021400")
+    assert (result.input_tokens, result.output_tokens) == (42, 13)
+    await provider.close()
+
+
+@pytest.mark.parametrize("payload", [
+    {"recommendations": [{"skill_id": "invented", "task_fit": "yes", "taste_fit": "yes", "caveat": None}]},
+    {"recommendations": [{"skill_id": "valid", "task_fit": "yes", "taste_fit": "yes", "caveat": None}] * 2},
+    {"recommendations": [], "extra": "not allowed"},
+    {"recommendations": [{"skill_id": "valid", "task_fit": 123, "taste_fit": "yes", "caveat": None}]},
 ])
-async def test_claude_health_requires_login_and_safe_capabilities(backend, configuration, authenticated):
-    backend.configure(engine="claude-code", **configuration)
-    async with backend.client() as client:
-        health = (await client.get("/api/health")).json()["engines"]
-        assert health["claude-code"]["installed"] is True
-        assert health["claude-code"]["authenticated"] is authenticated
-        assert health["claude-code"]["ready"] is False
-        assert health["codex"]["ready"] is True
-        assert "private-auth-output" not in json.dumps(health)
-        if "help" in configuration:
-            failed = await match(client, engine="claude-code")
-            assert failed["status"] == "failed"
-            assert not (backend.root / "claude-request.json").exists()
+async def test_invalid_output_still_retains_billed_usage(settings, payload):
+    provider = matcher(settings, lambda request: httpx.Response(200, json=completion(payload)))
+    result = await provider.match(build_request({}, settings.letsur_model, settings), {"valid"})
+    assert result.error_code == "invalid_recommendations"
+    assert result.result is None
+    assert result.cost == Decimal("0.00021400")
+    await provider.close()
 
 
-@pytest.mark.parametrize("envelope", [
-    None,
-    [],
-    {"type": "result", "subtype": "success", "is_error": False},
-    {"type": "result", "subtype": "error", "is_error": False, "structured_output": {"recommendations": []}},
-    {"type": "result", "subtype": "success", "is_error": True, "structured_output": {"recommendations": []}},
-    {"type": "message", "subtype": "success", "is_error": False, "structured_output": {"recommendations": []}},
-    {"type": "result", "subtype": "success", "is_error": False, "structured_output": "{\"recommendations\": []}"},
-])
-async def test_claude_rejects_unsuccessful_or_malformed_envelope(backend, envelope):
-    async with backend.client() as client:
-        first = await match(client, engine="claude-code")
-        backend.configure(engine="claude-code", envelope=envelope)
-        failed = await match(client, engine="claude-code", session_id=first["id"])
-        assert failed["status"] == "failed"
-        assert failed["recommendations"] == first["recommendations"]
+@pytest.mark.parametrize("finish", ["length", "content_filter", "tool_calls"])
+async def test_noncomplete_output_rejected(settings, finish):
+    payload = completion({"recommendations": []})
+    payload["choices"][0]["finish_reason"] = finish
+    provider = matcher(settings, lambda request: httpx.Response(200, json=payload))
+    assert (await provider.match(build_request({}, settings.letsur_model, settings), set())).error_code == "invalid_recommendations"
+    await provider.close()
 
 
-@pytest.mark.parametrize("configuration", [
-    {"raw": "private-output-not-json"},
-    {"envelope": {"type": "result", "subtype": "success", "is_error": False,
-                  "structured_output": {"recommendations": []},
-                  "result": "private-output" * 100_000}},
-    {"result": {"recommendations": [{"skill_id": "skill-0", "task_fit": "Task",
-                                      "taste_fit": "Style", "caveat": "x" * 100_001}]}},
-    {"result": {"recommendations": [{"skill_id": "skill-0", "task_fit": "Task",
-                                      "taste_fit": "Style", "caveat": "가" * 40_000}]}},
-])
-async def test_claude_caps_output_and_does_not_expose_it(backend, configuration):
-    backend.configure(engine="claude-code", **configuration)
-    async with backend.client() as client:
-        session = await match(client, engine="claude-code")
-        assert session["status"] == "failed" and session["recommendations"] == []
-        assert "private-output" not in json.dumps(session)
-        assert "x" * 100 not in json.dumps(session)
-        assert "가" * 100 not in json.dumps(session, ensure_ascii=False)
+async def test_provider_does_not_retry_ambiguous_failure(settings):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(503, json={"type": "gateway", "error_ref": "safe-ref"})
+    provider = matcher(settings, handler)
+    result = await provider.match(build_request({}, settings.letsur_model, settings), set())
+    assert result.unknown and result.cost is None
+    assert result.error_ref == "safe-ref"
+    assert len(calls) == 1
+    await provider.close()
 
 
-async def test_claude_process_has_no_tools_inherited_keys_or_persistent_session(backend, monkeypatch):
-    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN",
-                 "CLAUDE_SESSION_ID", "CLAUDECODE", "CLAUDE_UNRECOGNIZED_OVERRIDE"):
-        monkeypatch.setenv(name, "private-inherited-value")
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(backend.root / "local-login"))
-    async with backend.client() as client:
-        assert (await client.get("/api/health")).json()["engines"]["claude-code"]["ready"] is True
-        assert (await match(client, engine="claude-code", task="Private matching task"))["status"] == "completed"
-    auth_args = json.loads((backend.root / "claude-auth-args.json").read_text())
-    assert {"--safe-mode", "--setting-sources", "--settings", "auth", "status", "--json"}.issubset(auth_args)
-    assert auth_args[auth_args.index("--setting-sources") + 1] == ""
-    assert json.loads(auth_args[auth_args.index("--settings") + 1])["disableAllHooks"] is True
-    args = json.loads((backend.root / "claude-args.json").read_text())
-    assert "Private matching task" not in " ".join(args)
-    assert {"--print", "--strict-mcp-config", "--no-session-persistence",
-            "--disable-slash-commands", "--safe-mode", "--no-chrome"}.issubset(args)
-    assert args[args.index("--tools") + 1] == ""
-    assert args[args.index("--setting-sources") + 1] == ""
-    assert json.loads(args[args.index("--settings") + 1])["disableAllHooks"] is True
-    assert args[args.index("--output-format") + 1] == "json"
-    assert json.loads(args[args.index("--mcp-config") + 1]) == {"mcpServers": {}}
-    assert not {"--continue", "--resume", "--session-id", "--dangerously-skip-permissions"} & set(args)
-    for filename in ("claude-env.json", "claude-check-env.json"):
-        env = json.loads((backend.root / filename).read_text())
-        assert env["CLAUDE_CONFIG_DIR"] == str(backend.root / "local-login")
-        assert not [key for key in env if key.startswith(("ANTHROPIC_", "CLAUDE_"))
-                    and key != "CLAUDE_CONFIG_DIR"]
-        assert "CLAUDECODE" not in env
-    assert not os.path.exists((backend.root / "claude-cwd").read_text())
+@pytest.mark.parametrize("change", [None, {}, {"currency": "unit", "usage": []},
+    {"currency": "usd", "usage": []}])
+def test_missing_prices_fail_closed(change):
+    with pytest.raises(ProviderError):
+        parse_pricing({"pricing": change})
+
+
+def test_reservation_counts_utf8_and_all_output_tokens(settings):
+    request = build_request({"task": "한글" * 100}, settings.letsur_model, settings)
+    price = Pricing(Decimal("0.000002"), Decimal("0.00001"))
+    assert price.reserve(request) >= (Decimal(len(json.dumps(request, ensure_ascii=False).encode())) * price.input
+        + settings.max_output_tokens * price.output)

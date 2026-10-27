@@ -1,12 +1,17 @@
 import uvicorn
 
 from .app import create_app
+from .diagnostics import configure_logging
+from .settings import load_settings
 
 
 def main():
-    # The personal-data API has no account authentication and must stay on the loopback interface.
-    uvicorn.run(create_app(), host="127.0.0.1", port=8742)
+    settings = load_settings('web')
+    configure_logging(settings.log_level)
+    uvicorn.run(create_app(settings=settings), host=settings.host, port=settings.port,
+                log_level=settings.log_level.lower(),
+                timeout_graceful_shutdown=int(settings.shutdown_grace_seconds))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

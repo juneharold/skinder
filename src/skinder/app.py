@@ -1,293 +1,224 @@
+"""HTTP application. Matching executes in independent durable workers."""
 import asyncio
-import os
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import ExitStack, asynccontextmanager
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from uuid import UUID
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func, select, text
+from starlette.middleware.sessions import SessionMiddleware
 
+from .auth import AuthService, create_auth_router
 from .catalog import CatalogStore
-from .claude_matcher import ClaudeMatcher
-from .codex_matcher import CodexMatcher
-from .matcher import Matcher
-from .matching import Enricher, MatchService, MatchServiceError, Retriever
-from .models import (
-    Catalog,
-    Engine,
-    EngineStatus,
-    Error,
-    FeedbackInput,
-    FeedbackResult,
-    Health,
-    MatchInput,
-    MatchSession,
-    Profile,
-    Saved,
-    Skill,
-)
-from .ownership import DatabaseOwnership
+from .database import Database
+from .jobs import JobError, JobStore
+from .models import (Catalog, Error, FeedbackInput, FeedbackResult, Health, MatchInput,
+                     MatchSession, Profile, Saved, Skill, User)
+from .orm import WorkerRecord
 from .retrieval import HybridRetriever
-from .sources import SourceEnricher
+from .settings import Settings, load_settings
 from .sync import sync_status
 from .user import UserStore
-from .work import SyncWork, run_sync, wait_for_work
+from .work import SyncWork, wait_for_work
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def create_app(
-    *, user_db_path: str | Path | None = None, catalog_db_path: str | Path | None = None,
-    matchers: dict[Engine, Matcher] | None = None, frontend_path: str | Path | None = None,
-    retriever: Retriever | None = None, enricher: Enricher | None = None,
-) -> FastAPI:
-    user_db_path = Path(
-        user_db_path or os.environ.get("SKINDER_USER_DB_PATH", str(ROOT / ".data" / "user.sqlite3"))
-    )
-    catalog_db_path = Path(catalog_db_path or os.environ.get(
-        "SKINDER_CATALOG_DB_PATH", user_db_path.with_name("catalog.sqlite3")
-    ))
-    frontend_path = Path(frontend_path or ROOT / "frontend" / "dist")
-    matchers = matchers if matchers is not None else {
-        "codex": CodexMatcher(), "claude-code": ClaudeMatcher(),
-    }
-    user_store: UserStore
-    catalog_store: CatalogStore
-    search: Retriever
-    service: MatchService
+def create_app(*, settings: Settings | None = None, database: Database | None = None,
+               frontend_path: str | Path | None = None) -> FastAPI:
+    settings = settings or load_settings('web')
+    settings.require('web')
+    owns_database = database is None
+    database = database or Database(settings)
+    users = UserStore(database)
+    catalog = CatalogStore(database, settings)
+    jobs = JobStore(database, settings, users)
+    auth = AuthService(database, settings)
+    search = HybridRetriever(catalog, settings)
     work = SyncWork()
+    frontend_path = Path(frontend_path or ROOT / 'frontend' / 'dist')
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        nonlocal user_store, catalog_store, search, service
-        ownership = DatabaseOwnership(user_db_path)
-        cleanup = ExitStack()
-        # Callbacks run in reverse order: close the stores before releasing ownership.
-        cleanup.callback(ownership.release)
-        started = False
-
-        def initialize() -> None:
-            nonlocal user_store, catalog_store, search, service
-            ownership.acquire()
-            user_store = UserStore(user_db_path)
-            cleanup.callback(user_store.close)
-            # Recovery is safe only after excluding another server with live matching work.
-            user_store.recover_interrupted_sessions()
-            catalog_store = CatalogStore(catalog_db_path)
-            cleanup.callback(catalog_store.close)
-            search = retriever or HybridRetriever(catalog_store)
-            sources = enricher or SourceEnricher(catalog_store)
-            service = MatchService(user_store, catalog_store, matchers, search, sources)
-            app.state.user_store = user_store
-            app.state.catalog_store = catalog_store
-            app.state.match_service = service
-
-        async def shutdown() -> None:
-            try:
-                # Cancelled request workers may still be using the stores.
-                await work.drain()
-                if started:
-                    await service.shutdown()
-            finally:
-                await run_sync(cleanup.close)
-
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
-            await run_sync(initialize)
-            started = True
+            await work.run(database.check_schema)
             yield
         finally:
-            await wait_for_work(asyncio.create_task(shutdown()))
+            await wait_for_work(asyncio.create_task(work.drain()))
+            if owns_database:
+                database.close()
 
-    app = FastAPI(
-        title="Skinder API",
-        version="0.1.0",
-        lifespan=lifespan,
-        responses={
-            400: {"model": Error},
-            404: {"model": Error},
-            409: {"model": Error},
-            422: {"model": Error},
-        },
-    )
+    app = FastAPI(title='Skinder API', version='0.2.0', lifespan=lifespan,
+                  responses={code: {'model': Error} for code in (400, 401, 403, 404, 409, 422, 429)})
+    app.state.auth = auth
+    app.state.users = users
+    app.state.catalog = catalog
+    app.state.jobs = jobs
+    app.state.database = database
+    app.state.settings = settings
+    app.add_middleware(SessionMiddleware, secret_key=settings.session_secret.get_secret_value(),
+                       session_cookie='skinder_oauth', max_age=600, same_site='lax',
+                       https_only=settings.secure_cookies)
+    app.include_router(create_auth_router(auth))
 
-    @app.middleware("http")
-    async def local_origin(
-        request: Request, call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
-        host = request.headers.get("host", "")
-        # A local socket alone does not stop a browser from reaching it through another hostname.
-        allowed_hosts = {"127.0.0.1:8742", "localhost:8742"}
-        if host not in allowed_hosts:
-            return JSONResponse({"detail": "Use http://127.0.0.1:8742 to access Skinder."}, 403)
-        if request.url.path.startswith("/api/"):
-            origin = request.headers.get("origin")
-            # The Vite proxy must rewrite Origin to the backend origin in development.
-            if origin and origin != f"http://{host}":
-                return JSONResponse({"detail": "Cross-origin API requests are not allowed."}, 403)
-            # Browser requests can omit Origin; retain the separate cross-site check.
-            if request.headers.get("sec-fetch-site") == "cross-site":
-                return JSONResponse({"detail": "Cross-site API requests are not allowed."}, 403)
+    @app.middleware('http')
+    async def origin_boundary(request: Request, call_next):
+        # Infrastructure probes expose no account data and may use an internal Host header.
+        probe = request.url.path in {'/health/live', '/health/ready'} and request.method == 'GET'
+        if not probe and request.headers.get('host') != urlsplit(settings.app_origin).netloc:
+            return JSONResponse({'detail': 'Unrecognized host.'}, 403)
+        if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+            origin = request.headers.get('origin')
+            if ((origin is not None and origin != settings.app_origin)
+                    or request.headers.get('sec-fetch-site') == 'cross-site'):
+                return JSONResponse({'detail': 'Cross-origin writes are not allowed.'}, 403)
         response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path.startswith("/api/"):
-            response.headers["Cache-Control"] = "no-store"
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        if request.url.path.startswith('/api/'):
+            response.headers['Cache-Control'] = 'no-store'
         return response
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(
-        request: Request, exc: RequestValidationError,
-    ) -> JSONResponse:
-        # Validation details can include submitted values; expose only locations and messages.
-        issues = []
-        for error in exc.errors():
-            location = ".".join(str(part) for part in error["loc"] if part != "body")
-            issues.append(f"{location or 'request'}: {error['msg']}")
-        return JSONResponse({"detail": "; ".join(issues)}, 422)
+    async def invalid_request(_request: Request, exc: RequestValidationError):
+        fields = ['.'.join(str(part) for part in error['loc'] if part != 'body')
+                  for error in exc.errors()]
+        return JSONResponse({'detail': 'Invalid request fields: ' + ', '.join(fields)}, 422)
 
-    @app.exception_handler(MatchServiceError)
-    async def match_service_error(request: Request, exc: MatchServiceError) -> JSONResponse:
-        return JSONResponse({"detail": str(exc)}, exc.status_code)
+    @app.exception_handler(JobError)
+    async def job_error(_request: Request, exc: JobError):
+        return JSONResponse({'detail': exc.detail}, exc.status_code)
 
-    @app.get("/api/health", response_model=Health)
-    async def health() -> Health:
-        def snapshot() -> dict[str, Any]:
-            return {"catalog_count": catalog_store.count(),
-                    "sync_status": sync_status(catalog_store), **search.status()}
+    @app.get('/health/live', include_in_schema=False)
+    async def live():
+        return {'status': 'ok'}
 
-        status = await work.run(snapshot)
+    @app.get('/health/ready', include_in_schema=False)
+    async def ready():
+        try:
+            await work.run(database.check_schema)
+        except Exception:
+            return JSONResponse({'status': 'unavailable'}, 503)
+        return {'status': 'ok'}
 
-        async def engine_health(engine: Engine, matcher: Matcher) -> EngineStatus:
-            try:
-                return await matcher.health()
-            except Exception:  # noqa: BLE001
-                # A broken connection must not hide the other engine's status.
-                name = "Codex" if engine == "codex" else "Claude Code"
-                return EngineStatus(
-                    installed=True, authenticated=False, ready=False,
-                    message=f"Could not check {name}. Check your local installation and retry.",
-                )
+    @app.get('/api/health', response_model=Health)
+    async def health():
+        def snapshot():
+            with database.db_sessions() as session:
+                cutoff = func.clock_timestamp() - timedelta(seconds=settings.job_lease_seconds)
+                available = session.scalar(select(WorkerRecord.id).where(
+                    WorkerRecord.ready.is_(True), WorkerRecord.last_seen > cutoff,
+                    WorkerRecord.model == settings.letsur_model,
+                ).limit(1)) is not None
+            return Health(catalog_count=catalog.count(), model=settings.letsur_model,
+                          matching_available=available, **search.status())
+        return await work.run(snapshot)
 
-        results = await asyncio.gather(*(
-            engine_health(engine, matcher) for engine, matcher in matchers.items()
-        ))
-        return Health(engines=dict(zip(matchers, results, strict=True)), **status)
+    @app.get('/api/catalog', response_model=Catalog)
+    async def get_catalog(q: str = Query('', max_length=4000), category: str | None = None,
+                          offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
+        return await work.run(catalog.page, q=q, category=category, offset=offset, limit=limit)
 
-    @app.get("/api/catalog", response_model=Catalog)
-    async def get_catalog(
-        q: str = Query(default="", max_length=4000), category: str | None = None,
-        offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=200),
-    ) -> Catalog:
-        return await work.run(
-            catalog_store.page, q=q, category=category, offset=offset, limit=limit
-        )
-
-    @app.get("/api/skills/{skill_id}", response_model=Skill)
-    async def get_skill(skill_id: str) -> Skill:
-        skill = await work.run(catalog_store.get, skill_id)
+    @app.get('/api/skills/{skill_id}', response_model=Skill)
+    async def get_skill(skill_id: str):
+        skill = await work.run(catalog.get, skill_id)
         if skill is None:
-            raise HTTPException(404, "Skill not found.")
+            raise HTTPException(404, 'Skill not found.')
         return skill
 
-    @app.get("/api/profile", response_model=Profile)
-    async def get_profile() -> Profile:
-        return await work.run(user_store.get_profile)
+    @app.get('/api/profile', response_model=Profile)
+    async def get_profile(user: User = Depends(auth.require_user)):
+        return await work.run(users.get_profile, user.id)
 
-    @app.put("/api/profile", response_model=Profile)
-    async def put_profile(profile: Profile) -> Profile:
-        return await work.run(user_store.set_profile, profile)
+    @app.put('/api/profile', response_model=Profile)
+    async def put_profile(profile: Profile, user: User = Depends(auth.require_csrf)):
+        return await work.run(users.set_profile, user.id, profile)
 
-    @app.post("/api/matches", response_model=MatchSession, status_code=202)
-    async def start_match(value: MatchInput) -> MatchSession:
-        return await service.start(value)
+    @app.post('/api/matches', response_model=MatchSession, status_code=202)
+    async def start_match(value: MatchInput, user: User = Depends(auth.require_csrf),
+                          idempotency_key: str = Header(min_length=1, max_length=128)):
+        return await work.run(jobs.submit, user.id, value, idempotency_key)
 
-    @app.get("/api/matches/current", response_model=MatchSession | None)
-    async def current_match() -> MatchSession | None:
-        return await work.run(user_store.get_current_match_session)
+    @app.get('/api/matches/current', response_model=MatchSession | None)
+    async def current_match(user: User = Depends(auth.require_user)):
+        return await work.run(users.get_current_match_session, user.id)
 
-    @app.get("/api/matches/{session_id}", response_model=MatchSession)
-    async def get_match(session_id: str) -> MatchSession:
-        return await work.run(service.get_session, session_id)
+    @app.get('/api/matches/{session_id}', response_model=MatchSession)
+    async def get_match(session_id: UUID, user: User = Depends(auth.require_user)):
+        result = await work.run(users.get_match_session, user.id, str(session_id))
+        if result is None:
+            raise HTTPException(404, 'Task session not found.')
+        return result
 
-    @app.post("/api/matches/{session_id}/cancel", response_model=MatchSession)
-    async def cancel_match(session_id: str) -> MatchSession:
-        return await service.cancel(session_id)
+    @app.post('/api/jobs/{job_id}/cancel', response_model=MatchSession)
+    async def cancel_match(job_id: UUID, user: User = Depends(auth.require_csrf)):
+        return await work.run(jobs.cancel, user.id, str(job_id))
 
-    def saved_collection() -> Saved:
-        # User data outlives catalog entries; omit missing skills without deleting their saves.
-        return Saved(
-            items=[
-                {"skill": skill, "saved_at": row["saved_at"]}
-                for row in user_store.get_bookmarks()
-                if (skill := catalog_store.get(row["skill_id"])) is not None
-            ]
-        )
+    def saved_collection(user_id: str):
+        return Saved(items=[{'skill': skill, 'saved_at': row['saved_at']}
+                            for row in users.get_bookmarks(user_id)
+                            if (skill := catalog.get(row['skill_id'])) is not None])
 
-    @app.post("/api/feedback", response_model=FeedbackResult)
-    async def add_feedback(value: FeedbackInput) -> FeedbackResult:
-        def save_feedback() -> FeedbackResult:
-            service.get_session(value.session_id)
+    @app.post('/api/feedback', response_model=FeedbackResult)
+    async def add_feedback(value: FeedbackInput, user: User = Depends(auth.require_csrf)):
+        def save():
+            if users.get_match_session(user.id, value.session_id) is None:
+                raise HTTPException(404, 'Task session not found.')
             try:
-                feedback = user_store.add_feedback(value)
+                feedback = users.add_feedback(user.id, value)
             except ValueError as exc:
-                raise HTTPException(409, str(exc)) from exc
-            # Retries return the current collection, which may have changed since the original save.
-            return FeedbackResult(feedback=feedback, saved=saved_collection())
-
-        return await work.run(save_feedback)
-
-    @app.delete("/api/feedback/{feedback_id}", response_model=Saved)
-    async def undo_feedback(feedback_id: str) -> Saved:
-        def undo() -> Saved:
-            try:
-                user_store.undo_feedback(feedback_id)
-            except ValueError as exc:
-                raise HTTPException(409, str(exc)) from exc
-            return saved_collection()
-
-        return await work.run(undo)
-
-    @app.get("/api/saved", response_model=Saved)
-    async def get_saved() -> Saved:
-        return await work.run(saved_collection)
-
-    @app.put("/api/saved/{skill_id}", response_model=Saved)
-    async def put_saved(skill_id: str) -> Saved:
-        def save() -> Saved:
-            if catalog_store.get(skill_id) is None:
-                raise HTTPException(404, "Skill not found.")
-            user_store.add_bookmark(skill_id)
-            return saved_collection()
-
+                raise HTTPException(409, str(exc)) from None
+            return FeedbackResult(feedback=feedback, saved=saved_collection(user.id))
         return await work.run(save)
 
-    @app.delete("/api/saved/{skill_id}", response_model=Saved)
-    async def delete_saved(skill_id: str) -> Saved:
-        def remove() -> Saved:
-            user_store.remove_bookmark(skill_id)
-            return saved_collection()
+    @app.delete('/api/feedback/{feedback_id}', response_model=Saved)
+    async def undo_feedback(feedback_id: UUID, user: User = Depends(auth.require_csrf)):
+        def undo():
+            try:
+                users.undo_feedback(user.id, str(feedback_id))
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            return saved_collection(user.id)
+        return await work.run(undo)
 
+    @app.get('/api/saved', response_model=Saved)
+    async def get_saved(user: User = Depends(auth.require_user)):
+        return await work.run(saved_collection, user.id)
+
+    @app.put('/api/saved/{skill_id}', response_model=Saved)
+    async def put_saved(skill_id: str, user: User = Depends(auth.require_csrf)):
+        def save():
+            if catalog.get(skill_id) is None:
+                raise HTTPException(404, 'Skill not found.')
+            users.add_bookmark(user.id, skill_id)
+            return saved_collection(user.id)
+        return await work.run(save)
+
+    @app.delete('/api/saved/{skill_id}', response_model=Saved)
+    async def remove_saved(skill_id: str, user: User = Depends(auth.require_csrf)):
+        def remove():
+            users.remove_bookmark(user.id, skill_id)
+            return saved_collection(user.id)
         return await work.run(remove)
 
-    if frontend_path.is_dir():
-        assets = frontend_path / "assets"
-        if assets.is_dir():
-            app.mount("/assets", StaticFiles(directory=assets), name="assets")
+    if (frontend_path / 'assets').is_dir():
+        app.mount('/assets', StaticFiles(directory=frontend_path / 'assets'), name='assets')
 
-    @app.get("/{path:path}", include_in_schema=False)
-    async def frontend(path: str) -> Response:
-        if path == "api" or path.startswith("api/"):
-            raise HTTPException(404, "API endpoint not found.")
-        # Resolve symlinks before checking containment so they cannot expose files outside dist.
+    @app.get('/{path:path}', include_in_schema=False)
+    async def frontend(path: str):
+        if path == 'api' or path.startswith('api/'):
+            raise HTTPException(404, 'API endpoint not found.')
         candidate = (frontend_path / path).resolve()
         if candidate.is_relative_to(frontend_path.resolve()) and candidate.is_file():
             return FileResponse(candidate)
-        index = frontend_path / "index.html"
-        if index.is_file():
-            return FileResponse(index)
-        return JSONResponse({"detail": "Build the frontend with npm run build in frontend/."}, 503)
+        if (frontend_path / 'index.html').is_file():
+            return FileResponse(frontend_path / 'index.html')
+        return JSONResponse({'detail': 'Build the frontend before starting Skinder.'}, 503)
 
     return app

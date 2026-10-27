@@ -1,12 +1,6 @@
-"""Shared matcher interface, recommendation instructions, and process cleanup."""
+"""Versioned recommendation instructions shared by the hosted provider."""
 
-import asyncio
-import contextlib
-import os
-import signal
-from typing import Any, Protocol
-
-from .models import EngineStatus
+PROMPT_VERSION = "2026-10-27.1"
 
 MATCH_INSTRUCTIONS = (
     "You recommend agent skills from supplied metadata. You have no tools. "
@@ -33,25 +27,3 @@ MATCH_INSTRUCTIONS = (
     "tasks. Consider the original task with every feedback event. "
     "Choose IDs only from eligible_skills; never invent or repeat an ID."
 )
-
-
-class Matcher(Protocol):
-    async def health(self) -> EngineStatus: ...
-    async def match(self, request: dict[str, Any]) -> str: ...
-
-
-class MatchError(RuntimeError):
-    pass
-
-
-async def terminate(process: asyncio.subprocess.Process) -> None:
-    # Descendants may outlive the CLI and keep its stdout open, even after the parent exits.
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
-    try:
-        await asyncio.wait_for(process.wait(), 3)
-    except TimeoutError:
-        pass
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    await process.wait()

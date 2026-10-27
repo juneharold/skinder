@@ -1,507 +1,349 @@
+"""Durability and concurrency contracts against isolated PostgreSQL schemas."""
 import asyncio
-import os
-import signal
-import sqlite3
-import subprocess
-import sys
-import threading
-from contextlib import asynccontextmanager, suppress
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from decimal import Decimal
+from threading import Barrier
+from uuid import uuid4
 
-import httpx
 import pytest
-from test_catalog_store import example_skill
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 
-from skinder.app import create_app
-from skinder.catalog import CatalogStore
-from skinder.claude_matcher import invoke
-from skinder.matcher import terminate
-from skinder.matching import MatchServiceError
-from skinder.models import EngineStatus, MatchInput
-from skinder.ownership import DatabaseOwnership
-from skinder.sources import SourceEnricher
-from skinder.work import run_sync
-
-
-# Explicit gates place cancellation inside an active match without depending on machine speed.
-class WaitingMatcher:
-    def __init__(self):
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-        self.calls = 0
-
-    async def health(self):
-        return EngineStatus(installed=True, authenticated=True, ready=True, message="Ready")
-
-    async def match(self, request):
-        self.calls += 1
-        self.entered.set()
-        await self.release.wait()
-        return '{"recommendations": []}'
+from skinder.jobs import JobError, JobStore
+from skinder.models import MatchInput, MatchResult, Profile, Recommendation
+from skinder.orm import (
+    DailyUsageRecord,
+    MatchJobRecord,
+    MatchSessionSkillRecord,
+    ProviderAttemptRecord,
+    UserDailyUsageRecord,
+    UserRecord,
+)
+from skinder.provider import Pricing, ProviderOutcome
+from skinder.user import UserStore
+from skinder.worker import Worker
 
 
-class MetadataOnly:
+@pytest.fixture
+def stores(db, settings):
+    return JobStore(db, settings, UserStore(db)), JobStore(db, settings, UserStore(db))
+
+
+def submit(store, user, *, session=None, key=None, task="Build a website"):
+    return store.submit(user.id, MatchInput(task=task, agent="codex", session_id=session), key or str(uuid4()))
+
+
+def result(skill="skill-a", cost=None):
+    return ProviderOutcome(result=MatchResult(recommendations=[] if skill is None else [Recommendation(
+        skill_id=skill, task_fit="Fits the task", taste_fit="Fits the profile", caveat=None)]),
+        cost=cost, currency="unit" if cost is not None else None, input_tokens=100, output_tokens=50)
+
+
+def expire(db, job_id, *, deadline=False):
+    with db.db_sessions.begin() as session:
+        job = session.get(MatchJobRecord, job_id)
+        now = session.scalar(select(func.clock_timestamp()))
+        if deadline:
+            job.deadline_at = now - timedelta(seconds=1)
+        else:
+            job.lease_expires_at = now - timedelta(seconds=1)
+
+
+def dispatch(store, job):
+    return store.dispatch(job.id, job.lease_token, {"messages": [], "max_tokens": 10},
+        Pricing(Decimal("0.000001"), Decimal("0.000001")))
+
+
+def test_duplicate_request_survives_lost_response_and_counts_once(db, users, stores):
+    first, second = stores
+    one = submit(first, users[0], key="same")
+    two = submit(second, users[0], key="same")
+    assert one.latest_job.id == two.latest_job.id
+    with db.db_sessions() as session:
+        assert session.scalar(select(func.count()).select_from(MatchJobRecord)) == 1
+        assert session.scalar(select(UserDailyUsageRecord.accepted_jobs)) == 1
+    with pytest.raises(JobError) as error:
+        submit(second, users[0], key="same", task="A different website")
+    assert error.value.status_code == 409
+
+
+def test_parallel_submit_is_scoped_to_user(db, users, stores):
+    barrier = Barrier(2)
+    def run(store, user):
+        barrier.wait()
+        try:
+            return submit(store, user)
+        except JobError as error:
+            return error.status_code
+    with ThreadPoolExecutor(2) as pool:
+        outcomes = list(pool.map(lambda pair: run(*pair), zip(stores, users)))
+    assert all(item.status == "queued" for item in outcomes)
+    stores[0].cancel(users[0].id, outcomes[0].latest_job.id)
+    with ThreadPoolExecutor(2) as pool:
+        outcomes = list(pool.map(lambda store: run(store, users[0]), stores))
+    assert sum(item == 409 for item in outcomes) == 1
+
+
+def test_snapshot_is_frozen_at_acceptance(db, users, stores):
+    store = stores[0]
+    store.users.set_profile(users[0].id, Profile(communication="concise"))
+    public = submit(store, users[0])
+    store.users.set_profile(users[0].id, Profile(communication="detailed"))
+    with db.db_sessions() as session:
+        assert session.get(MatchJobRecord, public.latest_job.id).input["profile"]["communication"] == "concise"
+
+
+def test_global_claim_cap_across_workers(db, settings, stores):
+    with db.db_sessions.begin() as session:
+        accounts = [UserRecord(github_id=i, login=str(i), avatar_url=None) for i in range(10, 16)]
+        session.add_all(accounts)
+        session.flush()
+    for user in accounts:
+        submit(stores[0], user)
+    with ThreadPoolExecutor(2) as pool:
+        claims = list(pool.map(lambda i: stores[i % 2].claim(str(i)), range(6)))
+    assert sum(job is not None for job in claims) == settings.max_concurrent_jobs
+    with db.db_sessions() as session:
+        assert session.scalar(select(func.count()).select_from(MatchJobRecord).where(
+            MatchJobRecord.status == "running")) == settings.max_concurrent_jobs
+
+
+def test_expired_predispatch_can_retry_but_old_lease_cannot_publish(db, users, stores):
+    public = submit(stores[0], users[0])
+    old = stores[0].claim("worker-a")
+    expire(db, old.id)
+    new = stores[1].claim("worker-b")
+    assert new.id == old.id and new.lease_token > old.lease_token
+    assert not stores[0].finish(old.id, old.lease_token, result("stale"))
+    assert stores[1].finish(new.id, new.lease_token, result())
+    view = stores[0].users.get_match_session(users[0].id, public.id)
+    assert [item.skill_id for item in view.recommendations] == ["skill-a"]
+
+
+def test_expired_postdispatch_never_requeues_and_keeps_reservation(db, users, stores):
+    submit(stores[0], users[0])
+    job = stores[0].claim("worker-a")
+    assert dispatch(stores[0], job)
+    expire(db, job.id)
+    assert stores[1].claim("worker-b") is None
+    with db.db_sessions() as session:
+        row = session.get(MatchJobRecord, job.id)
+        assert row.status == "failed" and row.error_code == "provider_outcome_unknown"
+        assert session.scalar(select(DailyUsageRecord.reserved)) > 0
+        assert session.scalar(select(func.count()).select_from(ProviderAttemptRecord)) == 1
+
+
+def test_budget_reservation_race_cannot_overspend(db, users, stores):
+    for store, user in zip(stores, users):
+        submit(store, user)
+        store.settings = store.settings.model_copy(update={"daily_budget_units": Decimal("0.0015")})
+    jobs = [store.claim(str(i)) for i, store in enumerate(stores)]
+    barrier = Barrier(2)
+    def run(pair):
+        store, job = pair
+        barrier.wait()
+        return dispatch(store, job)
+    with ThreadPoolExecutor(2) as pool:
+        outcomes = list(pool.map(run, zip(stores, jobs)))
+    assert sorted(outcomes) == [False, True]
+    with db.db_sessions() as session:
+        usage = session.scalar(select(DailyUsageRecord))
+        assert usage.spent + usage.reserved <= Decimal("0.0015")
+
+
+def test_cancelled_late_result_records_cost_without_replacing_new_batch(db, users, stores):
+    store = stores[0]
+    public = submit(store, users[0])
+    old = store.claim("worker-a")
+    assert dispatch(store, old)
+    store.cancel(users[0].id, old.id)
+    submit(store, users[0], session=public.id)
+    new = store.claim("worker-b")
+    assert store.finish(new.id, new.lease_token, result("new"))
+    assert not store.finish(old.id, old.lease_token, result("old", Decimal("0.0002")))
+    view = store.cancel(users[0].id, old.id)
+    assert view.latest_job.id == new.id
+    assert [item.skill_id for item in view.recommendations] == ["new"]
+    with db.db_sessions() as session:
+        usage = session.scalar(select(DailyUsageRecord))
+        assert usage.spent == Decimal("0.0002") and usage.reserved == 0
+    store.finish(old.id, old.lease_token, result("old", Decimal("0.0002")))
+    with db.db_sessions() as session:
+        assert session.scalar(select(DailyUsageRecord.spent)) == Decimal("0.0002")
+
+
+def test_failed_continuation_preserves_batch_and_zero_result_clears(db, users, stores):
+    store = stores[0]
+    public = submit(store, users[0])
+    job = store.claim("a")
+    store.finish(job.id, job.lease_token, result())
+    submit(store, users[0], session=public.id)
+    failed = store.claim("b")
+    store.finish(failed.id, failed.lease_token, ProviderOutcome(error_code="invalid_recommendations"))
+    assert store.users.get_match_session(users[0].id, public.id).recommendations[0].skill_id == "skill-a"
+    submit(store, users[0], session=public.id)
+    empty = store.claim("c")
+    store.finish(empty.id, empty.lease_token, result(None))
+    assert store.users.get_match_session(users[0].id, public.id).recommendations == []
+    with db.db_sessions() as session:
+        assert set(session.scalars(select(MatchSessionSkillRecord.skill_id))) == {"skill-a"}
+
+
+def test_claim_limit_and_deadline_are_not_reset(db, users, stores):
+    store = stores[0]
+    submit(store, users[0])
+    original_deadline = None
+    for _ in range(store.settings.max_job_claims):
+        job = store.claim("worker")
+        original_deadline = original_deadline or job.deadline_at
+        assert job.deadline_at == original_deadline
+        expire(db, job.id)
+    assert store.claim("worker") is None
+    with db.db_sessions() as session:
+        assert session.get(MatchJobRecord, job.id).status == "failed"
+    submit(store, users[0])
+    job = store.claim("worker")
+    expire(db, job.id, deadline=True)
+    assert not store.heartbeat(job.id, job.lease_token)
+    assert store.claim("worker") is None
+
+
+class Retriever:
+    def search(self, task, agent, excluded):
+        return [{"id": "skill-a", "name": "Skill A"}]
+
+
+class Enricher:
     async def enrich(self, skills):
-        from skinder.sources import match_metadata
-        return [match_metadata(skill) for skill in skills]
+        return skills
 
 
-async def test_termination_reaps_child_that_ignores_graceful_shutdown():
-    process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c",
-        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "print('ready', flush=True); time.sleep(30)",
-        stdout=asyncio.subprocess.PIPE, start_new_session=True,
-    )
-    try:
-        assert await asyncio.wait_for(process.stdout.readline(), 3) == b"ready\n"
-        await asyncio.wait_for(terminate(process), 5)
-        assert process.returncode == -signal.SIGKILL
-        with pytest.raises(ProcessLookupError):
-            os.kill(process.pid, 0)
-    finally:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
+class Matcher:
+    def __init__(self, outcome=None):
+        self.calls = 0
+        self.outcome = outcome or result()
+
+    async def pricing(self, model):
+        return Pricing(Decimal("0.000001"), Decimal("0.000001"))
+
+    async def match(self, request, eligible):
+        self.calls += 1
+        return self.outcome
 
 
-@pytest.mark.parametrize("stop", ["timeout", "cancel"])
-async def test_claude_cleanup_stops_descendant_after_cli_leader_exits(tmp_path, stop):
-    child_pid_file = tmp_path / "descendant.pid"
-    leader_pid_file = tmp_path / "leader.pid"
-    child_code = (
-        "import os, pathlib, signal, sys, time; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"
-    )
-    leader_code = (
-        "import os, pathlib, subprocess, sys, time\n"
-        "root = pathlib.Path(sys.argv[1])\n"
-        "subprocess.Popen([sys.executable, '-c', sys.argv[2], str(root / 'descendant.pid')])\n"
-        "while not (root / 'descendant.pid').exists() or not (root / 'descendant.pid').read_text():\n"
-        "    time.sleep(0.005)\n"
-        "(root / 'leader.pid').write_text(str(os.getpid()))\n"
-    )
-    operation = asyncio.create_task(invoke(
-        sys.executable, ["-c", leader_code, str(tmp_path), child_code],
-        directory=str(tmp_path), timeout=1 if stop == "timeout" else 30, limit=1024,
-    ))
-    child_pid = leader_pid = None
-    try:
-        async with asyncio.timeout(3):
-            while not leader_pid_file.exists() or not leader_pid_file.read_text():
-                await asyncio.sleep(0.005)
-            child_pid = int(child_pid_file.read_text())
-            leader_pid = int(leader_pid_file.read_text())
-            # Observe the reaped leader before stopping the still-open stdout reader.
-            while True:
-                try:
-                    os.kill(leader_pid, 0)
-                except ProcessLookupError:
-                    break
-                await asyncio.sleep(0.005)
-        if stop == "cancel":
-            operation.cancel()
-        completed, _ = await asyncio.wait({operation}, timeout=5)
-        assert operation in completed, "CLI cleanup exceeded its termination budget"
-        with pytest.raises(TimeoutError if stop == "timeout" else asyncio.CancelledError):
-            await operation
-
-        async with asyncio.timeout(2):
-            while True:
-                try:
-                    os.kill(child_pid, 0)
-                except ProcessLookupError:
-                    break
-                # An adopted zombie has exited; only its new parent can reap it.
-                state = (await asyncio.to_thread(
-                    subprocess.run, ["ps", "-o", "stat=", "-p", str(child_pid)],
-                    capture_output=True, text=True, check=False,
-                )).stdout.strip()
-                if state.startswith("Z"):
-                    break
-                await asyncio.sleep(0.01)
-    finally:
-        if leader_pid is None and leader_pid_file.exists():
-            leader_pid = int(leader_pid_file.read_text())
-        if child_pid is None and child_pid_file.exists():
-            child_pid = int(child_pid_file.read_text())
-        if leader_pid is not None:
-            with suppress(ProcessLookupError):
-                os.killpg(leader_pid, signal.SIGKILL)
-        if child_pid is not None:
-            with suppress(ProcessLookupError):
-                os.kill(child_pid, signal.SIGKILL)
-        operation.cancel()
-        with suppress(asyncio.CancelledError, TimeoutError):
-            await operation
+async def test_database_failure_after_response_retries_only_persistence(db, users, stores, monkeypatch):
+    store = stores[0]
+    public = submit(store, users[0])
+    original = store.finish
+    count = 0
+    def flaky(*args):
+        nonlocal count
+        count += 1
+        if count == 1:
+            raise OperationalError("statement", {}, Exception())
+        return original(*args)
+    monkeypatch.setattr(store, "finish", flaky)
+    matcher = Matcher()
+    assert await Worker(store, Retriever(), Enricher(), matcher).run_once()
+    assert matcher.calls == 1
+    assert store.users.get_match_session(users[0].id, public.id).status == "completed"
+    with db.db_sessions() as session:
+        assert session.scalar(select(func.count()).select_from(ProviderAttemptRecord)) == 1
 
 
-@asynccontextmanager
-async def running_app(backend, **options):
-    options.setdefault("enricher", MetadataOnly())
-    app = create_app(
-        user_db_path=backend.user_db_path, catalog_db_path=backend.root / "catalog.sqlite3",
-        **options,
-    )
-    async with app.router.lifespan_context(app):
-        yield app
+async def test_partial_provider_failure_and_unknown_cost_keep_reservation(db, users, stores):
+    store = stores[0]
+    public = submit(store, users[0])
+    matcher = Matcher(ProviderOutcome(error_code="invalid_recommendations", input_tokens=50, output_tokens=10))
+    await Worker(store, Retriever(), Enricher(), matcher).run_once()
+    assert store.users.get_match_session(users[0].id, public.id).status == "failed"
+    with db.db_sessions() as session:
+        assert session.scalar(select(DailyUsageRecord.reserved)) > 0
+        attempt = session.scalar(select(ProviderAttemptRecord))
+        assert attempt.input_tokens == 50 and attempt.cost is None
 
 
-async def wait_until_finished(service, session_id):
-    async with asyncio.timeout(3):
-        while True:
-            session = await run_sync(service.get_session, session_id)
-            if session.status != "running":
-                return session
-            await asyncio.sleep(0.005)
+async def test_two_workers_make_progress_for_two_users_at_once(users, stores):
+    public = [submit(store, user) for store, user in zip(stores, users)]
+    entered = 0
+    both = asyncio.Event()
+    class ConcurrentMatcher(Matcher):
+        async def match(self, request, eligible):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                both.set()
+            await asyncio.wait_for(both.wait(), 2)
+            return result()
+    workers = [Worker(store, Retriever(), Enricher(), ConcurrentMatcher()) for store in stores]
+    assert await asyncio.gather(*(worker.run_once() for worker in workers)) == [True, True]
+    assert [store.users.get_match_session(user.id, task.id).status
+        for store, user, task in zip(stores, users, public)] == ["completed", "completed"]
 
 
-async def test_simultaneous_start_and_lost_response_leave_one_owned_job(backend, monkeypatch):
-    matcher = WaitingMatcher()
-    async with running_app(backend, matchers={"codex": matcher}) as app:
-        service = app.state.match_service
-        entered, release = threading.Event(), threading.Event()
-        original = app.state.user_store.get_profile
-
-        def blocked_profile():
-            entered.set()
-            assert release.wait(3)
-            return original()
-
-        monkeypatch.setattr(app.state.user_store, "get_profile", blocked_profile)
-        value = MatchInput(task="Review changes", agent="codex")
-        first = asyncio.create_task(service.start(value))
-        try:
-            assert await asyncio.to_thread(entered.wait, 2)
-            second = asyncio.create_task(service.start(value))
-            first.cancel()
-            await asyncio.sleep(0)
-            first.cancel()
-        finally:
-            release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await first
-        with pytest.raises(MatchServiceError) as error:
-            await second
-        assert error.value.status_code == 409
-        await asyncio.wait_for(matcher.entered.wait(), 2)
-        session = await run_sync(app.state.user_store.get_current_match_session)
-        assert session.status == "running"
-        assert matcher.calls == 1
-        cancelled = await service.cancel(session.id)
-        assert cancelled.status == "cancelled"
-        matcher.release.set()
-        assert (await run_sync(service.get_session, session.id)).status == "cancelled"
+def test_cancel_and_finish_race_has_one_consistent_outcome(db, users, stores):
+    public = submit(stores[0], users[0])
+    job = stores[0].claim("worker")
+    barrier = Barrier(2)
+    def cancel():
+        barrier.wait()
+        return stores[0].cancel(users[0].id, job.id)
+    def finish():
+        barrier.wait()
+        return stores[1].finish(job.id, job.lease_token, result())
+    with ThreadPoolExecutor(2) as pool:
+        one, two = pool.submit(cancel), pool.submit(finish)
+        one.result(), two.result()
+    final = stores[0].users.get_match_session(users[0].id, public.id)
+    assert final.status in {"completed", "cancelled"}
+    assert [item.skill_id for item in final.recommendations] == (["skill-a"] if final.status == "completed" else [])
 
 
-async def test_cancelled_caller_still_finishes_cancellation(backend, monkeypatch):
-    matcher = WaitingMatcher()
-    async with running_app(backend, matchers={"codex": matcher}) as app:
-        service = app.state.match_service
-        session = await service.start(MatchInput(task="Review changes", agent="codex"))
-        await asyncio.wait_for(matcher.entered.wait(), 2)
-        entered, release = threading.Event(), threading.Event()
-        original = app.state.user_store.finish_match_session
-
-        def blocked_finish(*args, **kwargs):
-            entered.set()
-            assert release.wait(3)
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(app.state.user_store, "finish_match_session", blocked_finish)
-        cancellation = asyncio.create_task(service.cancel(session.id))
-        try:
-            assert await asyncio.to_thread(entered.wait, 2)
-            cancellation.cancel()
-        finally:
-            release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await cancellation
-        assert (await run_sync(service.get_session, session.id)).status == "cancelled"
-        next_session = await service.start(MatchInput(task="Review another task", agent="codex"))
-        assert next_session.id != session.id
-        await service.cancel(next_session.id)
+def test_queue_expiry_and_daily_limit_do_not_charge_duplicates(db, users, stores):
+    store = stores[0]
+    store.settings = store.settings.model_copy(update={"matches_per_user_per_day": 1})
+    public = submit(store, users[0], key="original")
+    with db.db_sessions.begin() as session:
+        row = session.get(MatchJobRecord, public.latest_job.id)
+        row.created_at = session.scalar(select(func.clock_timestamp())) - timedelta(seconds=601)
+    assert store.claim("worker") is None
+    assert submit(store, users[0], key="original").latest_job.status == "failed"
+    with pytest.raises(JobError) as error:
+        submit(store, users[0])
+    assert error.value.status_code == 429
 
 
-async def test_shutdown_waits_for_retrieval_before_releasing_database(backend):
-    entered, release = threading.Event(), threading.Event()
-
-    class BlockingRetriever:
-        def search(self, task, agent, excluded):
-            entered.set()
-            assert release.wait(3)
-            return []
-
-    app = create_app(user_db_path=backend.user_db_path, retriever=BlockingRetriever())
-    lifespan = app.router.lifespan_context(app)
-    await lifespan.__aenter__()
-    session = await app.state.match_service.start(MatchInput(task="Review changes", agent="codex"))
-    assert await asyncio.to_thread(entered.wait, 2)
-    shutdown = asyncio.create_task(lifespan.__aexit__(None, None, None))
-    probe = DatabaseOwnership(backend.user_db_path)
-    try:
-        await asyncio.sleep(0.03)
-        assert not shutdown.done()
-        with pytest.raises(RuntimeError):
-            probe.acquire()
-    finally:
-        release.set()
-        await shutdown
-    probe.acquire()
-    probe.release()
-    with sqlite3.connect(backend.user_db_path) as db:
-        status, error = db.execute(
-            "SELECT status, error FROM match_sessions WHERE id=?", (session.id,),
-        ).fetchone()
-    assert status == "failed" and "shutdown" in error
-
-
-@pytest.mark.parametrize("stage,exception", [
-    ("matcher", RuntimeError), ("matcher", ValueError),
-    ("retrieval", ValueError), ("enrichment", ValueError),
-])
-async def test_failure_diagnostics_keep_context_without_sensitive_values(
-    backend, caplog, stage, exception,
-):
-    def fail():
-        raise exception("private-task access_token=secret provider stderr SQL parameters")
-
-    class BrokenMatcher(WaitingMatcher):
-        async def match(self, request):
-            fail()
-
-    class BrokenRetriever:
-        def search(self, task, agent, excluded):
-            fail()
-
-    class BrokenEnricher:
-        async def enrich(self, skills):
-            fail()
-
-    options = {"matchers": {"codex": BrokenMatcher()}}
-    if stage == "retrieval":
-        options["retriever"] = BrokenRetriever()
-    if stage == "enrichment":
-        options["enricher"] = BrokenEnricher()
-    async with running_app(backend, **options) as app:
-        service = app.state.match_service
-        session = await service.start(MatchInput(task="private-task Review changes", agent="codex"))
-        result = await wait_until_finished(service, session.id)
-        assert result.status == "failed"
-        assert result.error is not None
-    assert session.id in caplog.text
-    assert stage in caplog.text and exception.__name__ in caplog.text
-    assert "test_matching_lifecycle.py" in caplog.text
-    diagnostics = caplog.text + result.error
-    assert all(value not in diagnostics for value in ("private-task", "secret", "stderr", "parameters"))
-
-
-async def test_source_cache_failure_logs_underlying_error_without_sensitive_values(backend, caplog):
-    catalog = CatalogStore(backend.root / "catalog.sqlite3")
-    skill = example_skill(99)
-    catalog.upsert(skill)
-    with catalog.engine.begin() as connection:
-        connection.exec_driver_sql(
-            "CREATE TRIGGER fail_source_cache BEFORE INSERT ON source_cache "
-            "BEGIN SELECT RAISE(ABORT, 'private-task access_token=secret provider stderr'); END"
-        )
-
-    class SingleSkillRetriever:
-        def search(self, task, agent, excluded):
-            return [skill]
-
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, text="private-source-text"))
-    try:
-        async with running_app(
-            backend, matchers={"codex": WaitingMatcher()}, retriever=SingleSkillRetriever(),
-            enricher=SourceEnricher(catalog, transport=transport),
-        ) as app:
-            service = app.state.match_service
-            session = await service.start(MatchInput(task="Review changes", agent="codex"))
-            result = await wait_until_finished(service, session.id)
-            assert result.status == "failed" and result.error is not None
-        assert "IntegrityError" in caplog.text and "sources.py" in caplog.text
-        assert session.id in caplog.text and "enrichment" in caplog.text
-        diagnostics = caplog.text + result.error
-        assert all(value not in diagnostics for value in (
-            "private-task", "secret", "stderr", "private-source-text",
-        ))
-    finally:
-        catalog.close()
-
-
-async def test_database_contention_does_not_block_other_requests(backend):
-    async with (
-        running_app(backend, matchers={"codex": WaitingMatcher()}) as app,
-        httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8742",
-        ) as client,
-    ):
-        with sqlite3.connect(backend.user_db_path) as blocker:
-            blocker.execute("BEGIN IMMEDIATE")
-            pending = asyncio.create_task(client.put("/api/profile", json={"output_style": "brief"}))
-            try:
-                await asyncio.sleep(0.03)
-                assert not pending.done()
-                response = await asyncio.wait_for(client.get("/api/matches/current"), 0.5)
-                assert response.status_code == 200 and response.json() is None
-            finally:
-                blocker.rollback()
-                result = await pending
-            assert result.status_code == 200
-            assert result.json()["output_style"] == "brief"
-
-async def test_cancelled_thread_failure_preserves_cancellation():
-    entered, release = threading.Event(), threading.Event()
-    finished = threading.Event()
-
-    def failing_work():
-        entered.set()
-        assert release.wait(3)
-        finished.set()
-        raise RuntimeError("private worker error")
-
-    task = asyncio.create_task(run_sync(failing_work))
-    try:
-        assert await asyncio.to_thread(entered.wait, 2)
-        task.cancel()
-        await asyncio.sleep(0)
-        task.cancel()
-    finally:
-        release.set()
+async def test_shutdown_after_dispatch_recovers_without_second_provider_call(db, users, stores):
+    store = stores[0]
+    public = submit(store, users[0])
+    started = asyncio.Event()
+    class HangingMatcher(Matcher):
+        async def match(self, request, eligible):
+            self.calls += 1
+            started.set()
+            await asyncio.Event().wait()
+    matcher = HangingMatcher()
+    worker = Worker(store, Retriever(), Enricher(), matcher)
+    task = asyncio.create_task(worker.run_once())
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert finished.is_set()
+    expire(db, public.latest_job.id)
+    assert stores[1].claim("replacement") is None
+    assert matcher.calls == 1
+    view = store.users.get_match_session(users[0].id, public.id)
+    assert view.latest_job.error_code == "provider_outcome_unknown"
 
 
-def test_process_lock_resolves_symlinks_and_can_be_reacquired(tmp_path):
-    database = tmp_path / "user.sqlite3"
-    database.touch()
-    alias = tmp_path / "alias.sqlite3"
-    alias.symlink_to(database)
-    owner = DatabaseOwnership(database)
-    owner.acquire()
-    code = (
-        "from pathlib import Path; from skinder.ownership import DatabaseOwnership; "
-        "import sys; owner = DatabaseOwnership(Path(sys.argv[1])); owner.acquire(); owner.release()"
-    )
-    try:
-        rejected = subprocess.run([sys.executable, "-c", code, str(alias)], capture_output=True, check=False)
-        assert rejected.returncode != 0
-        assert b"already using this user database" in rejected.stderr
-    finally:
-        owner.release()
-    accepted = subprocess.run([sys.executable, "-c", code, str(alias)], capture_output=True, check=False)
-    assert accepted.returncode == 0, accepted.stderr.decode()
-
-
-async def test_second_app_cannot_recover_active_job_and_startup_failure_releases_lock(backend, monkeypatch):
-    matcher = WaitingMatcher()
-    async with running_app(backend, matchers={"codex": matcher}) as app:
-        session = await app.state.match_service.start(MatchInput(task="Review changes", agent="codex"))
-        with pytest.raises(RuntimeError, match="already using"):
-            async with running_app(backend):
-                pytest.fail("Second server acquired the database")
-        assert (await run_sync(app.state.match_service.get_session, session.id)).status == "running"
-        await app.state.match_service.cancel(session.id)
-
-    def failed_catalog(*args, **kwargs):
-        raise RuntimeError("Cannot initialize catalog")
-
-    with monkeypatch.context() as patch:
-        patch.setattr("skinder.app.CatalogStore", failed_catalog)
-        with pytest.raises(RuntimeError, match="Cannot initialize"):
-            async with running_app(backend):
-                pytest.fail("Startup should fail")
-    async with running_app(backend) as app:
-        assert (await run_sync(app.state.match_service.get_session, session.id)).status == "cancelled"
-
-
-async def test_late_match_result_cannot_overwrite_cancellation(backend):
-    class LateMatcher(WaitingMatcher):
-        async def match(self, request):
-            self.entered.set()
-            try:
-                await self.release.wait()
-            except asyncio.CancelledError:
-                return '{"recommendations": []}'
-
-    matcher = LateMatcher()
-    async with running_app(backend, matchers={"codex": matcher}) as app:
-        service = app.state.match_service
-        session = await service.start(MatchInput(task="Review changes", agent="codex"))
-        await asyncio.wait_for(matcher.entered.wait(), 2)
-        assert (await service.cancel(session.id)).status == "cancelled"
-        assert (await run_sync(service.get_session, session.id)).status == "cancelled"
-
-
-async def test_shutdown_waits_for_cancelled_request_write(backend, monkeypatch):
-    app = create_app(user_db_path=backend.user_db_path)
-    lifespan = app.router.lifespan_context(app)
-    await lifespan.__aenter__()
-    entered, release = threading.Event(), threading.Event()
-    closed = threading.Event()
-    users = app.state.user_store
-    original = users.set_profile
-
-    def blocked_write(profile):
-        entered.set()
-        assert release.wait(3)
-        assert not closed.is_set()
-        return original(profile)
-
-    monkeypatch.setattr(users, "set_profile", blocked_write)
-    # SQLAlchemy's disposal event observes the actual resource lifecycle.
-    from sqlalchemy import event
-    event.listen(users.engine, "engine_disposed", lambda engine: closed.set())
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8742",
-    ) as client:
-        request = asyncio.create_task(client.put("/api/profile", json={"output_style": "brief"}))
-        assert await asyncio.to_thread(entered.wait, 2)
-        request.cancel()
-        shutdown = asyncio.create_task(lifespan.__aexit__(None, None, None))
-        try:
-            await asyncio.sleep(0.02)
-            assert not shutdown.done() and not closed.is_set()
-        finally:
-            release.set()
-            with pytest.raises(asyncio.CancelledError):
-                await request
-            await shutdown
-    assert closed.is_set()
-    with sqlite3.connect(backend.user_db_path) as db:
-        assert '"output_style":"brief"' in db.execute("SELECT data FROM profile").fetchone()[0]
-
-
-@pytest.mark.parametrize("engine", ["codex", "claude-code"])
-async def test_selected_engine_controls_budget_for_enrichment(backend, engine):
-    class ImmediateMatcher(WaitingMatcher):
-        timeout = 1
-
-        async def match(self, request):
-            self.calls += 1
-            return '{"recommendations": []}'
-
-    class SlowEnricher(MetadataOnly):
-        async def enrich(self, skills):
-            await asyncio.sleep(0.05)
-            return await super().enrich(skills)
-
-    selected, other = ImmediateMatcher(), ImmediateMatcher()
-    selected.timeout = 0.01
-    other_engine = "claude-code" if engine == "codex" else "codex"
-    async with running_app(
-        backend, matchers={engine: selected, other_engine: other}, enricher=SlowEnricher(),
-    ) as app:
-        service = app.state.match_service
-        session = await service.start(MatchInput(task="Review changes", agent="codex", engine=engine))
-        failed = await wait_until_finished(service, session.id)
-        assert failed.status == "failed" and "timed out" in failed.error
-        assert selected.calls == other.calls == 0
-        session = await service.start(MatchInput(
-            task="Review changes", agent="codex", engine=other_engine,
-        ))
-        completed = await wait_until_finished(service, session.id)
-        assert completed.status == "completed"
-        assert other.calls == 1 and selected.calls == 0
+def test_cross_user_cancellation_and_invalid_ids_are_not_found(users, stores):
+    public = submit(stores[0], users[0])
+    for job_id in (public.latest_job.id, "invalid"):
+        with pytest.raises(JobError) as error:
+            stores[1].cancel(users[1].id, job_id)
+        assert error.value.status_code == 404
+    with pytest.raises(JobError) as error:
+        submit(stores[1], users[1], session="invalid")
+    assert error.value.status_code == 404
+    assert stores[0].users.get_match_session(users[0].id, public.id).status == "queued"

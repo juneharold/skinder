@@ -447,3 +447,28 @@ def test_worker_logging_hides_transport_debug_payloads(monkeypatch, caplog):
     finally:
         for name, level in old.items():
             logging.getLogger(name).setLevel(level)
+
+
+async def test_quote_heavy_sources_trim_to_full_provider_envelope(db, users, stores):
+    import json
+
+    store = stores[0]
+    store.settings = store.settings.model_copy(update={"max_prompt_bytes": 8192})
+    profile = Profile(communication="concise", output_style='Use "examples" and C:\\paths')
+    store.users.set_profile(users[0].id, profile)
+    public = submit(store, users[0], task='Explain "quoted" source paths and \\escapes')
+    class QuotedRetriever:
+        def search(self, task, agent, excluded):
+            return [{"id": "skill-a", "name": "Skill A", "source_excerpt": '\\"' * 1400}]
+    matcher = Matcher()
+    await Worker(store, QuotedRetriever(), Enricher(), matcher).run_once()
+    final = store.users.get_match_session(users[0].id, public.id)
+    assert final.status == "completed" and matcher.calls == 1
+    with db.db_sessions() as session:
+        payload = session.get(MatchJobRecord, public.latest_job.id).provider_request
+    assert len(json.dumps(payload, ensure_ascii=False).encode()) <= store.settings.max_prompt_bytes
+    supplied = json.loads(payload["messages"][1]["content"])
+    assert supplied["task"] == public.task
+    assert supplied["profile"] == profile.model_dump()
+    assert supplied["eligible_skills"][0]["source_excerpt"] == ""
+    assert supplied["eligible_skills"][0]["source_truncated"] is True

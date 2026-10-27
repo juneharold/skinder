@@ -13,7 +13,7 @@ from .database import Database
 from .diagnostics import configure_logging
 from .jobs import JobStore
 from .models import MatchResult
-from .provider import LetsurMatcher, ProviderError, ProviderOutcome, build_request
+from .provider import LetsurMatcher, ProviderError, ProviderOutcome, build_request, request_size
 from .settings import load_settings
 from .sources import bounded_request
 from .work import run_sync
@@ -77,14 +77,11 @@ class Worker:
                 enriched = await self.enricher.enrich(candidates[:40])
                 timings[stage] = round(monotonic() - start, 3)
                 stage, start = "provider", monotonic()
-                # Reserve space for the system prompt and schema, then bound the entire
-                # request again. The exact bounded payload is durably saved before dispatch.
-                empty = build_request({}, job.model, self.settings)
-                overhead = len(json.dumps(empty, ensure_ascii=False).encode()) + 1024
-                budget = self.settings.model_copy(update={
-                    "max_prompt_bytes": max(0, self.settings.max_prompt_bytes - overhead)})
+                # Trim against the complete serialized envelope, including escaped message
+                # content. The exact bounded payload is saved before paid dispatch.
                 data = bounded_request(job.input["task"], job.input["profile"],
-                    job.input["feedback"], enriched, budget)
+                    job.input["feedback"], enriched, self.settings,
+                    request_size=lambda value: request_size(value, job.model, self.settings))
                 if not data["eligible_skills"]:
                     outcome = ProviderOutcome(result=MatchResult(recommendations=[]))
                 else:

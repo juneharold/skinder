@@ -3,7 +3,7 @@
 import asyncio
 import json
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypedDict
 from urllib.parse import quote, unquote, urlsplit
 
@@ -76,14 +76,18 @@ def match_metadata(skill: Skill) -> dict[str, Any]:
 def bounded_request(
     task: str, profile: dict[str, Any], feedback: Sequence[Mapping[str, Any]],
     candidates: Sequence[dict[str, Any]], settings: Settings | None = None,
+    *, request_size: Callable[[dict[str, Any]], int] | None = None,
 ) -> dict[str, Any]:
     settings = settings or Settings(_env_file=None)
     request = {
         "task": task, "profile": profile, "recent_feedback": list(feedback),
         "eligible_skills": [dict(item) for item in candidates[:40]],
     }
+    # The provider can measure its complete envelope, including the second JSON escaping
+    # of message content. Standalone callers retain the plain input byte limit.
+    measure = request_size or (lambda value: len(json.dumps(value, ensure_ascii=False).encode("utf-8")))
     # Trim source text, then oldest feedback, then lowest-ranked candidates; keep task/preferences.
-    while len(json.dumps(request, ensure_ascii=False).encode("utf-8")) > settings.max_prompt_bytes:
+    while measure(request) > settings.max_prompt_bytes:
         with_source = [item for item in request["eligible_skills"] if item.get("source_excerpt")]
         if with_source:
             longest = max(with_source, key=lambda item: len(item["source_excerpt"]))

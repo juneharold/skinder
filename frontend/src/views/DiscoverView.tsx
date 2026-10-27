@@ -126,10 +126,6 @@ export default function DiscoverView({
                 {session.agent === "codex" ? "Codex" : "Claude Code"}
               </strong>
             </div>
-            <div className="sidebar-section">
-              <span className="field-label">Recommendation engine</span>
-              <strong>{session.engine === "codex" ? "Codex" : "Claude Code"}</strong>
-            </div>
             <div className="sidebar-actions">
               <button
                 disabled={preferencesDisabled}
@@ -199,7 +195,7 @@ export default function DiscoverView({
             )}
             {matching || matchBusy ? (
               <div className="empty-state matching-state" role="status">
-                <h2>Finding skills…</h2>
+                <h2>{session.status === "queued" ? "Your task is queued…" : "Finding skills…"}</h2>
                 <p>
                   Matching skills to your task and preferences. This can
                   take a little while.
@@ -218,7 +214,7 @@ export default function DiscoverView({
                     <p>Matching failed. {session.error}</p>
                     {currentSkill && (
                       <button
-                        disabled={!canMatch(session.engine) || writeBusy}
+                        disabled={!canMatch() || writeBusy}
                         onClick={more}
                       >
                         Retry matching
@@ -339,7 +335,7 @@ export default function DiscoverView({
                       className="primary-button"
                       disabled={
                         writeBusy ||
-                        ((retryMatching || canContinue) && !canMatch(session.engine))
+                        ((retryMatching || canContinue) && !canMatch())
                       }
                       onClick={retryMatching || canContinue ? more : onEditTask}
                     >

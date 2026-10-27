@@ -3,7 +3,7 @@ import { api } from "../lib/api";
 import {
   defaultProfile,
   type Agent,
-  type Engine,
+  type AuthState,
   type Health,
   type Feedback,
   type MatchSession,
@@ -50,7 +50,7 @@ export function sessionFor(
     id: "session-1",
     task: "Build a thoughtful landing page",
     agent: "codex",
-    engine: "codex",
+    latest_job: { id: "job-1", status: overrides.status ?? "completed", model: "hosted-model", error: null, error_code: null },
     status: "completed",
     recommendations: skills.map((item) => ({
       skill_id: item.id,
@@ -70,9 +70,12 @@ export function savedItem(item: Skill, savedAt = "2026-10-27T01:00:00Z"): SavedI
   return { skill: item, saved_at: savedAt };
 }
 
-export const readyEngines: Health["engines"] = {
-  codex: { installed: true, authenticated: true, ready: true, message: "Ready." },
-  "claude-code": { installed: true, authenticated: true, ready: true, message: "Ready." },
+export const readyHealth: Health = {
+  status: "ok", catalog_count: 3, indexed_count: 3, retrieval_mode: "hybrid",
+  model: "hosted-model", matching_available: true,
+};
+export const signedIn: AuthState = {
+  user: { id: "user-1", login: "alice", avatar_url: null }, csrf_token: "test-csrf-token",
 };
 
 type BackendOptions = {
@@ -80,7 +83,8 @@ type BackendOptions = {
   saved?: SavedItem[];
   profile?: Profile;
   skills?: Skill[];
-  engines?: Health["engines"];
+  health?: Partial<Health>;
+  auth?: AuthState;
 };
 
 // This models one session for interaction tests; backend tests cover ownership and concurrent writes.
@@ -95,7 +99,9 @@ export function installBackend(options: BackendOptions = {}) {
   const directSaved = new Set(saved.map((item) => item.skill.id));
   const feedbackSaved = new Set<string>();
   let profile = structuredClone(options.profile ?? defaultProfile);
-  const matchRequests: Array<{ task: string; agent: Agent; engine: Engine; session_id?: string }> = [];
+  const matchRequests: Array<{ task: string; agent: Agent; session_id?: string }> = [];
+  const accepted = new Map<string, MatchSession>();
+  let auth = options.auth ?? signedIn;
 
   // Real HTTP responses cannot mutate server state through shared object references.
   const savedResponse = (): Saved => ({ items: structuredClone(saved) });
@@ -147,6 +153,10 @@ export function installBackend(options: BackendOptions = {}) {
     return { feedback, saved: savedResponse() };
   };
 
+  vi.spyOn(api, "me").mockImplementation(async () => structuredClone(auth));
+  vi.spyOn(api, "logout").mockImplementation(async () => {
+    auth = { user: null, csrf_token: null };
+  });
   vi.spyOn(api, "catalog").mockImplementation(async ({ q = "", category, offset = 0, limit = 50 } = {}) => {
     const filtered = skills.filter((item) =>
       (!category || category === item.category) &&
@@ -180,7 +190,8 @@ export function installBackend(options: BackendOptions = {}) {
     catalog_count: skills.length,
     indexed_count: skills.length,
     retrieval_mode: "hybrid",
-    engines: options.engines ?? readyEngines,
+    model: "hosted-model", matching_available: true,
+    ...options.health,
   });
   vi.spyOn(api, "feedback").mockImplementation(async (...args) =>
     persistFeedback(...args),
@@ -211,8 +222,9 @@ export function installBackend(options: BackendOptions = {}) {
     saved = saved.filter((item) => item.skill.id !== id);
     return savedResponse();
   });
-  vi.spyOn(api, "match").mockImplementation(async (task, agent, engine, session_id) => {
-    matchRequests.push({ task, agent, engine, ...(session_id ? { session_id } : {}) });
+  vi.spyOn(api, "match").mockImplementation(async (task, agent, key, session_id) => {
+    if (accepted.has(key)) return structuredClone(accepted.get(key)!);
+    matchRequests.push({ task, agent, ...(session_id ? { session_id } : {}) });
     const previous = session_id && session?.id === session_id ? session : null;
     const previouslyRecommended = new Set(
       previous?.recommendations.map((item) => item.skill_id) ?? [],
@@ -224,15 +236,16 @@ export function installBackend(options: BackendOptions = {}) {
       id: session_id ?? `session-${matchRequests.length + 1}`,
       task,
       agent,
-      engine,
+      latest_job: { id: `job-${matchRequests.length + 1}`, status: "completed", model: "hosted-model" },
       status: "completed",
       feedback: previous?.feedback ?? [],
     });
     session = next;
+    accepted.set(key, next);
     return structuredClone(next);
   });
   vi.spyOn(api, "cancel").mockImplementation(async (id) => {
-    if (session?.id === id) session = { ...session, status: "cancelled" };
+    if (session?.latest_job.id === id) session = { ...session, status: "cancelled", latest_job: { ...session.latest_job, status: "cancelled" } };
     if (!session) throw new Error("There is no active matching session.");
     return structuredClone(session);
   });

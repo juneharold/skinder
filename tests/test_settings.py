@@ -54,3 +54,23 @@ def test_example_is_loadable_without_private_credentials():
     settings.require('ingest')
     assert settings.daily_budget_units == 5
     assert settings.letsur_api_key.get_secret_value() == ''
+
+
+def test_keyword_queries_are_loaded_from_json_and_normalized(monkeypatch):
+    monkeypatch.setenv('SKINDER_SYNC_KEYWORDS', '["coding", " testing ", "coding"]')
+    settings = Settings(_env_file=None)
+    assert settings.sync_keywords == ['coding', 'testing']
+    assert settings.sync_max_requests == 12 and settings.sync_daily_requests == 48
+    assert settings.sync_min_interval_seconds == 6
+
+
+@pytest.mark.parametrize('keywords', [[], [''], ['*'], [' coding* '], ['!!!']])
+def test_invalid_keyword_scopes_are_rejected(keywords):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, sync_keywords=keywords)
+
+
+def test_keyword_queries_respect_provider_length_limit():
+    assert Settings(_env_file=None, sync_keywords=['x' * 200]).sync_keywords == ['x' * 200]
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, sync_keywords=['x' * 201])

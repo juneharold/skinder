@@ -1,4 +1,4 @@
-"""Resumable, best-effort SkillsMP metadata discovery; never a completeness proof."""
+"""Resumable SkillsMP keyword searches; coverage is limited to configured keywords."""
 
 import argparse
 import hashlib
@@ -10,7 +10,6 @@ from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
@@ -27,8 +26,8 @@ from .orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
 from .settings import Settings, load_settings
 
 BASE = "https://skillsmp.com"
-TAXONOMY_LIMIT = 1000
-DIMENSIONS = ("language", "category", "occupation")
+SEARCH_PATH = "/api/v1/skills/search"
+STATE_VERSION = 2
 logger = logging.getLogger(__name__)
 
 
@@ -74,9 +73,7 @@ def sync_status(catalog: CatalogStore) -> dict[str, Any] | None:
                          "imported_unique_total is the durable distinct provider inventory across runs",
         "partition_examples": [{key: value for key, value in row.items()
                                 if key != "fingerprints"} for row in diagnostics],
-        "discovered": {key: len(value) for key, value in state["discovered"].items()},
-        "taxonomy_pages_pending": len(state["discovery_pending"]),
-        "coverage": "best-effort; provider caps and undiscovered taxonomy prevent a completeness proof",
+        "coverage": "best-effort within configured keywords; not a full-catalog inventory",
     }
 
 
@@ -84,44 +81,12 @@ class Paused(Exception):
     pass
 
 
-class TaxonomyLinks(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.links = set()
-
-    def handle_starttag(self, tag, attrs):
-        # General page links must not grow the crawl beyond the provider's taxonomy.
-        if tag != "a":
-            return
-        href = dict(attrs).get("href", "")
-        url = urlsplit(urljoin(BASE, href))
-        if url.scheme != "https" or url.netloc != "skillsmp.com":
-            return
-        path = url.path.rstrip("/")
-        if not re.fullmatch(r"/(categories|occupations)/[a-zA-Z0-9_/-]+", path):
-            return
-        self.links.add(path)
+class BudgetReached(Paused):
+    pass
 
 
-def language_values(document: Any) -> list[str]:
-    """Find language enums in parameters or named schemas in the public API contract."""
-    result = set()
-
-    def visit(value, language=False):
-        # Language context must survive nested parameter and schema wrappers.
-        if isinstance(value, dict):
-            language = language or value.get("name") in ("language", "contentLanguage")
-            if language and isinstance(value.get("enum"), list):
-                result.update(x for x in value["enum"] if isinstance(x, str)
-                              and re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]+)*", x))
-            for key, child in value.items():
-                visit(child, language or "language" in key.lower())
-        elif isinstance(value, list):
-            for child in value:
-                visit(child, language)
-
-    visit(document)
-    return sorted(result)
+class SearchUncertain(Paused):
+    pass
 
 
 def import_skill(
@@ -155,7 +120,7 @@ def import_skill(
             branch, directory = parts[3], "/".join(parts[4:])
         if parts[2] == "blob":
             path = directory
-        elif not (path == directory or path.startswith(directory + "/")):
+        elif not path or not (path == directory or path.startswith(directory + "/")):
             # Providers mix directory-relative and repository-relative paths for the same skill.
             path = (directory + "/" if directory else "") + (path or "SKILL.md")
     if not branch or not path or any(x in ("", ".", "..") for x in path.split("/")):
@@ -167,7 +132,7 @@ def import_skill(
     tags = set(previous.tags if previous else [])
     if category:
         tags.add(category)
-    route = row.get("route")
+    route = row.get("skillUrl") or row.get("route")
     provider_url = urljoin(BASE, route) if isinstance(route, str) else None
     if provider_url and (urlsplit(provider_url).scheme != "https"
                          or urlsplit(provider_url).netloc != "skillsmp.com"):
@@ -189,8 +154,8 @@ def import_skill(
 
 class Sync:
     def __init__(
-        self, catalog: CatalogStore, client: httpx.Client, *, settings: Settings | None = None, max_requests: int | None = None,
-        sleep: Callable[[float], None] = time.sleep,
+        self, catalog: CatalogStore, client: httpx.Client, *, settings: Settings | None = None,
+        max_requests: int | None = None, sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.catalog, self.client = catalog, client
@@ -200,18 +165,34 @@ class Sync:
         self.calls, self.last_call = 0, None
         with catalog.db_sessions.begin() as session:
             row = session.get(SyncRunRecord, 1)
-            self.state = row.data if row else None
-            # Completed runs recrawl; paused runs retain their frontier without clearing inventory.
-            if not self.state or self.state["status"] == "completed":
+            self.state = dict(row.data) if row else {}
+            # Replace obsolete crawl checkpoints, preserving inventory and request accounting.
+            if self.state.get("version") != STATE_VERSION:
                 session.execute(delete(SyncPartitionRecord))
-                self.state = {
-                    "status": "running", "started_at": now(), "updated_at": now(),
-                    "requests": 0, "added": 0, "updated": 0, "duplicates": 0, "invalid": 0,
-                    "discovery_pending": ["/categories", "/occupations", "/openapi.json"],
-                    "discovery_seen": [], "discovered": {x: [] for x in DIMENSIONS},
-                    "warnings": [], "last_error": None,
-                }
-        self.enqueue({})
+                self.state = {key: value for key, value in self.state.items() if key in (
+                    "budget_date", "daily_requests", "provider_daily_remaining", "retry_after",
+                    "last_request_at",
+                )}
+            if self.state.get("status") in (None, "completed"):
+                self.state.update(
+                    version=STATE_VERSION, status="running", started_at=now(), updated_at=now(),
+                    requests=0, added=0, updated=0, duplicates=0, invalid=0,
+                    warnings=[], last_error=None,
+                )
+                # A new scan refreshes bounded windows; uncertain charges remain blocked.
+                session.execute(delete(SyncPartitionRecord).where(
+                    SyncPartitionRecord.status != "pending",
+                    SyncPartitionRecord.data["retry_blocked"].as_boolean().is_not(True),
+                ))
+            self.state["keywords"] = self.settings.sync_keywords
+            session.execute(delete(SyncPartitionRecord).where(
+                SyncPartitionRecord.data["query"].as_string().not_in(self.settings.sync_keywords),
+            ))
+            for query in self.settings.sync_keywords:
+                session.execute(insert(SyncPartitionRecord).values(
+                    key=query, status="pending",
+                    data={"query": query, "page": 1, "fingerprints": [], "capped": False},
+                ).on_conflict_do_nothing(index_elements=["key"]))
         self.save()
 
     def save(self):
@@ -219,43 +200,48 @@ class Sync:
         with self.catalog.db_sessions.begin() as session:
             session.merge(SyncRunRecord(id=1, data=dict(self.state)))
 
-    def enqueue(self, filters, sort="stars"):
-        # Repeated discovery must not reset a partition's saved page or completion state.
-        key = json.dumps({"filters": filters, "sort": sort}, sort_keys=True)
-        data = {"filters": filters, "sort": sort, "page": 1, "fingerprints": [], "capped": False}
-        with self.catalog.db_sessions.begin() as session:
-            session.execute(insert(SyncPartitionRecord).values(
-                key=key, status="pending", data=data,
-            ).on_conflict_do_nothing(index_elements=["key"]))
-
     def checkpoint(self, key, data, status="pending"):
-        # Upserts precede this checkpoint; interruption can replay a page, so imports are idempotent.
+        # Upserts precede the checkpoint; interrupted page imports are idempotent.
         with self.catalog.db_sessions.begin() as session:
             session.execute(update(SyncPartitionRecord).where(
                 SyncPartitionRecord.key == key
             ).values(status=status, data=data))
         self.save()
 
-    def request(self, path, params=None):
-        # Discovery and retries consume the same invocation budget as ingestion requests.
+    def request(self, params):
         for attempt in range(4):
-            if self.max_requests is not None and self.calls >= self.max_requests:
-                raise Paused("Request budget reached; rerun to resume")
-            # Wait once for the longest of backoff, provider cooldown, and normal pacing.
+            if self.calls >= self.max_requests:
+                raise BudgetReached("Request budget reached; rerun to resume")
+            today = datetime.fromtimestamp(time.time(), UTC).date().isoformat()
+            if self.state.get("budget_date") != today:
+                self.state.update(budget_date=today, daily_requests=0)
+                self.state.pop("provider_daily_remaining", None)
+            if (self.state["daily_requests"] >= self.settings.sync_daily_requests
+                    or self.state.get("provider_daily_remaining") == 0):
+                raise BudgetReached("Daily request budget exhausted; resume after midnight UTC")
             delay = max(2 ** attempt if attempt else 0,
-                        self.state.get("retry_after", 0) - time.time())
+                        self.state.get("retry_after", 0) - time.time(),
+                        self.settings.sync_min_interval_seconds
+                        - (time.time() - self.state.get("last_request_at", 0)))
             if self.last_call is not None:
-                delay = max(delay, self.settings.sync_min_interval_seconds - (self.monotonic() - self.last_call))
-            if attempt:
-                logger.info("Retrying SkillsMP %s in %.1fs (retry %s/3)", path, delay, attempt)
+                delay = max(delay, self.settings.sync_min_interval_seconds
+                            - (self.monotonic() - self.last_call))
+            # Long provider cooldowns belong to a later scheduled invocation.
+            if delay > 60:
+                raise Paused("Provider cooldown active; resume after retry_after")
             if delay:
                 self.sleep(delay)
             self.calls += 1
             self.state["requests"] += 1
+            self.state["daily_requests"] += 1
+            if self.state.get("provider_daily_remaining") is not None:
+                self.state["provider_daily_remaining"] -= 1
+            self.state["last_request_at"] = time.time()
+            # Reserve the request durably before sending, including retries and interruptions.
             self.save()
             self.last_call = self.monotonic()
             try:
-                response = self.client.get(BASE + path, params=params)
+                response = self.client.get(BASE + SEARCH_PATH, params=params)
             except httpx.TransportError as exc:
                 if attempt == 3:
                     raise Paused(f"Transport failure: {type(exc).__name__}") from None
@@ -267,119 +253,57 @@ class Sync:
                 except ValueError:
                     try:
                         delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError, OverflowError):
                         delay = 0
-                # Persist an absolute deadline so a paused process also respects Retry-After.
-                self.state["retry_after"] = time.time() + max(0, delay)
+                self.state["retry_after"] = max(self.state.get("retry_after", 0),
+                                                time.time() + max(0, delay))
+            remaining = response.headers.get("X-RateLimit-Daily-Remaining")
+            if remaining is not None and remaining.isdigit():
+                self.state["provider_daily_remaining"] = int(remaining)
+            self.save()
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            error = payload.get("error") if isinstance(payload, dict) else None
+            code = error.get("code") if isinstance(error, dict) else None
+            if code == "SEARCH_COMPLETION_UNCERTAIN":
+                raise SearchUncertain("SEARCH_COMPLETION_UNCERTAIN: review provider usage before retrying")
+            if code == "DAILY_QUOTA_EXCEEDED":
+                self.state["provider_daily_remaining"] = 0
                 self.save()
+                raise Paused("Provider daily quota exhausted; resume after midnight UTC")
             if response.status_code in (401, 403):
-                # Authentication/authorization failures will not improve with retries.
-                raise Paused(f"Provider access/quota response HTTP {response.status_code}")
+                # Persist a cooldown so scheduled restarts cannot hammer an access failure.
+                midnight = (int(time.time()) // 86400 + 1) * 86400
+                self.state["retry_after"] = max(self.state.get("retry_after", 0), midnight)
+                self.save()
+                raise Paused(f"Provider access response HTTP {response.status_code}")
             if response.status_code >= 500 or response.status_code in (408, 429):
                 if attempt == 3:
                     raise Paused(f"Provider retries exhausted: HTTP {response.status_code}")
                 continue
             if response.status_code != 200:
-                raise Paused(f"Unexpected provider response HTTP {response.status_code} for {path}")
+                raise Paused(f"Unexpected provider response HTTP {response.status_code}")
             return response
-
-    def discover(self):
-        path = self.state["discovery_pending"][0]
-        response = self.request(path)
-        if path == "/openapi.json":
-            try:
-                values = language_values(response.json())
-            except (ValueError, TypeError) as exc:
-                raise Paused("Malformed OpenAPI document") from exc
-            if not values:
-                raise Paused("Public OpenAPI has no discoverable language enum")
-            for value in values:
-                self.add_filter("language", value)
-        else:
-            parser = TaxonomyLinks()
-            parser.feed(response.text)
-            # An empty leaf is valid; empty roots could conceal blocked or changed discovery.
-            if not parser.links and path in ("/categories", "/occupations"):
-                raise Paused(f"No taxonomy links found on {path}; provider format/access may have changed")
-            for link in sorted(parser.links):
-                kind, value = link.strip("/").split("/", 1)
-                # A known or omitted taxonomy page can still contribute a newly found filter.
-                self.add_filter("category" if kind == "categories" else "occupation", value)
-                if link in self.state["discovery_seen"] or link in self.state["discovery_pending"]:
-                    continue
-                if len(self.state["discovery_seen"]) + len(self.state["discovery_pending"]) >= TAXONOMY_LIMIT:
-                    self.warn(f"Taxonomy discovery bounded at {TAXONOMY_LIMIT} pages; additional pages omitted")
-                    continue
-                self.state["discovery_pending"].append(link)
-            if not parser.links:
-                self.warn(f"No additional taxonomy links found on {path}")
-        self.state["discovery_pending"].pop(0)
-        self.state["discovery_seen"].append(path)
-        self.save()
-
-    def add_filter(self, kind, value):
-        if value in self.state["discovered"][kind]:
-            return
-        self.state["discovered"][kind].append(value)
-        self.enqueue({kind: value})
-        # Newly found filters must also refine capped groups discovered earlier.
-        with self.catalog.db_sessions() as session:
-            partitions = session.execute(select(
-                SyncPartitionRecord.key, SyncPartitionRecord.data,
-            ).where(SyncPartitionRecord.data["capped"].as_boolean().is_(True))).all()
-        for row in partitions:
-            data = row.data
-            if not self.expand(data):
-                continue
-            with self.catalog.db_sessions.begin() as session:
-                session.execute(update(SyncPartitionRecord).where(
-                    SyncPartitionRecord.key == row.key
-                ).values(data=data))
-
-    def warn(self, message):
-        if message not in self.state["warnings"]:
-            self.state["warnings"].append(message)
-
-    def expand(self, data):
-        # Only stars partitions spawn refinements; recent partitions are alternate capped windows.
-        if data["sort"] != "stars":
-            return False
-        changed = False
-        if not data.get("recent_enqueued"):
-            self.enqueue(data["filters"], "recent")
-            data["recent_enqueued"] = changed = True
-        for dimension in DIMENSIONS:
-            if dimension in data["filters"]:
-                continue
-            # The saved count belongs to this first missing dimension, even while its list is empty.
-            values = self.state["discovered"][dimension]
-            count = data.get("expanded_values", 0)
-            for value in values[count:]:
-                self.enqueue(data["filters"] | {dimension: value})
-            data["expanded_values"] = len(values)
-            return changed or count != len(values)
-        return changed
 
     def page(self, key, data):
         try:
-            response = self.request("/api/skills", {
-                # The website listing endpoint permits 48, unlike REST search's limit of 50.
-                **data["filters"], "page": data["page"], "limit": 48, "sortBy": data["sort"],
-            })
-        except Paused as exc:
-            # A local request budget is not a provider error and must leave the page retryable.
-            if not str(exc).startswith("Request budget reached"):
-                data["error"] = str(exc)
-                self.checkpoint(key, data)
+            response = self.request({"q": data["query"], "page": data["page"],
+                                     "limit": 50, "sortBy": "stars"})
+        except SearchUncertain as exc:
+            data["retry_blocked"] = True
+            data["error"] = str(exc)
+            self.checkpoint(key, data, "unresolved")
             raise
         try:
             payload = response.json()
-            rows, pagination = payload["skills"], payload["pagination"]
+            if payload["success"] is not True:
+                raise ValueError("Unsuccessful search")
+            rows, pagination = payload["data"]["skills"], payload["data"]["pagination"]
             if not isinstance(rows, list) or not isinstance(pagination, dict):
                 raise TypeError("Wrong container types")
-            page = pagination["page"]
-            has_next = pagination["hasNext"]
-            # Python considers bool an int; this API contract requires distinct field types.
+            page, has_next = pagination["page"], pagination["hasNext"]
             if type(page) is not int or type(has_next) is not bool:
                 raise ValueError("Missing page/hasNext contract")
         except (KeyError, ValueError, TypeError) as exc:
@@ -390,26 +314,18 @@ class Sync:
         data["capped"] = data["capped"] or pagination.get("isCapped") is True
         data["total"] = pagination.get("total")
         data["max_results"] = pagination.get("maxResults")
-        if pagination.get("totalIsExact") is not True:
-            self.warn("Some provider totals are estimates; exact coverage is unknown")
-        fingerprint = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
-        # Sorting IDs detects repeats even if result order or per-row statistics have changed.
         identifiers = sorted(str(row.get("id")) for row in rows if isinstance(row, dict))
-        if identifiers:
-            fingerprint = hashlib.sha256(json.dumps(identifiers).encode()).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps(identifiers or rows, sort_keys=True).encode()).hexdigest()
         if page != data["page"] or fingerprint in data["fingerprints"] or (has_next and not rows):
             data["error"] = "Provider repeated a page or stopped advancing"
-            if data["capped"]:
-                self.expand(data)
             self.checkpoint(key, data, "unresolved")
             return
-        # Reject bad rows individually so one malformed listing cannot block later pages.
         for row in rows:
             try:
-                skill = import_skill(row, data["filters"].get("category"))
+                skill = import_skill(row)
                 previous = self.catalog.get(skill.id)
                 if previous:
-                    skill = import_skill(row, data["filters"].get("category"), previous)
+                    skill = import_skill(row, previous=previous)
                 outcome = self.catalog.upsert(skill, provider_id=row["id"], raw=row,
                                               source_updated_at=row.get("updatedAt"))
                 self.state["duplicates" if outcome == "unchanged" else outcome] += 1
@@ -417,42 +333,36 @@ class Sync:
                 self.state["invalid"] += 1
         data["fingerprints"].append(fingerprint)
         data["page"] += 1
-        if data["capped"]:
-            self.expand(data)
-        # A fully refined cap remains unresolved even when pagination claims this is the end.
-        terminal_cap = data["capped"] and all(x in data["filters"] for x in DIMENSIONS)
-        status = "pending" if has_next else "unresolved" if terminal_cap else "completed"
+        # Estimated totals/totalPages are not stopping conditions; follow explicit hasNext.
+        if has_next:
+            status = "pending"
+        elif data["capped"]:
+            status = "unresolved"
+        else:
+            status = "completed"
         self.checkpoint(key, data, status)
-        logger.info("SkillsMP page %s: %s rows; added %s, updated %s, duplicate observations %s",
-                    page, len(rows), self.state["added"], self.state["updated"], self.state["duplicates"])
+        logger.info("SkillsMP query %r page %s: %s rows; added %s, updated %s, duplicates %s",
+                    data["query"], page, len(rows), self.state["added"],
+                    self.state["updated"], self.state["duplicates"])
 
     def run(self):
-        self.state.update(status="running", last_error=None)
+        self.state.update(status="running", last_error=None, pause_reason=None)
         self.save()
         try:
-            # Seed every dimension before ingestion so early capped partitions can be refined.
-            while any(path not in self.state["discovery_seen"] for path in (
-                "/categories", "/occupations", "/openapi.json",
-            )):
-                self.discover()
-            # Alternate both queues so a large taxonomy or catalog cannot starve the other.
             while True:
                 with self.catalog.db_sessions() as session:
                     partition = session.execute(select(
                         SyncPartitionRecord.key, SyncPartitionRecord.data,
                     ).where(SyncPartitionRecord.status == "pending").order_by(
-                        SyncPartitionRecord.ordinal
+                        SyncPartitionRecord.data["page"].as_integer(), SyncPartitionRecord.ordinal,
                     ).limit(1)).first()
-                if partition:
-                    self.page(partition.key, partition.data)
-                if self.state["discovery_pending"]:
-                    self.discover()
-                elif not partition:
+                if not partition:
                     break
-            # Drained queues finish a run; unresolved caps still prevent a coverage claim.
+                self.page(partition.key, partition.data)
             self.state["status"] = "completed"
         except Paused as exc:
-            self.state.update(status="paused", last_error=str(exc))
+            self.state.update(status="paused", last_error=str(exc),
+                              pause_reason="budget" if isinstance(exc, BudgetReached) else "provider")
         except KeyboardInterrupt:
             self.state.update(status="paused", last_error="Interrupted; rerun to resume")
             raise
@@ -518,7 +428,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 from .retrieval import index_catalog
                 result["index"] = index_catalog(catalog, allow_download=False)
                 print(json.dumps(result, indent=2))
-                if result.get("sync", {}).get("status") == "paused":
+                if (result.get("sync", {}).get("status") == "paused"
+                        and result["sync"].get("pause_reason") != "budget"):
                     raise SystemExit(2)
         except RuntimeError as exc:
             parser.exit(1, str(exc) + "\n")

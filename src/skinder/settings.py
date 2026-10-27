@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, ValidationError, model_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -60,9 +60,23 @@ class Settings(BaseSettings):
     embedding_model_dir: Path = Path("/opt/skinder/models/e5-small")
     embedding_threads: int = Field(4, gt=0)
     embedding_batch_size: int = Field(64, gt=0)
-    sync_max_requests: int = Field(300, gt=0)
+    sync_keywords: list[str] = Field(default_factory=lambda: [
+        "coding", "testing", "design", "data", "documentation", "automation",
+    ], min_length=1)
+    sync_max_requests: int = Field(12, gt=0)
+    sync_daily_requests: int = Field(48, gt=0, le=50)
     sync_http_timeout_seconds: float = Field(30, gt=0)
-    sync_min_interval_seconds: float = Field(2, ge=2)
+    sync_min_interval_seconds: float = Field(6, ge=6)
+
+    @field_validator("sync_keywords")
+    @classmethod
+    def valid_sync_keywords(cls, values):
+        keywords = list(dict.fromkeys(value.strip() for value in values))
+        if any(len(value) > 200 for value in keywords):
+            raise ValueError("SKINDER_SYNC_KEYWORDS queries must be at most 200 characters")
+        if any(not any(char.isalnum() for char in value) or "*" in value for value in keywords):
+            raise ValueError("SKINDER_SYNC_KEYWORDS must contain concrete keyword queries")
+        return keywords
 
     @model_validator(mode="after")
     def consistent_configuration(self):

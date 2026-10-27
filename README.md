@@ -2,7 +2,7 @@
 
 Skinder helps people find agent skills that fit a task and their working style. It imports public listings, searches skill descriptions and source files, and uses a language model to explain recommendations. It does not install or execute discovered skills.
 
-The hosted app uses PostgreSQL with pgvector. The web process handles GitHub sign-in and the interface; a separate worker claims and processes matching jobs. A one-off ingest process imports the catalog and builds its embedding index.
+The hosted app uses PostgreSQL with pgvector. The web process handles GitHub sign-in and the interface; a separate worker claims and processes matching jobs. A scheduled ingest process searches SkillsMP through its documented API for a configured set of keywords and builds its embedding index.
 
 Each matching request has an idempotency key and a persisted job. Jobs capture the task, preferences, feedback, model, and prompt instructions when accepted. Workers use expiring leases and ownership tokens; restarting the API does not interrupt them. A worker failure before dispatch can be recovered. If the model may already have run, the job fails without an automatic second call. Cancellation prevents publication, but cannot guarantee that a remote model stopped or that its usage was refunded.
 
@@ -35,9 +35,7 @@ The image includes the pinned E5-small model and verifies its files during image
 docker compose --profile ops run --rm ingest
 ```
 
-Ingest resumes interrupted imports. It can take hours, depending on provider responses. Compose does not run ingest automatically when the app starts.
-
-A bounded run exits with code 2 after checkpointing a pause. Its JSON report distinguishes an exhausted request budget from a provider failure. Rerunning resumes the checkpoint; the scheduled service does not automatically retry exited runs.
+Ingest uses the configured keyword list and resumes unfinished searches from durable page checkpoints. Completed keyword windows are searched again on a later run. It does not enumerate the full SkillsMP catalog. Each run is bounded by a request budget, and a persisted daily budget limits total calls across runs. A request-budget pause exits successfully with `pause_reason=budget`; the next run resumes unfinished searches. Provider failures exit with code 2 and `pause_reason=provider`. Compose does not run ingest automatically when the app starts.
 
 For backend development without containers, install dependencies with `uv sync --frozen` and `npm ci --prefix frontend`. Run PostgreSQL with pgvector on port 55433 and set `DATABASE_URL` in `.env` to `postgresql+psycopg://skinder:skinder@127.0.0.1:55433/skinder`. Set `SKINDER_EMBEDDING_MODEL_DIR` to a writable local directory and prepare the pinned model explicitly:
 
@@ -64,24 +62,30 @@ Start the worker in another terminal with `uv run skinder-worker`. The web entry
 | `LETSUR_BASE_URL` | Worker | HTTPS model API endpoint. |
 | `LETSUR_MODEL` | Web and worker | Model name, shared across services. Each accepted job retains its selected model. |
 | `SKINDER_EMBEDDING_MODEL_DIR` | All roles | Bundled E5-small model path; image default is `/opt/skinder/models/e5-small`. |
+| `SKINDER_SYNC_KEYWORDS` | Ingest | JSON array of SkillsMP search terms. Default: `["coding","testing","design","data","documentation","automation"]`. |
+| `SKINDER_SYNC_MAX_REQUESTS` | Ingest | Maximum remote requests per run, including retries. Default: `12`. |
+| `SKINDER_SYNC_DAILY_REQUESTS` | Ingest | Maximum remote requests per UTC day across runs. Default: `48`. |
+| `SKINDER_SYNC_MIN_INTERVAL_SECONDS` | Ingest | Minimum seconds between requests. Default: `6`. |
 
 Other `SKINDER_*` variables tune database pools, session expiry, model request limits, job budgets and timeouts, source fetching, and catalog sync. The example file documents their default values. Quotas reset at 00:00 UTC. A web service needs database, GitHub, and session credentials. A worker needs database and Letsur credentials. Ingest and migrations need no GitHub or model API credentials; indexing needs the prepared embedding files. Configuration is loaded once per process, so restart affected services after changes. Request logs contain route patterns, not query strings or submitted content.
 
 ## Deploy on Railway
 
-Create three Railway services from this repository and select the matching config file in each service's settings: [`railway.web.json`](railway.web.json), [`railway.worker.json`](railway.worker.json), and [`railway.ingest.json`](railway.ingest.json). They all build the same Docker image. The web service runs migrations before deployment and checks `/health/ready`; the worker has no HTTP health port. The ingest service runs on the `0 */6 * * *` schedule. Ensure only one scheduled ingest service is active for a database.
+Create four services in the project: three application services from the same GitHub repository, plus PostgreSQL. Configure each application service in Railway's dashboard. Railway has deprecated Config as Code. New services cannot opt in to these legacy files; existing legacy services are supported through December 1, 2026. See [Railway's Config as Code migration notice](https://docs.railway.com/config-as-code/reference).
 
-Provision PostgreSQL 18 with the pgvector 0.8.7 extension, enable persistent storage, and use the database provider's backups. Set `DATABASE_URL` on all three services to the provider's private connection URL. Keep the database private. Verify that backups are enabled and perform a restore exercise before relying on the deployment for durable user data; the application image and service filesystem are not a database backup.
+For each application service, select the Dockerfile builder and set the Dockerfile path to `Dockerfile` at the repository root.
 
-Set these variables on Railway:
+- **Web:** start command `skinder`; pre-deploy command `skinder-migrate`; healthcheck path `/health/ready`, timeout 300 seconds; restart on failure, up to 10 retries.
+- **Worker:** start command `skinder-worker`; restart on failure, up to 10 retries.
+- **Ingest:** start command `best-effort-full-sync`; schedule `0 */6 * * *`; restart policy `Never` (the cron schedule starts each run).
 
-- **Web:** `APP_ORIGIN` (the public HTTPS origin), `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and a unique `SESSION_SECRET` with at least 32 characters.
-- **Worker:** `LETSUR_API_KEY`.
-- **All roles:** `DATABASE_URL` using the private PostgreSQL connection URL. Share `LETSUR_MODEL` and job/quota settings between web and worker. Set `SKINDER_ENV=production` and `APP_ORIGIN` on web.
+Provision PostgreSQL with `pgvector/pgvector:0.8.7-pg18-bookworm`. Attach persistent storage mounted at `/var/lib/postgresql` and set `PGDATA=/var/lib/postgresql/18/docker`. Keep the database private. Set its private `DATABASE_URL` on all three application services. The web pre-deploy migration creates the `vector` extension and application schema.
 
-Set the GitHub OAuth callback URL to `{APP_ORIGIN}/api/auth/callback`. Use the exact same public origin in the GitHub OAuth app and `APP_ORIGIN`; cookies are secure when the origin uses HTTPS. Do not expose the database publicly or share the session secret across unrelated applications.
+Set `SKINDER_ENV=production` and the public HTTPS `APP_ORIGIN` on the web service. Add the GitHub OAuth client ID and secret, and a unique `SESSION_SECRET` of at least 32 characters. Set `LETSUR_API_KEY` on the worker. Set matching `LETSUR_MODEL` values on web and worker. On the ingest service, set `SKINDER_SYNC_KEYWORDS` to a JSON array if you want different search terms; its default is a bounded starter set. The documented [SkillsMP search API](https://skillsmp.com/docs/api) allows anonymous keyword requests, so no SkillsMP API key is required. Its documented anonymous allowance is 50 requests per day. The app caps itself at 48 requests per day by default; other anonymous calls from the same IP may also use the provider allowance. This keyword search does not enumerate the full catalog and cannot guarantee complete coverage.
 
-The web and worker services each open a database connection pool, so size PostgreSQL for the combined pool limits. Keep one web service and one or more workers within the configured concurrency and database capacity. The ingest schedule is best-effort: upstream caps, changing search results, and provider access limits mean it does not guarantee a complete catalog. Listings do not establish compatibility, license, or revision; these remain unknown without source evidence. Recommendations send the task, preferences, shortlisted descriptions, source excerpts, and relevant feedback to the configured model provider. Review that data flow and provider terms before inviting users.
+Set the GitHub OAuth callback URL to `{APP_ORIGIN}/api/auth/callback`, using the same public origin as the web service. Railway's pre-deploy command runs with that service's environment variables and private network access; it does not mount service volumes. The migration only needs `DATABASE_URL`. See [Railway's pre-deploy command guide](https://docs.railway.com/deployments/pre-deploy-command).
+
+Check the database plan's backup options, confirm backups are enabled, and perform a restore exercise before relying on the deployment for durable user data. Availability depends on the selected plan; the application image and service filesystem are not database backups. Keep one web service and one or more workers within the configured concurrency and database capacity. Listings do not establish compatibility, license, or revision; these remain unknown without source evidence. Recommendations send the task, preferences, shortlisted descriptions, source excerpts, and relevant feedback to the configured model provider. Review that data flow and the provider's terms before inviting users.
 
 ## Checks
 

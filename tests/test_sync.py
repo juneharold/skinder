@@ -1,4 +1,4 @@
-"""Offline provider-contract tests assert durable catalog and crawl outcomes."""
+"""Offline tests cover the public search contract and durable importer outcomes."""
 
 import json
 from datetime import UTC, datetime
@@ -11,38 +11,37 @@ from sqlalchemy import func, select
 
 from skinder.catalog import CatalogStore, stable_id
 from skinder.orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
-from skinder.sync import Sync, TaxonomyLinks, import_skill, sync_status
+from skinder.sync import Sync, import_skill, sync_status
 
 
 def skill_row(name="one", **changes):
-    return {"id": name, "name": name, "description": "A verified provider description.",
+    return {"id": name, "name": name, "description": "A provider description.",
             "githubUrl": f"https://github.com/example/repo/tree/main/skills/{name}",
-            "path": "SKILL.md", "branch": "main", "author": "example",
-            "contentLanguage": "en", "route": f"/skills/{name}", **changes}
+            "author": "example", "contentLanguage": "en",
+            "skillUrl": f"https://skillsmp.com/skills/{name}", **changes}
 
 
-def page(rows, number=1, *, more=False, capped=False, total=1, exact=True):
-    return {"skills": rows, "pagination": {"page": number, "hasNext": more,
-            "total": total, "totalIsExact": exact, "isCapped": capped,
-            "maxResults": 480 if capped else 1200}}
+def page(rows, number=1, *, more=False, capped=False):
+    return {"success": True, "data": {"skills": rows, "pagination": {
+        "page": number, "limit": 50, "hasNext": more, "hasPrev": number > 1,
+        "total": 50, "totalPages": 1, "totalIsExact": False,
+        "isCapped": capped, "maxResults": 5000,
+    }}}
 
 
 class Provider:
     def __init__(self, skills):
-        self.skills = skills
-        self.calls = []
+        self.skills, self.calls = skills, []
         self.client = httpx.Client(transport=httpx.MockTransport(self.handle))
 
     def handle(self, request):
         self.calls.append(request)
-        path = request.url.path
-        if path == "/openapi.json":
-            return httpx.Response(200, json={"parameters": [
-                {"name": "language", "schema": {"enum": ["en"]}}]})
-        if path.startswith("/categories"):
-            return httpx.Response(200, text='<a href="/categories/tools">Tools</a>')
-        if path.startswith("/occupations"):
-            return httpx.Response(200, text='<a href="/occupations/developer">Developer</a>')
+        assert request.url.path == "/api/v1/skills/search"
+        assert request.url.params["q"] in {
+            "coding", "testing", "design", "data", "documentation", "automation",
+        }
+        assert request.url.params["limit"] == "50"
+        assert request.url.params["sortBy"] == "stars"
         result = self.skills(request)
         return result if isinstance(result, httpx.Response) else httpx.Response(200, json=result)
 
@@ -78,264 +77,239 @@ def test_status_read_does_not_create_sync_state(catalog):
         assert session.scalar(select(func.count()).select_from(SyncPartitionRecord)) == 0
 
 
-def test_taxonomy_links_accept_only_provider_taxonomy_anchors():
-    parser = TaxonomyLinks()
-    parser.feed('''
-        <a href="/categories/tools/">Tools</a>
-        <a href="https://skillsmp.com/occupations/software/developer">Developer</a>
-        <a href="/categories/tools">Duplicate</a>
-        <img href="/categories/image">
-        <a href="http://skillsmp.com/categories/insecure">Insecure</a>
-        <a href="https://other.example/categories/external">External</a>
-        <a href="https://skillsmp.com.evil.test/categories/lookalike">Lookalike</a>
-        <a href="/skills/other">Skill</a>
-        <a href="/categories/">Root</a>
-        <a>No link</a>
-    ''')
-
-    assert parser.links == {"/categories/tools", "/occupations/software/developer"}
-
-
-def test_discovery_bounds_unique_pages_but_keeps_all_filters(catalog, monkeypatch):
-    from skinder import sync as module
-
-    monkeypatch.setattr(module, "TAXONOMY_LIMIT", 4)
-    document = '''
-        <a href="/categories/a">A</a>
-        <a href="/categories/a/">Duplicate A</a>
-        <a href="/categories/b">B</a>
-        <a href="/categories/queued">Queued</a>
-        <a href="/categories/seen">Seen</a>
-    '''
-    with httpx.Client(transport=httpx.MockTransport(
-        lambda request: httpx.Response(200, text=document),
-    )) as client:
-        sync = Sync(catalog, client, sleep=lambda _: None)
-        sync.state["discovery_pending"] = ["/categories", "/categories/queued"]
-        sync.state["discovery_seen"] = ["/categories/seen"]
-
-        sync.discover()
-
-    with catalog.db_sessions() as session:
-        state = session.get(SyncRunRecord, 1).data
-        partitions = [data for data in session.scalars(select(SyncPartitionRecord.data))]
-    assert state["discovery_pending"] == ["/categories/queued", "/categories/a"]
-    assert state["discovery_seen"] == ["/categories/seen", "/categories"]
-    assert state["discovered"]["category"] == ["a", "b", "queued", "seen"]
-    assert {row["filters"]["category"] for row in partitions if "category" in row["filters"]} == {
-        "a", "b", "queued", "seen",
-    }
-    assert len(partitions) == 5
-    assert len(state["warnings"]) == 1
-
-
-@pytest.mark.parametrize("filters, missing, later", [
-    ({}, "language", "category"),
-    ({"language": "en"}, "category", "occupation"),
-])
-def test_expansion_waits_for_first_missing_dimension(catalog, filters, missing, later):
-    provider = Provider(lambda _: page([]))
-    sync = Sync(catalog, provider.client, sleep=lambda _: None)
-    sync.state["discovered"][later] = ["known"]
-    data = {"filters": filters, "sort": "stars", "recent_enqueued": True}
-
-    sync.expand(data)
-
-    with catalog.db_sessions() as session:
-        queued = [row["filters"]
-                  for row in session.scalars(select(SyncPartitionRecord.data))]
-    assert queued == [{}]
-
-    sync.state["discovered"][missing] = ["new"]
-    sync.expand(data)
-
-    with catalog.db_sessions() as session:
-        queued = [row["filters"]
-                  for row in session.scalars(select(SyncPartitionRecord.data))]
-    assert len(queued) == 2
-    assert {} in queued
-    assert filters | {missing: "new"} in queued
-
-
-def test_overlapping_partitions_preserve_id_metadata_and_category(catalog):
+def test_overlap_preserves_source_identity_metadata_and_aliases(catalog):
     provider = Provider(lambda _: page([skill_row()]))
-    first = run(catalog, provider)
-    identifier = stable_id("example/repo", "skills/one/SKILL.md")
-    skill = catalog.get(identifier)
-    assert catalog.count() == 1
-    assert skill.category == "tools"
-    assert skill.tags == ["tools"]
+    status = run(catalog, provider)
+    skill = catalog.get(stable_id("example/repo", "skills/one/SKILL.md"))
+    assert catalog.count() == status["imported_unique_total"] == 1
+    assert status["added"] == 1 and status["duplicates"] == 5
     assert skill.source_url == "https://github.com/example/repo/blob/main/skills/one/SKILL.md"
+    assert skill.provider_url == "https://skillsmp.com/skills/one"
+    assert skill.provenance == "skillsmp" and skill.content_language == "en"
+    assert skill.category == "Uncategorized" and skill.tags == []
     assert skill.revision is None and skill.license is None and skill.compatibility is None
-    assert skill.workflow == [] and skill.install_commands.codex is None
-    assert first["status"] == "completed"
-    assert first["added"] == 1 and first["duplicates"] >= 2
-    second = run(catalog, provider)
-    assert catalog.count() == 1 and catalog.get(identifier) == skill
-    assert second["added"] == 0
+    assert run(catalog, provider)["added"] == 0
+    assert catalog.get(skill.id) == skill
 
 
-@pytest.mark.parametrize("total", [480, 1200])
-def test_exact_capped_totals_expand_all_dimensions_and_recent_window(catalog, total):
-    provider = Provider(lambda _: page([skill_row()], capped=True, total=total, exact=True))
-    status = run(catalog, provider)
-    queries = [dict(request.url.params) for request in provider.calls
-               if request.url.path == "/api/skills"]
-    assert any(all(key in query for key in ("category", "occupation", "language"))
-               and query["sortBy"] == "recent" for query in queries)
-    assert len({json.dumps(query, sort_keys=True) for query in queries}) == len(queries)
-    assert len(queries) <= 16  # The finite filter combinations cannot grow without bound.
-    assert status["status"] == "completed"
-    assert status["partitions"]["unresolved"] == 2
-    assert status["partitions"]["capped"] == len(queries)
-    assert catalog.count() == 1
-
-
-@pytest.mark.parametrize("canonical", [False, True])
-def test_repeated_or_canonicalized_pages_stop_without_losing_data(catalog, canonical):
-    def skills(request):
-        requested = int(request.url.params["page"])
-        return page([skill_row()], 1 if canonical else requested, more=True)
-
-    provider = Provider(skills)
-    status = run(catalog, provider)
-    assert status["status"] == "completed"
-    assert status["partitions"]["unresolved"] == 4
-    assert catalog.count() == 1
-    assert len([r for r in provider.calls if r.url.path == "/api/skills"]) == 8
-
-
-def test_request_budget_includes_discovery_and_resumes_next_page(catalog):
+def test_budget_resumes_pages_and_gives_every_keyword_a_turn(catalog):
     def skills(request):
         number = int(request.url.params["page"])
-        return page([skill_row(str(number))], number, more=number == 1)
-
+        return page([skill_row(str(number))], number, more=number < 3)
     provider = Provider(skills)
-    first = run(catalog, provider, max_requests=4)
-    assert first["status"] == "paused" and first["requests"] == 4
-    assert catalog.count() == 1
+    first = run(catalog, provider, max_requests=7)
+    assert first["status"] == "paused" and first["pause_reason"] == "budget"
+    assert first["requests"] == 7 and catalog.count() == 2
+    assert {r.url.params["q"] for r in provider.calls[:6]} == set(catalog.settings.sync_keywords)
+    assert all(r.url.params["page"] == "1" for r in provider.calls[:6])
     second = run(catalog, provider)
-    requests = [r for r in provider.calls if r.url.path == "/api/skills"]
-    assert [r.url.params["page"] for r in requests[:2]] == ["1", "2"]
-    assert second["status"] == "completed" and catalog.count() == 2
+    assert second["status"] == "completed" and catalog.count() == 3
+    assert provider.calls[7].url.params["q"] == "testing"
+    assert provider.calls[7].url.params["page"] == "2"
+    assert len({r.url for r in provider.calls}) == 18
 
 
-@pytest.mark.parametrize("retry_after, gaps", [
-    (None, [2, 4, 8]),
-    ("1", [2, 4, 8]),
-    ("10", [10, 10, 10]),
-    ("date", [10, 10, 10]),
-    ("invalid", [2, 4, 8]),
-    ("past-date", [2, 4, 8]),
-])
-def test_rate_limits_retry_same_page_and_finish(catalog, clock, retry_after, gaps):
-    attempts = []
+def test_obsolete_crawl_state_migrates_without_removing_inventory(catalog):
+    catalog.upsert(import_skill(skill_row()))
+    with catalog.db_sessions.begin() as session:
+        session.add(SyncRunRecord(id=1, data={"status": "paused", "discovery_pending": ["/categories"],
+                    "discovery_seen": [], "discovered": {}, "requests": 1}))
+        session.add(SyncPartitionRecord(key="{}", status="pending", data={"filters": {}}))
+    status = run(catalog, Provider(lambda _: page([skill_row()])))
+    assert status["status"] == "completed" and catalog.count() == 1
+    assert status["partitions"]["completed"] == 6
+    with catalog.db_sessions() as session:
+        assert session.get(SyncPartitionRecord, "{}") is None
+        assert "discovery_pending" not in session.get(SyncRunRecord, 1).data
 
+
+@pytest.mark.parametrize("kind", ["repeated", "canonical", "empty"])
+def test_nonadvancing_results_stop_current_scan_and_refresh_in_later_runs(catalog, kind):
     def skills(request):
         number = int(request.url.params["page"])
-        if number == 2:
-            attempts.append((clock.time(), request.url))
-            if len(attempts) <= 3:
-                value = retry_after
-                if value in ("date", "past-date"):
-                    deadline = clock.time() + (10 if value == "date" else -10)
-                    value = format_datetime(datetime.fromtimestamp(deadline, UTC), usegmt=True)
-                return httpx.Response(429, headers={"Retry-After": value} if value else {})
-        return page([skill_row(str(number))], number, more=number == 1)
-
+        rows = [] if kind == "empty" else [skill_row()]
+        return page(rows, 1 if kind == "canonical" else number, more=True)
     provider = Provider(skills)
-    status = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
+    status = run(catalog, provider)
+    assert status["partitions"]["unresolved"] == 6
+    assert catalog.count() == (0 if kind == "empty" else 1)
+    calls = len(provider.calls)
+    run(catalog, provider)
+    assert len(provider.calls) == calls * 2
 
-    assert status["status"] == "completed"
-    assert catalog.count() == 2 and status["added"] == 2
-    assert len({url for _, url in attempts[:4]}) == 1
-    assert [second[0] - first[0] for first, second in pairwise(attempts[:4])] == gaps
-    assert status["requests"] == len(provider.calls)
+
+def test_capped_windows_finish_unresolved_without_inventing_queries(catalog):
+    provider = Provider(lambda _: page([skill_row()], capped=True))
+    status = run(catalog, provider)
+    assert status["partitions"]["unresolved"] == status["partitions"]["capped"] == 6
+    assert len(provider.calls) == 6
+    run(catalog, provider)
+    assert len(provider.calls) == 12
 
 
-def test_quota_pauses_without_skipping_page_and_resume_respects_retry_after(catalog, clock):
-    provider = Provider(lambda _: httpx.Response(429, headers={"Retry-After": "10"}))
-    status = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
-    assert status["status"] == "paused" and "429" in status["last_error"]
-    assert status["partitions"]["pending"] == 4 and catalog.count() == 0
-    requests = [r for r in provider.calls if r.url.path == "/api/skills"]
-    assert len(requests) == 4 and len({r.url for r in requests}) == 1
-    assert status["retry_after"] == clock.time() + 10
-
+def test_uncertain_completion_is_never_automatically_replayed(catalog):
+    provider = Provider(lambda _: httpx.Response(503, json={"success": False,
+                        "error": {"code": "SEARCH_COMPLETION_UNCERTAIN"}}))
+    first = run(catalog, provider)
+    assert first["status"] == "paused" and first["partitions"]["unresolved"] == 1
+    assert len(provider.calls) == 1
     provider.skills = lambda _: page([skill_row()])
+    run(catalog, provider)
+    run(catalog, provider)
+    assert sum(r.url.params["q"] == "coding" for r in provider.calls) == 1
+    assert catalog.count() == 1
+
+
+@pytest.mark.parametrize("retry_after", ["10", "date", "invalid", None])
+def test_transient_retries_honor_pacing_and_retry_after(catalog, clock, retry_after):
+    starts = []
+    def skills(request):
+        starts.append(clock.time())
+        if len(starts) <= 3:
+            value = retry_after
+            if value == "date":
+                value = format_datetime(datetime.fromtimestamp(clock.time() + 10, UTC), usegmt=True)
+            return httpx.Response(429, headers={"Retry-After": value} if value else {})
+        return page([skill_row()])
+    provider = Provider(skills)
+    status = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
+    assert status["status"] == "completed" and catalog.count() == 1
+    expected = [10, 10, 10] if retry_after in ("10", "date") else [6, 6, 8]
+    assert [b - a for a, b in pairwise(starts[:4])] == expected
+    assert len({r.url for r in provider.calls[:4]}) == 1
+    assert status["requests"] == len(provider.calls) == 9
+
+
+def test_retry_budget_stops_before_sleep_and_persists_cooldown(catalog, clock):
+    provider = Provider(lambda _: httpx.Response(429, headers={"Retry-After": "10"}))
+    first = Sync(catalog, provider.client, max_requests=2,
+                 sleep=clock.sleep, monotonic=clock.time).run()
+    assert first["pause_reason"] == "budget" and len(provider.calls) == 2
+    assert clock.sleeps == [10]
+    provider.skills = lambda _: page([skill_row()])
+    first_url = provider.calls[-1].url
     clock.sleeps.clear()
-    next_call = len(provider.calls)
     resumed = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
-    assert clock.sleeps[0] == 10
-    assert provider.calls[next_call].url == requests[-1].url
     assert resumed["status"] == "completed" and catalog.count() == 1
+    assert provider.calls[2].url == first_url and clock.sleeps[0] == 10
 
 
-def test_request_budget_stops_rate_limit_retries_before_sleeping(catalog, clock):
-    provider = Provider(lambda _: httpx.Response(429, headers={"Retry-After": "10"}))
-    status = Sync(catalog, provider.client, max_requests=4,
-                  sleep=clock.sleep, monotonic=clock.time).run()
-
-    assert status["status"] == "paused" and status["requests"] == 4
-    assert "budget" in status["last_error"].lower()
-    assert clock.sleeps == [2, 2, 2]
-    assert catalog.count() == 0 and status["partitions"]["failed"] == 0
-    assert status["retry_after"] == clock.time() + 10
-
-    failed_url = provider.calls[-1].url
-    provider.skills = lambda _: page([skill_row()])
-    resumed_at = []
-    original = provider.client.get
-
-    def get(*args, **kwargs):
-        resumed_at.append(clock.time())
-        return original(*args, **kwargs)
-
-    provider.client.get = get
-    resumed = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
-    assert provider.calls[4].url == failed_url
-    assert resumed_at[0] == status["retry_after"]
-    assert resumed["status"] == "completed" and catalog.count() == 1
+def test_long_cooldown_does_not_block_process_or_restart(catalog, clock):
+    provider = Provider(lambda _: httpx.Response(503, headers={"Retry-After": "3600"}))
+    first = Sync(catalog, provider.client, sleep=clock.sleep, monotonic=clock.time).run()
+    assert first["status"] == "paused" and len(provider.calls) == 1 and not clock.sleeps
+    run(catalog, provider)
+    assert len(provider.calls) == 1
+    clock.elapsed += 3600
+    provider.skills = lambda _: page([])
+    assert run(catalog, provider)["status"] == "completed"
 
 
-@pytest.mark.parametrize("status_code", [401, 403])
-def test_access_failures_pause_without_retrying(catalog, status_code):
-    provider = Provider(lambda _: httpx.Response(status_code))
-    status = run(catalog, provider)
-    assert status["status"] == "paused" and str(status_code) in status["last_error"]
-    assert len([r for r in provider.calls if r.url.path == "/api/skills"]) == 1
-    assert catalog.count() == 0
-
-
-@pytest.mark.parametrize("status_code", [408, 429, 503])
-def test_transient_failures_retry_at_most_three_times(catalog, status_code):
-    provider = Provider(lambda _: httpx.Response(status_code))
-    status = run(catalog, provider)
-    assert status["status"] == "paused"
-    assert len([r for r in provider.calls if r.url.path == "/api/skills"]) == 4
-    assert catalog.count() == 0
+@pytest.mark.parametrize("failure", ["header", "code"])
+def test_provider_daily_exhaustion_is_persisted_until_next_utc_day(catalog, clock, failure):
+    if failure == "header":
+        response = httpx.Response(200, json=page([skill_row()]),
+                                  headers={"X-RateLimit-Daily-Remaining": "0"})
+    else:
+        response = httpx.Response(429, json={"success": False,
+                                  "error": {"code": "DAILY_QUOTA_EXCEEDED"}})
+    provider = Provider(lambda _: response)
+    run(catalog, provider)
+    run(catalog, provider)
+    assert len(provider.calls) == 1
+    clock.elapsed = (int(clock.time()) // 86400 + 1) * 86400
     provider.skills = lambda _: page([skill_row()])
     assert run(catalog, provider)["status"] == "completed"
     assert catalog.count() == 1
 
 
-def test_malformed_rows_are_counted_but_malformed_pages_pause(catalog):
-    provider = Provider(lambda _: page([skill_row(), {"id": "broken"}, None]))
-    status = run(catalog, provider)
-    assert catalog.count() == 1 and status["invalid"] == 8
-    provider.skills = lambda _: {"skills": [], "pagination": {}}
-    status = run(catalog, provider)
-    assert status["status"] == "paused"
-    assert status["partitions"]["failed"] == 1
-    assert catalog.count() == 1
+def test_daily_budget_survives_completed_runs_and_resets_at_midnight(catalog, clock):
+    settings = catalog.settings.model_copy(update={"sync_daily_requests": 7})
+    provider = Provider(lambda _: page([skill_row()]))
+    run(catalog, provider, settings=settings)
+    status = run(catalog, provider, settings=settings)
+    assert len(provider.calls) == 7 and status["pause_reason"] == "budget"
+    run(catalog, provider, settings=settings)
+    assert len(provider.calls) == 7
+    clock.elapsed = (int(clock.time()) // 86400 + 1) * 86400
+    assert run(catalog, provider, settings=settings)["status"] == "completed"
+    assert len(provider.calls) == 12
 
 
-def test_estimated_uncapped_end_is_not_subdivided(catalog):
-    provider = Provider(lambda _: page([skill_row()], exact=False))
+@pytest.mark.parametrize("code", [401, 403])
+def test_access_failures_are_not_retried_after_process_restart(catalog, clock, code):
+    provider = Provider(lambda _: httpx.Response(code))
+    assert run(catalog, provider)["status"] == "paused"
+    run(catalog, provider)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.parametrize("code", [408, 429, 503])
+def test_transient_failure_retries_are_bounded(catalog, code):
+    provider = Provider(lambda _: httpx.Response(code))
     status = run(catalog, provider)
-    assert status["partitions"]["completed"] == 4
-    assert status["partitions"]["capped"] == 0
-    assert status["warnings"]
+    assert status["status"] == "paused" and status["pause_reason"] == "provider"
+    assert len(provider.calls) == 4 and catalog.count() == 0
+
+
+def test_malformed_rows_are_skipped_but_bad_pagination_keeps_checkpoint(catalog):
+    provider = Provider(lambda _: page([skill_row(), None, {"id": "bad"}]))
+    status = run(catalog, provider)
+    assert catalog.count() == 1 and status["invalid"] == 12
+    provider.skills = lambda _: {"success": True, "data": {"skills": [], "pagination": {}}}
+    status = run(catalog, provider)
+    assert status["status"] == "paused" and status["partitions"]["failed"] == 1
+    with catalog.db_sessions() as session:
+        assert session.get(SyncPartitionRecord, "coding").data["page"] == 1
+
+
+def test_pacing_is_preserved_between_separate_invocations(catalog, clock):
+    starts = []
+    def skills(request):
+        starts.append(clock.time())
+        return page([skill_row()])
+    provider = Provider(skills)
+    for _ in range(2):
+        Sync(catalog, provider.client, max_requests=3,
+             sleep=clock.sleep, monotonic=clock.time).run()
+    assert len(starts) == 6
+    assert all(b - a >= 6 for a, b in pairwise(starts))
+
+
+@pytest.mark.parametrize("outcome, expected_exit", [("budget", None), ("provider", 2), ("interrupt", 130)])
+def test_cli_indexes_completed_batches_and_reports_exit_status(catalog, monkeypatch, capsys, outcome, expected_exit):
+    import sys
+    from types import SimpleNamespace
+
+    from skinder import sync as module
+
+    def skills(request):
+        if outcome == "interrupt":
+            raise KeyboardInterrupt
+        if outcome == "provider":
+            return httpx.Response(403)
+        return page([skill_row()])
+    provider = Provider(skills)
+    original = module.Sync
+    monkeypatch.setattr(module, "load_settings", lambda role: catalog.settings)
+    monkeypatch.setattr(module, "Database", lambda settings: catalog.database)
+    monkeypatch.setattr(module, "Sync", lambda *args, **kwargs:
+                        original(*args, **kwargs, sleep=lambda _: None))
+    monkeypatch.setattr(module.httpx, "Client", lambda **kwargs: provider.client)
+    indexed = []
+    def index(catalog, *, allow_download):
+        indexed.append(catalog.count())
+        return {"indexed_count": catalog.count()}
+    monkeypatch.setitem(sys.modules, "skinder.retrieval", SimpleNamespace(index_catalog=index))
+    if expected_exit is None:
+        module.main(["--max-requests", "1"])
+    else:
+        with pytest.raises(SystemExit) as caught:
+            module.main(["--max-requests", "1"])
+        assert caught.value.code == expected_exit
+    report = json.loads(capsys.readouterr().out)
+    assert report["sync"]["status"] == "paused"
+    assert indexed == ([] if outcome == "interrupt" else [1 if outcome == "budget" else 0])
 
 
 def test_bundled_data_wins_and_alias_is_recorded(catalog):
@@ -372,53 +346,10 @@ def test_repository_root_skill_and_missing_optional_metadata():
     assert imported.description == "" and imported.author == ""
 
 
-def test_requests_are_serial_and_at_least_two_seconds_apart(catalog):
-    elapsed = [0.0]
-    starts = []
-    provider = Provider(lambda _: page([skill_row()]))
-    original = provider.client.get
-
-    def get(*args, **kwargs):
-        starts.append(elapsed[0])
-        return original(*args, **kwargs)
-
-    provider.client.get = get
-
-    def sleep(seconds):
-        elapsed[0] += seconds
-
-    Sync(catalog, provider.client, sleep=sleep, monotonic=lambda: elapsed[0]).run()
-    assert len(starts) >= 7
-    assert all(second - first >= 2 for first, second in pairwise(starts))
-
-
 @pytest.mark.parametrize("route", ["javascript://skillsmp.com/foo", "http://skillsmp.com/foo",
                                   "https://other.example/foo"])
 def test_provider_links_require_https_and_provider_host(route):
-    assert import_skill(skill_row(route=route)).provider_url is None
-
-
-def test_capped_expansion_only_enqueues_newly_discovered_values(catalog):
-    provider = Provider(lambda _: page([skill_row()], capped=True))
-    sync = Sync(catalog, provider.client, sleep=lambda _: None)
-    sync.state["discovered"]["language"] = ["en"]
-    key = json.dumps({"filters": {}, "sort": "stars"}, sort_keys=True)
-    with catalog.db_sessions() as session:
-        data = session.get(SyncPartitionRecord, key).data
-    sync.page(key, data)
-    # An unchanged expansion must do no queue writes, even on subsequent capped pages.
-    original = sync.enqueue
-    def reject_enqueue(*args, **kwargs):
-        pytest.fail("Repeated expansion attempted a queue write")
-    sync.enqueue = reject_enqueue
-    assert sync.expand(data) is False
-    sync.enqueue = original
-    sync.add_filter("language", "ko")
-    with catalog.db_sessions() as session:
-        queued = [data for data in session.scalars(select(SyncPartitionRecord.data))]
-    assert any(row["filters"] == {"language": "ko"} for row in queued)
-    root = next(row for row in queued if row["filters"] == {} and row["sort"] == "stars")
-    assert root["expanded_values"] == 2
+    assert import_skill(skill_row(skillUrl=route)).provider_url is None
 
 
 def test_interrupted_upsert_keeps_authoritative_unique_inventory(catalog, monkeypatch):
@@ -435,46 +366,6 @@ def test_interrupted_upsert_keeps_authoritative_unique_inventory(catalog, monkey
     assert status["imported_unique_total"] == 1 and status["added"] == 0
     monkeypatch.setattr(catalog, "upsert", original)
     assert run(catalog, provider)["imported_unique_total"] == 1
-
-
-@pytest.mark.parametrize("interrupted", [False, True])
-def test_cli_exit_codes_and_indexing_after_pause(catalog, monkeypatch, tmp_path, capsys, interrupted):
-    import sys
-    from types import SimpleNamespace
-
-    from skinder import sync as module
-
-    def skills(request):
-        assert 1 <= int(request.url.params["limit"]) <= 48
-        if interrupted:
-            raise KeyboardInterrupt
-        return page([skill_row()])
-
-    provider = Provider(skills)
-    original = module.Sync
-    monkeypatch.setattr(module, "load_settings", lambda role: catalog.settings)
-    monkeypatch.setattr(module, "Database", lambda settings: catalog.database)
-    monkeypatch.setattr(module, "Sync", lambda *args, **kwargs:
-                        original(*args, **kwargs, sleep=lambda _: None))
-    def client(**kwargs):
-        assert "Skinder" in kwargs["headers"]["User-Agent"]
-        return provider.client
-    monkeypatch.setattr(module.httpx, "Client", client)
-    marker = tmp_path / "indexed"
-    def index(catalog, *, allow_download):
-        marker.write_text(str(catalog.count()))
-        return {"indexed_count": catalog.count()}
-    monkeypatch.setitem(sys.modules, "skinder.retrieval", SimpleNamespace(index_catalog=index))
-    with pytest.raises(SystemExit) as exit_info:
-        module.main(["--max-requests", "4"])
-    assert exit_info.value.code == (130 if interrupted else 2)
-    report = json.loads(capsys.readouterr().out)
-    assert report["sync"]["status"] == "paused"
-    if interrupted:
-        assert not marker.exists()
-    else:
-        assert marker.read_text() == "1"
-        assert report["index"]["indexed_count"] == 1
 
 
 def test_advisory_lock_excludes_other_writers_and_releases_without_transaction(catalog):
@@ -507,3 +398,37 @@ def test_writer_lock_does_not_use_the_only_catalog_pool_slot(db, settings):
             assert catalog.count() == 1
     finally:
         database.close()
+
+
+def test_live_api_shape_preserves_source_and_provider_updated_time(catalog):
+    from skinder.orm import CatalogSkillRecord
+
+    row = {
+        "id": "openclaw-openclaw-skills-coding-agent-skill-md", "name": "coding-agent",
+        "author": "openclaw", "description": "Delegate coding tasks.", "contentLanguage": "en",
+        "githubUrl": "https://github.com/openclaw/openclaw/tree/main/skills/coding-agent",
+        "skillUrl": "https://skillsmp.com/creators/openclaw/openclaw/skills-coding-agent",
+        "stars": 100, "updatedAt": 1785303822,
+    }
+    run(catalog, Provider(lambda _: page([row])))
+    identifier = stable_id("openclaw/openclaw", "skills/coding-agent/SKILL.md")
+    skill = catalog.get(identifier)
+    assert skill.source_url == "https://github.com/openclaw/openclaw/blob/main/skills/coding-agent/SKILL.md"
+    assert skill.provider_url == row["skillUrl"]
+    with catalog.db_sessions() as session:
+        assert session.get(CatalogSkillRecord, identifier).source_updated_at == "1785303822"
+        alias = session.get(CatalogAliasRecord, ("skillsmp", row["id"]))
+        assert alias.skill_id == identifier and alias.payload == row
+
+
+def test_transport_retries_consume_invocation_and_persisted_daily_budgets(catalog):
+    def offline(request):
+        raise httpx.ConnectError("offline", request=request)
+    provider = Provider(offline)
+    first = run(catalog, provider, max_requests=2)
+    assert len(provider.calls) == first["daily_requests"] == 2
+    assert first["pause_reason"] == "budget" and catalog.count() == 0
+    provider.skills = lambda _: page([skill_row()])
+    second = run(catalog, provider)
+    assert second["daily_requests"] == 8 and catalog.count() == 1
+    assert provider.calls[0].url == provider.calls[2].url

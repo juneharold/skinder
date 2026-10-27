@@ -221,3 +221,21 @@ def test_model_checksum_damage_disables_semantic_search_without_network(catalog,
 
     assert retriever.status() == {"indexed_count": 2, "retrieval_mode": "keyword-only"}
     assert ids(retriever.search("stellar", "codex", [])) == ["lexical"]
+
+
+def test_large_catalog_approximate_search_filters_neighbors_and_keeps_best_match(catalog):
+    excluded = {f"seen-{number:04}" for number in range(330)}
+    for identifier in sorted(excluded):
+        catalog.upsert(skill(identifier, "nebula observation"))
+    catalog.upsert(skill("wrong-agent", "nebula observation", ["claude-code"]))
+    catalog.upsert(skill("best-eligible", "astronomy observation"))
+    for number in range(3770):
+        catalog.upsert(skill(f"noise-{number:04}", "Accounting reports"))
+    assert catalog.count() > 4096
+    index_catalog(catalog, embedder=TestEmbedder())
+    retriever = HybridRetriever(catalog, embedder=TestEmbedder())
+    results = ids(retriever.search("stellar", "codex", excluded))
+    assert len(results) == 40
+    assert results[0] == "best-eligible"
+    assert not (excluded | {"wrong-agent"}) & set(results)
+    assert ids(retriever.search("stellar", "codex", excluded)) == results

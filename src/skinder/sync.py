@@ -15,7 +15,8 @@ from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
-from sqlalchemy import Integer, cast, delete, func, or_, select, text, update
+from sqlalchemy import Integer, cast, create_engine, delete, func, or_, select, text, update
+from sqlalchemy.pool import NullPool
 from sqlalchemy.dialects.postgresql import insert
 
 from .catalog import CatalogStore, stable_id
@@ -468,15 +469,20 @@ def positive(value: str) -> int:
 
 @contextmanager
 def writer_lock(catalog: CatalogStore):
-    # A dedicated session owns this lock across network I/O without holding a transaction.
-    with catalog.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-        acquired = connection.scalar(text("SELECT pg_try_advisory_lock(73519002)"))
-        if not acquired:
-            raise RuntimeError("Another catalog sync/index writer is active.")
-        try:
-            yield
-        finally:
-            connection.execute(text("SELECT pg_advisory_unlock(73519002)"))
+    # The dedicated connection must not consume a slot needed by the catalog's transaction pool.
+    lock_engine = create_engine(catalog.engine.url, poolclass=NullPool, hide_parameters=True,
+        connect_args={"connect_timeout": catalog.settings.db_connect_timeout_seconds})
+    try:
+        with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            acquired = connection.scalar(text("SELECT pg_try_advisory_lock(73519002)"))
+            if not acquired:
+                raise RuntimeError("Another catalog sync/index writer is active.")
+            try:
+                yield
+            finally:
+                connection.execute(text("SELECT pg_advisory_unlock(73519002)"))
+    finally:
+        lock_engine.dispose()
 
 
 def main(argv: Sequence[str] | None = None) -> None:

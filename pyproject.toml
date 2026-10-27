@@ -30,3 +30,6 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["RET505", "RET506", "RET507", "RET508"]

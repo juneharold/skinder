@@ -164,8 +164,8 @@ class UserStore:
             ).order_by(FeedbackRecord.mutation_seq.desc()).limit(1))
             if other:
                 bookmark.feedback_id = other
-            else:
-                db.delete(bookmark)
+                return
+            db.delete(bookmark)
 
     def get_bookmarks(self, user_id: str) -> list[Bookmark]:
         with self.db_sessions() as db:
@@ -180,9 +180,9 @@ class UserStore:
             bookmark = db.get(BookmarkRecord, (user_id, skill_id))
             if bookmark:
                 bookmark.feedback_id = None
-            else:
-                db.add(BookmarkRecord(user_id=user_id, skill_id=skill_id,
-                    created_seq=user.mutation_seq))
+                return
+            db.add(BookmarkRecord(user_id=user_id, skill_id=skill_id,
+                created_seq=user.mutation_seq))
 
     def remove_bookmark(self, user_id: str, skill_id: str) -> None:
         with self._write_session(user_id) as (db, user):

@@ -93,12 +93,14 @@ def bounded_request(
             longest = max(with_source, key=lambda item: len(item["source_excerpt"]))
             longest["source_excerpt"] = ""
             longest["source_truncated"] = True
-        elif request["recent_feedback"]:
+            continue
+        if request["recent_feedback"]:
             request["recent_feedback"].pop()
-        elif request["eligible_skills"]:
+            continue
+        if request["eligible_skills"]:
             request["eligible_skills"].pop()
-        else:
-            raise ValueError("Task and preferences exceed the matching input limit.")
+            continue
+        raise ValueError("Task and preferences exceed the matching input limit.")
     return request
 
 

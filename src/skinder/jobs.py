@@ -186,12 +186,13 @@ class JobStore:
                 continue
             if job.dispatch_started:
                 self._terminal(job, now, "provider_outcome_unknown")
-            elif (job.status == "queued" or job.claim_count >= self.settings.max_job_claims or
-                  (job.deadline_at and job.deadline_at <= now)):
+                continue
+            if (job.status == "queued" or job.claim_count >= self.settings.max_job_claims or
+                    (job.deadline_at and job.deadline_at <= now)):
                 self._terminal(job, now, "job_expired")
-            else:
-                job.status, job.worker_id, job.lease_expires_at = "queued", None, None
-                job.lease_token += 1
+                continue
+            job.status, job.worker_id, job.lease_expires_at = "queued", None, None
+            job.lease_token += 1
         session.flush()
 
     def claim(self, worker_id: str):

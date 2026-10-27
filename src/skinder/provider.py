@@ -58,10 +58,10 @@ def amount(value) -> Decimal:
         raise ProviderError("pricing_unavailable") from None
 
 
-def _request_payload(data: dict, model: str, settings: Settings) -> dict:
+def _request_payload(data: dict, model: str, settings: Settings, instructions: str | None) -> dict:
     return {
         "model": model,
-        "messages": [{"role": "system", "content": MATCH_INSTRUCTIONS},
+        "messages": [{"role": "system", "content": MATCH_INSTRUCTIONS if instructions is None else instructions},
                      {"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
         "stream": False, "max_tokens": settings.max_output_tokens,
         "response_format": {"type": "json_schema", "json_schema": {
@@ -70,12 +70,12 @@ def _request_payload(data: dict, model: str, settings: Settings) -> dict:
     }
 
 
-def request_size(data: dict, model: str, settings: Settings) -> int:
-    return len(json.dumps(_request_payload(data, model, settings), ensure_ascii=False).encode())
+def request_size(data: dict, model: str, settings: Settings, instructions: str | None = None) -> int:
+    return len(json.dumps(_request_payload(data, model, settings, instructions), ensure_ascii=False).encode())
 
 
-def build_request(data: dict, model: str, settings: Settings) -> dict:
-    request = _request_payload(data, model, settings)
+def build_request(data: dict, model: str, settings: Settings, instructions: str | None = None) -> dict:
+    request = _request_payload(data, model, settings, instructions)
     if len(json.dumps(request, ensure_ascii=False).encode()) > settings.max_prompt_bytes:
         raise ProviderError("prompt_too_large")
     return request

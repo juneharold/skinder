@@ -8,7 +8,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 
 from .database import JOB_ADMISSION_LOCK, Database
-from .matcher import PROMPT_VERSION
+from .matcher import MATCH_INSTRUCTIONS, PROMPT_VERSION
 from .models import MatchInput, Profile, Recommendation, Skill
 from .orm import (
     CatalogSkillRecord,
@@ -130,7 +130,8 @@ class JobStore:
                 idempotency_key=idempotency_key, request_hash=digest, status="queued",
                 input={"task": value.task, "agent": value.agent, "profile": profile,
                        "feedback": feedback, "seen_ids": seen,
-                       "previous_recommendations": row.recommendations}, model=self.settings.letsur_model,
+                       "previous_recommendations": row.recommendations,
+                       "instructions": MATCH_INSTRUCTIONS}, model=self.settings.letsur_model,
                 prompt_version=PROMPT_VERSION)
             session.add(job)
             session.flush()

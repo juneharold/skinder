@@ -10,6 +10,7 @@ def main():
     configure_logging(settings.log_level)
     uvicorn.run(create_app(settings=settings), host=settings.host, port=settings.port,
                 log_level=settings.log_level.lower(),
+                access_log=False,
                 timeout_graceful_shutdown=int(settings.shutdown_grace_seconds))
 
 

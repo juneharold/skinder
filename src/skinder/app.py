@@ -1,9 +1,11 @@
 """HTTP application. Matching executes in independent durable workers."""
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Annotated
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -40,6 +42,7 @@ from .user import UserStore
 from .work import SyncWork, wait_for_work
 
 ROOT = Path(__file__).resolve().parents[2]
+logger = logging.getLogger("skinder.http")
 
 
 def create_app(*, settings: Settings | None = None, database: Database | None = None,
@@ -81,6 +84,7 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
 
     @app.middleware('http')
     async def origin_boundary(request: Request, call_next):
+        started = monotonic()
         # Infrastructure probes expose no account data and may use an internal Host header.
         probe = request.url.path in {'/health/live', '/health/ready'} and request.method == 'GET'
         if not probe and request.headers.get('host') != urlsplit(settings.app_origin).netloc:
@@ -91,6 +95,13 @@ def create_app(*, settings: Settings | None = None, database: Database | None = 
                     or request.headers.get('sec-fetch-site') == 'cross-site'):
                 return JSONResponse({'detail': 'Cross-origin writes are not allowed.'}, 403)
         response = await call_next(request)
+        # Route patterns omit OAuth codes, search text, cookies, and resource identifiers.
+        logger.info("http_request", extra={
+            "method": request.method,
+            "route": getattr(request.scope.get("route"), "path", "unmatched"),
+            "status": response.status_code,
+            "duration_ms": round((monotonic() - started) * 1000, 2),
+        })
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'no-referrer'
         if request.url.path.startswith('/api/'):

@@ -15,6 +15,7 @@ JOB_ADMISSION_LOCK = 73519003
 class Database:
     def __init__(self, settings: Settings, *, schema: str | None = None):
         settings.require("migrate")
+        self.settings = settings
         url = make_url(settings.database_url.get_secret_value()).set(drivername="postgresql+psycopg")
         args = {"connect_timeout": settings.db_connect_timeout_seconds}
         if schema is not None:

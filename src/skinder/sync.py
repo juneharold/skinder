@@ -21,6 +21,7 @@ from sqlalchemy.pool import NullPool
 
 from .catalog import CatalogStore, stable_id
 from .database import CATALOG_MAINTENANCE_LOCK, Database
+from .diagnostics import configure_logging
 from .models import InstallCommands, Skill
 from .orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
 from .settings import Settings, load_settings
@@ -492,11 +493,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     group.add_argument("--index-only", action="store_true")
     group.add_argument("--status", action="store_true")
     args = parser.parse_args(argv)
-    if not logger.handlers:
-        logger.addHandler(logging.StreamHandler())
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
     settings = load_settings("ingest")
+    configure_logging(settings.log_level)
     database = Database(settings)
     catalog = CatalogStore(database, settings)
     try:

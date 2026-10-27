@@ -9,19 +9,14 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from .catalog import CatalogStore
-from .matcher import MatchError
-from .models import Agent, Engine, EngineStatus, MatchInput, MatchResult, MatchSession, Skill
+from .matcher import Matcher, MatchError
+from .models import Agent, Engine, MatchInput, MatchResult, MatchSession, Skill
 from .retrieval import RetrievalStatus
 from .sources import bounded_request, match_metadata
 from .user import UserStore
 from .work import run_sync, wait_for_work
 
 logger = logging.getLogger(__name__)
-
-
-class Matcher(Protocol):
-    async def health(self) -> EngineStatus: ...
-    async def match(self, request: dict[str, Any]) -> str: ...
 
 
 class Retriever(Protocol):

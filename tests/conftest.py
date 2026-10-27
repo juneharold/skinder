@@ -9,7 +9,7 @@ import pytest
 from skinder.app import create_app
 from skinder.catalog import CatalogStore
 from skinder.claude_matcher import ClaudeMatcher
-from skinder.matcher import CodexMatcher
+from skinder.codex_matcher import CodexMatcher
 from skinder.models import Skill
 
 
@@ -123,7 +123,7 @@ else:
     claude_control = tmp_path / "claude-control.json"
     claude_control.write_text("{}")
     monkeypatch.setattr(
-        "skinder.matcher.shutil.which",
+        "shutil.which",
         lambda name: {"codex": str(fake), "claude": str(claude)}.get(name),
     )
     user_db_path = tmp_path / "user.sqlite3"

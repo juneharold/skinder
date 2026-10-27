@@ -1,0 +1,177 @@
+"""Codex matching through the user's locally authenticated CLI."""
+
+import asyncio
+import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from .matcher import MATCH_INSTRUCTIONS, MatchError, terminate
+from .models import EngineStatus, MatchResult
+
+
+def codex_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    # Use the local CLI login without inheriting a parent agent session or API-key override.
+    for key in (
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "CODEX_TOOL_CALL_ID",
+        "CODEX_CI",
+        "CODEX_API_KEY",
+        "OPENAI_API_KEY",
+    ):
+        env.pop(key, None)
+    return env
+
+
+class CodexMatcher:
+    def __init__(self, timeout: float = 180) -> None:
+        self.timeout = timeout
+
+    async def health(self) -> EngineStatus:
+        executable = shutil.which("codex")
+        if not executable:
+            return EngineStatus(
+                installed=False,
+                authenticated=False,
+                ready=False,
+                message="Install the Codex CLI, then run codex login.",
+            )
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                executable,
+                "login",
+                "status",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=codex_environment(),
+                start_new_session=True,
+            )
+            await asyncio.wait_for(process.wait(), 10)
+            authenticated = process.returncode == 0
+            return EngineStatus(
+                installed=True,
+                authenticated=authenticated,
+                ready=authenticated,
+                message="Codex is ready." if authenticated else "Run codex login.",
+            )
+        except (OSError, TimeoutError):
+            return EngineStatus(
+                installed=True,
+                authenticated=False,
+                ready=False,
+                message="Could not check Codex login. Run codex login status.",
+            )
+        finally:
+            if process is not None:
+                await terminate(process)
+
+    async def match(self, request: dict[str, Any]) -> str:
+        executable = shutil.which("codex")
+        if not executable:
+            raise MatchError(
+                "Codex CLI is missing. Install it and run codex login, then try again."
+            )
+        with tempfile.TemporaryDirectory(prefix="skinder-match-") as directory:
+            root = Path(directory)
+            schema = root / "schema.json"
+            output = root / "result.json"
+            schema.write_text(json.dumps(MatchResult.model_json_schema()), encoding="utf-8")
+            instructions = root / "instructions.md"
+            instructions.write_text(MATCH_INSTRUCTIONS, encoding="utf-8")
+            # Recommendations must not inherit user instructions or access tools from CLI config.
+            args = [
+                executable,
+                "exec",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "--color",
+                "never",
+                "--cd",
+                directory,
+                "--output-schema",
+                str(schema),
+                "--output-last-message",
+                str(output),
+            ]
+            config = {
+                "approval_policy": '"never"',
+                "web_search": '"disabled"',
+                "project_doc_max_bytes": "0",
+                "model_instructions_file": json.dumps(str(instructions)),
+                "features.skip_host_skill_discovery": "true",
+            }
+            disabled = (
+                "apps",
+                "plugins",
+                "hooks",
+                "multi_agent",
+                "multi_agent_v2",
+                "shell_tool",
+                "unified_exec",
+                "code_mode",
+                "code_mode_host",
+                "skill_search",
+                "view_image",
+                "image_generation",
+                "artifact",
+                "in_app_browser",
+                "browser_use",
+                "browser_use_external",
+                "computer_use",
+                "tool_suggest",
+                "recommended_plugins",
+                "memories",
+                "shell_snapshot",
+                "goals",
+                "sleep_tool",
+            )
+            config.update({f"features.{feature}": "false" for feature in disabled})
+            for key, value in config.items():
+                args.extend(["-c", f"{key}={value}"])
+            args.append("-")
+            process = None
+            try:
+                # CLI diagnostics may contain sensitive data; only the result file is consumed.
+                process = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    cwd=directory,
+                    env=codex_environment(),
+                    start_new_session=True,
+                )
+                # Keep task text and preferences off the command line exposed by process listings.
+                await asyncio.wait_for(
+                    process.communicate(json.dumps(request, ensure_ascii=False).encode()),
+                    self.timeout,
+                )
+                if process.returncode:
+                    raise MatchError(
+                        "Codex could not complete this match. Check codex login status and your "
+                        "Codex usage limits, then try again."
+                    )
+                if not output.is_file() or output.stat().st_size > 100_000:
+                    raise MatchError("Codex returned no usable result. Try again.")
+                return output.read_text(encoding="utf-8")
+            except TimeoutError as exc:
+                raise MatchError(
+                    f"Matching timed out after {self.timeout:g} seconds. Try again."
+                ) from exc
+            except OSError as exc:
+                raise MatchError(
+                    "Could not start or read Codex. Check your local installation."
+                ) from exc
+            finally:
+                # Wait for subprocess cleanup before TemporaryDirectory removes its working files.
+                if process is not None:
+                    await terminate(process)

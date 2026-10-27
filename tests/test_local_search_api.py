@@ -72,7 +72,7 @@ async def test_database_paths_select_persisted_user_and_catalog_data(
 
 @pytest.mark.asyncio
 async def test_fresh_catalog_can_be_browsed_and_matched_before_import(tmp_path, monkeypatch):
-    monkeypatch.setattr("skinder.matcher.shutil.which", lambda name: None)
+    monkeypatch.setattr("shutil.which", lambda name: None)
     app = create_app(
         user_db_path=tmp_path / "user.sqlite3", catalog_db_path=tmp_path / "catalog.sqlite3"
     )

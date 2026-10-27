@@ -415,7 +415,7 @@ async def test_shutdown_persistence_failure_still_reaps_child_and_releases_datab
 
 
 async def test_missing_codex_leaves_browsing_and_profile_usable(backend, monkeypatch):
-    monkeypatch.setattr("skinder.matcher.shutil.which", lambda name: None)
+    monkeypatch.setattr("shutil.which", lambda name: None)
     async with backend.client() as client:
         health = (await client.get("/api/health")).json()
         assert health["engines"]["codex"]["installed"] is False

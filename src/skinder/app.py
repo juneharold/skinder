@@ -12,8 +12,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .catalog import CatalogStore
 from .claude_matcher import ClaudeMatcher
-from .matcher import CodexMatcher
-from .matching import Enricher, Matcher, MatchService, MatchServiceError, Retriever
+from .codex_matcher import CodexMatcher
+from .matcher import Matcher
+from .matching import Enricher, MatchService, MatchServiceError, Retriever
 from .models import (
     Catalog,
     Engine,

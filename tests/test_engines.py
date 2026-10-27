@@ -58,7 +58,7 @@ async def test_missing_engine_does_not_block_other_engine(backend, monkeypatch, 
     import shutil
 
     original = shutil.which
-    monkeypatch.setattr("skinder.matcher.shutil.which", lambda name: None if name == missing else original(name))
+    monkeypatch.setattr("shutil.which", lambda name: None if name == missing else original(name))
     absent = "codex" if missing == "codex" else "claude-code"
     available = "claude-code" if absent == "codex" else "codex"
     async with backend.client() as client:

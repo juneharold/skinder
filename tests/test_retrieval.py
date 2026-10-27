@@ -1,4 +1,3 @@
-import json
 import math
 
 import numpy as np
@@ -38,16 +37,12 @@ def skill(identifier, description, compatibility=None):
 
 
 @pytest.fixture
-def catalog(tmp_path):
-    return CatalogStore(tmp_path / "catalog.sqlite3")
+def catalog(db, settings, tmp_path):
+    return CatalogStore(db, settings.model_copy(update={"embedding_model_dir": tmp_path / "model"}))
 
 
 def ids(results):
     return [result.id for result in results]
-
-
-def manifest(catalog):
-    return json.loads((retrieval._paths(catalog) / "manifest.json").read_text())
 
 
 def test_hybrid_finds_lexical_and_semantic_matches_and_caps_payload(catalog):
@@ -107,74 +102,57 @@ def test_stale_vectors_are_excluded_and_changed_records_get_new_ids(catalog):
         ))).all())
     assert current["changed"] != original["changed"]
     assert current["unchanged"] == original["unchanged"]
-    published = manifest(catalog)
-    index_catalog(catalog, embedder=TestEmbedder())
-    assert manifest(catalog) == published
-
-
-def test_failed_publication_preserves_old_index_and_resumes(catalog, monkeypatch):
-    catalog.upsert(skill("original", "nebula observation"))
-    index_catalog(catalog, embedder=TestEmbedder())
-    previous = manifest(catalog)
-    catalog.upsert(skill("added", "nebula observation"))
-    publish = retrieval._publish
-
-    def fail(*args):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(retrieval, "_publish", fail)
-    with pytest.raises(OSError, match="disk full"):
-        index_catalog(catalog, embedder=TestEmbedder())
-    assert manifest(catalog) == previous
-    assert ids(HybridRetriever(catalog, embedder=TestEmbedder()).search(
-        "stellar", "codex", []
-    )) == ["original"]
-    with catalog.db_sessions() as session:
-        persisted = dict(session.execute(select(
-            SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
-        )).all())
-    monkeypatch.setattr(retrieval, "_publish", publish)
     index_catalog(catalog, embedder=TestEmbedder())
     with catalog.db_sessions() as session:
-        assert dict(session.execute(select(
-            SkillEmbeddingRecord.skill_id, SkillEmbeddingRecord.vector_id,
-        )).all()) == persisted
-    assert set(ids(HybridRetriever(catalog, embedder=TestEmbedder()).search(
-        "stellar", "codex", []
-    ))) == {"original", "added"}
+        assert session.scalar(select(func.count()).select_from(SkillEmbeddingRecord)) == 3
 
 
-@pytest.mark.parametrize("damage", ["model-fingerprint", "database-identity", "index", "manifest"])
-def test_invalid_index_falls_back_to_keywords(catalog, damage):
+def test_interrupted_batch_preserves_committed_vectors_and_resumes(catalog):
+    catalog.settings = catalog.settings.model_copy(update={"embedding_batch_size": 1})
+    catalog.upsert(skill("a", "nebula observation"))
+    catalog.upsert(skill("b", "nebula observation"))
+
+    class InterruptedEmbedder(TestEmbedder):
+        calls = 0
+
+        def embed(self, texts):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("Model interrupted")
+            return super().embed(texts)
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        index_catalog(catalog, embedder=InterruptedEmbedder())
+    retriever = HybridRetriever(catalog, embedder=TestEmbedder())
+    assert retriever.status()["indexed_count"] == 1
+    assert ids(retriever.search("stellar", "codex", [])) == ["a"]
+    with catalog.db_sessions() as session:
+        first_id = session.scalar(select(SkillEmbeddingRecord.vector_id))
+    index_catalog(catalog, embedder=TestEmbedder())
+    assert set(ids(retriever.search("stellar", "codex", []))) == {"a", "b"}
+    with catalog.db_sessions() as session:
+        assert session.scalar(select(SkillEmbeddingRecord.vector_id).where(
+            SkillEmbeddingRecord.skill_id == "a")) == first_id
+
+
+def test_incompatible_model_vectors_fall_back_to_keywords(catalog, monkeypatch):
     catalog.upsert(skill("lexical", "stellar terminology"))
     catalog.upsert(skill("semantic", "nebula observation"))
     index_catalog(catalog, embedder=TestEmbedder())
-    root = retrieval._paths(catalog)
-    data = manifest(catalog)
-    if damage == "index":
-        (root / data["filename"]).write_bytes(b"broken")
-    elif damage == "manifest":
-        (root / "manifest.json").write_text("{broken")
-    else:
-        key = "model_fingerprint" if damage == "model-fingerprint" else "database_identity"
-        data[key] = "different"
-        (root / "manifest.json").write_text(json.dumps(data))
-
+    monkeypatch.setattr(retrieval, "MODEL_FINGERPRINT", "different")
     retriever = HybridRetriever(catalog, embedder=TestEmbedder())
     assert ids(retriever.search("stellar", "codex", [])) == ["lexical"]
     assert retriever.status() == {"indexed_count": 0, "retrieval_mode": "keyword-only"}
 
 
-def test_model_change_reembeds_and_publishes_new_generation(catalog, monkeypatch):
+def test_model_change_reembeds_with_new_fingerprint(catalog, monkeypatch):
     catalog.upsert(skill("semantic", "nebula observation"))
     index_catalog(catalog, embedder=TestEmbedder())
-    previous = manifest(catalog)
     monkeypatch.setattr(retrieval, "MODEL_FINGERPRINT", "new-model-fingerprint")
     assert HybridRetriever(catalog, embedder=TestEmbedder()).status()["indexed_count"] == 0
 
     index_catalog(catalog, embedder=TestEmbedder())
 
-    assert manifest(catalog)["generation"] != previous["generation"]
     assert HybridRetriever(catalog, embedder=TestEmbedder()).status()["indexed_count"] == 1
     with catalog.db_sessions() as session:
         assert session.scalar(select(func.count()).select_from(SkillEmbeddingRecord)) == 2
@@ -191,7 +169,7 @@ def test_restart_without_model_never_downloads_and_retains_index_count(catalog, 
 
     monkeypatch.setattr(httpx.Client, "send", no_network)
     monkeypatch.setattr(retrieval, "_load_embedder", no_network)
-    retriever = HybridRetriever(CatalogStore(catalog.path))
+    retriever = HybridRetriever(CatalogStore(catalog.database, catalog.settings))
 
     assert ids(retriever.search("stellar", "codex", [])) == ["lexical"]
     assert retriever.status() == {"indexed_count": 1, "retrieval_mode": "keyword-only"}
@@ -208,7 +186,7 @@ def test_empty_catalog_and_missing_index_remain_keyword_only(catalog):
     assert ids(retriever.search("stellar", "codex", [])) == ["lexical"]
 
 
-def test_reverted_metadata_is_not_counted_until_present_in_published_index(catalog):
+def test_reverted_metadata_reuses_compatible_persisted_vector(catalog):
     catalog.upsert(skill("one", "nebula observation"))
     index_catalog(catalog, embedder=TestEmbedder())
     catalog.upsert(skill("one", "Accounting reports"))
@@ -216,8 +194,8 @@ def test_reverted_metadata_is_not_counted_until_present_in_published_index(catal
     catalog.upsert(skill("one", "nebula observation"))
     retriever = HybridRetriever(catalog, embedder=TestEmbedder())
 
-    assert retriever.status()["indexed_count"] == 0
-    assert retriever.search("stellar", "codex", []) == []
+    assert retriever.status()["indexed_count"] == 1
+    assert ids(retriever.search("stellar", "codex", [])) == ["one"]
     index_catalog(catalog, embedder=TestEmbedder())
     assert retriever.status()["indexed_count"] == 1
     assert ids(retriever.search("stellar", "codex", [])) == ["one"]
@@ -229,14 +207,14 @@ def test_model_checksum_damage_disables_semantic_search_without_network(catalog,
     catalog.upsert(skill("lexical", "stellar terminology"))
     catalog.upsert(skill("semantic", "nebula observation"))
     index_catalog(catalog, embedder=TestEmbedder())
-    model_dir = retrieval._paths(catalog) / "model"
+    model_dir = catalog.settings.embedding_model_dir
     model_dir.mkdir()
     model_file = model_dir / "tiny.onnx"
     model_file.write_bytes(b"valid")
     monkeypatch.setattr(retrieval, "MODEL_FILES", {
         "tiny.onnx": hashlib.sha256(b"valid").hexdigest(),
     })
-    monkeypatch.setattr(retrieval, "_load_embedder", lambda directory: TestEmbedder())
+    monkeypatch.setattr(retrieval, "_load_embedder", lambda directory, threads: TestEmbedder())
     retriever = HybridRetriever(catalog)
     assert "semantic" in ids(retriever.search("stellar", "codex", []))
     model_file.write_bytes(b"wrong")

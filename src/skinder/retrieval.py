@@ -1,4 +1,4 @@
-"""Local hybrid retrieval; only explicit indexing may download embedding artifacts."""
+"""PostgreSQL hybrid retrieval with a pinned local E5 embedding model."""
 
 import hashlib
 import json
@@ -8,23 +8,17 @@ import threading
 from collections.abc import Iterable, Sequence
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypedDict
-from uuid import uuid4
+from typing import Literal, Protocol, TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
-from sqlalchemy import and_, delete, func, select
-from sqlalchemy.dialects.sqlite import insert
-from usearch.index import Index
+from sqlalchemy import and_, func, select, text
+from sqlalchemy.dialects.postgresql import insert
 
-from .catalog import CatalogStore
+from .catalog import CatalogStore, eligibility
 from .models import Agent, Skill
-from .orm import (
-    CatalogSkillRecord,
-    RetrievalMemberRecord,
-    RetrievalMetaRecord,
-    SkillEmbeddingRecord,
-)
+from .orm import CatalogSkillRecord, SkillEmbeddingRecord
+from .settings import Settings
 
 MODEL = "intfloat/multilingual-e5-small"
 # Pinned from the model publisher's Hugging Face revision and artifact metadata.
@@ -56,15 +50,6 @@ class RetrievalStatus(TypedDict):
     retrieval_mode: Literal["hybrid", "keyword-only"]
 
 
-def _paths(catalog: CatalogStore) -> Path:
-    return catalog.path.with_name(catalog.path.stem + "-search")
-
-
-def _identity(catalog: CatalogStore) -> str:
-    with catalog.db_sessions() as session:
-        return session.get(RetrievalMetaRecord, "identity").value
-
-
 def _sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -93,7 +78,7 @@ def _prepare_model(directory: Path, allow_download: bool) -> None:
     if _model_ready(directory):
         return
     if not allow_download:
-        raise ValueError("Local embedding model is missing or damaged. Run catalog indexing.")
+        raise ValueError("Local embedding model is missing or damaged. Rebuild the worker image.")
     import httpx
 
     with httpx.Client(follow_redirects=True, timeout=60) as client:
@@ -120,7 +105,7 @@ def _prepare_model(directory: Path, allow_download: bool) -> None:
                 temporary.unlink(missing_ok=True)
 
 
-def _load_embedder(directory: Path) -> Embedder:
+def _load_embedder(directory: Path, threads: int = 4) -> Embedder:
     # The explicit directory and local_files_only both prevent FastEmbed's automatic downloads.
     from fastembed import TextEmbedding
     from fastembed.common.model_description import ModelSource, PoolingType
@@ -134,7 +119,7 @@ def _load_embedder(directory: Path) -> Embedder:
             )
     return TextEmbedding(
         model_name=MODEL, specific_model_path=str(directory), local_files_only=True,
-        providers=["CPUExecutionProvider"], threads=4,
+        providers=["CPUExecutionProvider"], threads=threads,
     )
 
 
@@ -149,95 +134,47 @@ def _embed(embedder: Embedder, texts: Sequence[str]) -> NDArray[np.float32]:
     return vectors / norms
 
 
-def _manifest(root: Path, identity: str) -> dict[str, Any] | None:
-    try:
-        value = json.loads((root / "manifest.json").read_text())
-        # Replacing a database at the same path must not reuse another catalog's vector IDs.
-        if (
-            value["database_identity"] != identity
-            or value["model_fingerprint"] != MODEL_FINGERPRINT
-            or value["dimensions"] != DIMENSIONS
-            or value["format"] != 1
-            or value["filename"] != f"{value['generation']}.usearch"
-            or Path(value["filename"]).name != value["filename"]
-        ):
-            return None
-        if not isinstance(value["count"], int) or value["count"] < 0:
-            return None
-        if not isinstance(value["sha256"], str) or len(value["sha256"]) != 64:
-            return None
-        return value
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+def prepare_model(directory: str | Path) -> None:
+    """Download and verify pinned artifacts during image construction."""
+    _prepare_model(Path(directory), allow_download=True)
 
 
-def _indexed_count(catalog: CatalogStore, generation: str) -> int:
-    # A reusable embedding counts only when it belongs to this published generation
-    # and still matches the current catalog text, including after metadata is reverted.
+def _current_vectors():
+    return select(SkillEmbeddingRecord).join(CatalogSkillRecord, and_(
+        CatalogSkillRecord.id == SkillEmbeddingRecord.skill_id,
+        CatalogSkillRecord.text_hash == SkillEmbeddingRecord.text_hash,
+    )).where(SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT)
+
+
+def _indexed_count(catalog: CatalogStore) -> int:
     with catalog.db_sessions() as session:
-        return session.scalar(select(func.count()).select_from(RetrievalMemberRecord).join(
-            SkillEmbeddingRecord,
-            SkillEmbeddingRecord.vector_id == RetrievalMemberRecord.vector_id,
-        ).join(CatalogSkillRecord, and_(
-            CatalogSkillRecord.id == SkillEmbeddingRecord.skill_id,
-            CatalogSkillRecord.text_hash == SkillEmbeddingRecord.text_hash,
-        )).where(
-            RetrievalMemberRecord.generation == generation,
-            SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT,
-        ))
+        return session.scalar(select(func.count()).select_from(_current_vectors().subquery()))
 
 
-def _publish(root: Path, manifest: dict[str, Any]) -> None:
-    # Readers see either complete manifest; a rebuild never exposes a partially written one.
-    temporary = root / "manifest.json.part"
-    try:
-        with temporary.open("w") as output:
-            json.dump(manifest, output, sort_keys=True)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, root / "manifest.json")
-    finally:
-        temporary.unlink(missing_ok=True)
+def index_catalog(catalog: CatalogStore, *, allow_download: bool = False,
+                  embedder: Embedder | None = None) -> RetrievalStatus:
+    """Persist bounded batches; completed batches remain queryable after interruption.
 
-
-def index_catalog(
-    catalog: CatalogStore, *, allow_download: bool = True, embedder: Embedder | None = None,
-) -> RetrievalStatus:
-    """Resume embeddings, then publish a complete index. Caller owns the writer lock.
-
-    Tests may supply an embedder with an ``embed(texts)`` method; production uses pinned E5.
+    The ingest command owns the shared advisory lock across synchronization and indexing.
     """
-    identity = _identity(catalog)
-    root = _paths(catalog)
-    root.mkdir(parents=True, exist_ok=True)
     if not catalog.count():
         return {"indexed_count": 0, "retrieval_mode": "keyword-only"}
+    settings = catalog.settings
     if embedder is None:
-        _prepare_model(root / "model", allow_download)
-    previous = _manifest(root, identity)
-    # A valid file alone is insufficient: every current catalog row must still be represented.
-    if previous and _verified(root / previous["filename"], previous["sha256"]):
-        count = _indexed_count(catalog, previous["generation"])
-        if count == previous["count"] == catalog.count():
-            return {"indexed_count": count, "retrieval_mode": "hybrid"}
-    if embedder is None:
-        embedder = _load_embedder(root / "model")
-
-    # Keyset pagination bounds memory and resumes from persisted embeddings after interruption.
+        _prepare_model(settings.embedding_model_dir, allow_download)
+        embedder = _load_embedder(settings.embedding_model_dir, settings.embedding_threads)
     last_id = ""
     while True:
         with catalog.db_sessions() as session:
-            rows = session.execute(select(
-                CatalogSkillRecord.id, CatalogSkillRecord.text_hash,
-                CatalogSkillRecord.retrieval_text,
-            ).where(
+            rows = session.execute(select(CatalogSkillRecord.id, CatalogSkillRecord.text_hash,
+                CatalogSkillRecord.retrieval_text).where(
                 CatalogSkillRecord.id > last_id,
                 ~select(SkillEmbeddingRecord.vector_id).where(
                     SkillEmbeddingRecord.skill_id == CatalogSkillRecord.id,
                     SkillEmbeddingRecord.text_hash == CatalogSkillRecord.text_hash,
                     SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT,
                 ).exists(),
-            ).order_by(CatalogSkillRecord.id).limit(64)).all()
+            ).order_by(CatalogSkillRecord.id).limit(settings.embedding_batch_size)).all()
         if not rows:
             break
         vectors = _embed(embedder, ["passage: " + row.retrieval_text for row in rows])
@@ -245,181 +182,72 @@ def index_catalog(
             session.execute(insert(SkillEmbeddingRecord).on_conflict_do_nothing(
                 index_elements=["skill_id", "text_hash", "model_fingerprint"],
             ), [{"skill_id": row.id, "text_hash": row.text_hash,
-                 "model_fingerprint": MODEL_FINGERPRINT, "vector": vector.tobytes()}
+                 "model_fingerprint": MODEL_FINGERPRINT, "vector": vector}
                 for row, vector in zip(rows, vectors, strict=True)])
         last_id = rows[-1].id
-
-    # Build under a new name while readers continue using the published generation.
-    generation = uuid4().hex
-    filename = f"{generation}.usearch"
-    index = Index(ndim=DIMENSIONS, metric="cos", dtype="f16", connectivity=16,
-                  expansion_add=128, expansion_search=256)
-    try:
-        last_id = 0
-        while True:
-            with catalog.db_sessions() as session:
-                rows = session.execute(select(
-                    SkillEmbeddingRecord.vector_id, SkillEmbeddingRecord.vector,
-                ).join(CatalogSkillRecord, and_(
-                    CatalogSkillRecord.id == SkillEmbeddingRecord.skill_id,
-                    CatalogSkillRecord.text_hash == SkillEmbeddingRecord.text_hash,
-                )).where(
-                    SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT,
-                    SkillEmbeddingRecord.vector_id > last_id,
-                ).order_by(SkillEmbeddingRecord.vector_id).limit(1024)).all()
-            if not rows:
-                break
-            keys = np.array([row.vector_id for row in rows], dtype=np.uint64)
-            vectors = np.stack([np.frombuffer(row.vector, dtype=np.float32) for row in rows])
-            index.add(keys, vectors, threads=4)
-            with catalog.db_sessions.begin() as session:
-                session.add_all(RetrievalMemberRecord(generation=generation, vector_id=int(key))
-                                for key in keys)
-            last_id = int(keys[-1])
-        index.save(root / filename)
-        with (root / filename).open("rb") as stream:
-            os.fsync(stream.fileno())
-        manifest = {
-            "format": 1, "database_identity": identity, "model_fingerprint": MODEL_FINGERPRINT,
-            "dimensions": DIMENSIONS, "generation": generation, "filename": filename,
-            "count": len(index), "sha256": _sha256(root / filename),
-        }
-        # Publish the manifest only after the index file and generation membership are ready.
-        _publish(root, manifest)
-    except BaseException:
-        # Discard only this attempted generation; keep embeddings so the next run can resume.
-        (root / filename).unlink(missing_ok=True)
-        with catalog.db_sessions.begin() as session:
-            session.execute(delete(RetrievalMemberRecord).where(
-                RetrievalMemberRecord.generation == generation
-            ))
-        raise
-
-    # Keep one previous generation; mapped readers on this Mac retain their open old files.
-    keep = [generation] + ([previous["generation"]] if previous else [])
-    with catalog.db_sessions.begin() as session:
-        session.execute(delete(RetrievalMemberRecord).where(
-            RetrievalMemberRecord.generation.not_in(keep)
-        ))
-    for path in root.glob("*.usearch"):
-        if path.stem not in keep:
-            try:
-                path.unlink()
-            except OSError:
-                logger.warning("Could not remove retired vector index %s", path)
-    return {"indexed_count": _indexed_count(catalog, generation), "retrieval_mode": "hybrid"}
+    count = _indexed_count(catalog)
+    return {"indexed_count": count, "retrieval_mode": "hybrid" if count else "keyword-only"}
 
 
 class HybridRetriever:
-    def __init__(self, catalog: CatalogStore, *, embedder: Embedder | None = None) -> None:
+    def __init__(self, catalog: CatalogStore, settings: Settings | None = None, *,
+                 embedder: Embedder | None = None) -> None:
         self.catalog = catalog
-        self.root = _paths(catalog)
-        self.identity = _identity(catalog)
+        self.settings = settings or catalog.settings
         self._embedder = embedder
         self._injected = embedder is not None
-        self._index = None
-        self._generation = None
         self._lock = threading.RLock()
         self._model_failed = False
-        self._count_key = None
-        self._count = 0
-
-    def _resources(self):
-        manifest = _manifest(self.root, self.identity)
-        if not manifest:
-            return None
-        path = self.root / manifest["filename"]
-        if not _verified(path, manifest["sha256"]):
-            return None
-        with self._lock:
-            if self._generation != manifest["generation"]:
-                # Searches keep local index references while later calls adopt a new generation.
-                index = Index.restore(path, view=True)
-                if index is None or len(index) != manifest["count"] or index.ndim != DIMENSIONS:
-                    return None
-                index.expansion_search = 256
-                self._index = index
-                self._generation = manifest["generation"]
-            return self._index, manifest
 
     def status(self) -> RetrievalStatus:
-        try:
-            resources = self._resources()
-            if not resources:
-                return {"indexed_count": 0, "retrieval_mode": "keyword-only"}
-            generation = resources[1]["generation"]
-            # Catalog edits can invalidate vectors without changing the published index file.
-            with self.catalog.db_sessions() as session:
-                revision = session.get(RetrievalMetaRecord, "catalog_revision").value
-            with self._lock:
-                if self._count_key != (generation, revision):
-                    self._count = _indexed_count(self.catalog, generation)
-                    self._count_key = (generation, revision)
-                count = self._count
-            # Retain the indexed count even when a missing or failed model prevents querying it.
-            ready = self._injected or _model_ready(self.root / "model")
-            return {"indexed_count": count, "retrieval_mode": (
-                "hybrid" if count and ready and not self._model_failed else "keyword-only"
-            )}
-        except Exception:
-            logger.warning("Local vector index is unavailable", exc_info=True)
-        return {"indexed_count": 0, "retrieval_mode": "keyword-only"}
+        count = _indexed_count(self.catalog)
+        ready = self._injected or _model_ready(self.settings.embedding_model_dir)
+        return {"indexed_count": count, "retrieval_mode": (
+            "hybrid" if count and ready and not self._model_failed else "keyword-only")}
 
-    def _vector_skills(self, keys, agent, excluded):
-        # Published indexes can outlive catalog edits; stale text hashes are ineligible immediately.
-        ids = []
-        with self.catalog.db_sessions() as session:
-            for start in range(0, len(keys), 500):
-                batch = [int(key) for key in keys[start:start + 500]]
-                rows = session.execute(select(
-                    SkillEmbeddingRecord.vector_id, SkillEmbeddingRecord.skill_id,
-                ).join(CatalogSkillRecord, and_(
-                    CatalogSkillRecord.id == SkillEmbeddingRecord.skill_id,
-                    CatalogSkillRecord.text_hash == SkillEmbeddingRecord.text_hash,
-                )).where(
-                    SkillEmbeddingRecord.model_fingerprint == MODEL_FINGERPRINT,
-                    SkillEmbeddingRecord.vector_id.in_(batch),
-                )).all()
-                found = {row.vector_id: row.skill_id for row in rows}
-                # SQL lookup order must not replace the neighbors' relevance order.
-                ids.extend(found[key] for key in batch if key in found)
-        return self.catalog.eligible(ids, agent=agent, excluded=excluded)
+    def _semantic(self, vector, agent, excluded):
+        distance = SkillEmbeddingRecord.vector.cosine_distance(vector)
+        statement = eligibility(_current_vectors(), agent, excluded).with_only_columns(
+            CatalogSkillRecord.data, distance.label("distance"))
+        small_catalog = self.catalog.count() <= 4096
+        with self.catalog.db_sessions.begin() as session:
+            # Small catalogs use exact distances. Large catalogs retain the HNSW distance-only
+            # order so PostgreSQL can use its index, with bounded iterative filtering.
+            if small_catalog:
+                session.execute(text("SET LOCAL enable_indexscan = off"))
+                statement = statement.order_by(distance, CatalogSkillRecord.id).limit(200)
+            else:
+                session.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
+                session.execute(text("SET LOCAL hnsw.ef_search = 256"))
+                session.execute(text("SET LOCAL hnsw.max_scan_tuples = 20000"))
+                statement = statement.order_by(distance).limit(200)
+            rows = session.execute(statement).all()
+        rows = sorted(rows, key=lambda row: (row.distance, row.data["id"]))
+        return [Skill.model_validate(row.data) for row in rows]
 
     def search(self, task: str, agent: Agent, excluded: Iterable[str]) -> list[Skill]:
         excluded = set(excluded)
         lexical = self.catalog.keyword_search(task, agent=agent, excluded=excluded, limit=200)
         semantic = []
-        try:
-            resources = self._resources()
-            if resources and (self._injected or _model_ready(self.root / "model")):
-                index, _ = resources
+        if self._injected or _model_ready(self.settings.embedding_model_dir):
+            try:
                 with self._lock:
                     try:
                         if self._embedder is None:
-                            self._embedder = _load_embedder(self.root / "model")
+                            self._embedder = _load_embedder(self.settings.embedding_model_dir,
+                                                           self.settings.embedding_threads)
                         query = _embed(self._embedder, ["query: " + task])[0]
-                        # A transient model failure does not disable semantic search permanently.
                         self._model_failed = False
                     except Exception:
                         self._model_failed = True
                         raise
-                # Fetch more neighbors when eligibility filters remove the closest matches.
-                for count in (256, 1024, 4096):
-                    matches = index.search(
-                        query, count=min(count, len(index)), threads=1, exact=len(index) <= 4096,
-                    )
-                    ordered = sorted(zip(matches.keys, matches.distances, strict=True),
-                                     key=lambda item: (item[1], item[0]))
-                    semantic = self._vector_skills([key for key, _ in ordered], agent, excluded)[:200]
-                    if len(semantic) >= 200 or count >= len(index):
-                        break
-        except Exception:
-            logger.warning("Using keyword search because local semantic search failed", exc_info=True)
-        # Reciprocal rank fusion combines rankings without comparing their different score scales.
+                semantic = self._semantic(query, agent, excluded)
+            except Exception as exc:
+                # Exception bodies can contain SQL parameters or private task text.
+                logger.warning("Semantic search unavailable (%s)", type(exc).__name__)
         scores, skills = {}, {}
         for results in (lexical, semantic):
             for rank, skill in enumerate(results, 1):
                 skills[skill.id] = skill
                 scores[skill.id] = scores.get(skill.id, 0) + 1 / (60 + rank)
-        # Skill IDs break score ties consistently across index generations.
         return [skills[key] for key in sorted(scores, key=lambda key: (-scores[key], key))[:40]]

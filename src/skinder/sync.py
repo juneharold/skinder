@@ -1,13 +1,13 @@
 """Resumable, best-effort SkillsMP metadata discovery; never a completeness proof."""
 
 import argparse
-import fcntl
 import hashlib
 import json
 import logging
 import re
 import time
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -15,10 +15,12 @@ from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
-from sqlalchemy import Integer, cast, delete, func, literal_column, or_, select, update
-from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy import Integer, cast, delete, func, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert
 
-from .catalog import CatalogStore, default_catalog_db_path, stable_id
+from .catalog import CatalogStore, stable_id
+from .database import Database
+from .settings import Settings, load_settings
 from .models import InstallCommands, Skill
 from .orm import CatalogAliasRecord, SyncPartitionRecord, SyncRunRecord
 
@@ -38,7 +40,7 @@ def sync_status(catalog: CatalogStore) -> dict[str, Any] | None:
         row = session.get(SyncRunRecord, 1)
         if not row:
             return None
-        state = json.loads(row.data)
+        state = row.data
         # Upserts can commit before run counters are saved; aliases give durable unique inventory.
         imported_unique = session.scalar(select(func.count(
             CatalogAliasRecord.skill_id.distinct()
@@ -46,15 +48,15 @@ def sync_status(catalog: CatalogStore) -> dict[str, Any] | None:
         rows = session.execute(select(
             SyncPartitionRecord.status, func.count().label("n"),
         ).group_by(SyncPartitionRecord.status)).all()
-        capped_value = func.json_extract(SyncPartitionRecord.data, "$.capped")
-        has_error = func.json_extract(SyncPartitionRecord.data, "$.error").is_not(None)
-        diagnostics = [json.loads(data) for data in session.scalars(select(
+        capped_value = SyncPartitionRecord.data["capped"].as_boolean()
+        has_error = SyncPartitionRecord.data["error"].as_string().is_not(None)
+        diagnostics = list(session.scalars(select(
             SyncPartitionRecord.data,
         ).where(or_(
-            SyncPartitionRecord.status == "unresolved", capped_value == 1, has_error,
-        )).order_by(literal_column("sync_partitions.rowid")).limit(50))]
+            SyncPartitionRecord.status == "unresolved", capped_value.is_(True), has_error,
+        )).order_by(SyncPartitionRecord.ordinal).limit(50)))
         capped, failed = session.execute(select(
-            func.coalesce(func.sum(capped_value), 0),
+            func.coalesce(func.sum(cast(capped_value, Integer)), 0),
             func.coalesce(func.sum(cast(has_error, Integer)), 0),
         )).one()
     counts = {key: 0 for key in ("pending", "completed", "unresolved", "failed", "capped")}
@@ -185,16 +187,18 @@ def import_skill(
 
 class Sync:
     def __init__(
-        self, catalog: CatalogStore, client: httpx.Client, *, max_requests: int | None = None,
+        self, catalog: CatalogStore, client: httpx.Client, *, settings: Settings | None = None, max_requests: int | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.catalog, self.client = catalog, client
-        self.max_requests, self.sleep, self.monotonic = max_requests, sleep, monotonic
+        self.settings = settings or catalog.settings
+        self.max_requests = max_requests if max_requests is not None else self.settings.sync_max_requests
+        self.sleep, self.monotonic = sleep, monotonic
         self.calls, self.last_call = 0, None
         with catalog.db_sessions.begin() as session:
             row = session.get(SyncRunRecord, 1)
-            self.state = json.loads(row.data) if row else None
+            self.state = row.data if row else None
             # Completed runs recrawl; paused runs retain their frontier without clearing inventory.
             if not self.state or self.state["status"] == "completed":
                 session.execute(delete(SyncPartitionRecord))
@@ -211,7 +215,7 @@ class Sync:
     def save(self):
         self.state["updated_at"] = now()
         with self.catalog.db_sessions.begin() as session:
-            session.merge(SyncRunRecord(id=1, data=json.dumps(self.state)))
+            session.merge(SyncRunRecord(id=1, data=dict(self.state)))
 
     def enqueue(self, filters, sort="stars"):
         # Repeated discovery must not reset a partition's saved page or completion state.
@@ -219,7 +223,7 @@ class Sync:
         data = {"filters": filters, "sort": sort, "page": 1, "fingerprints": [], "capped": False}
         with self.catalog.db_sessions.begin() as session:
             session.execute(insert(SyncPartitionRecord).values(
-                key=key, status="pending", data=json.dumps(data),
+                key=key, status="pending", data=data,
             ).on_conflict_do_nothing(index_elements=["key"]))
 
     def checkpoint(self, key, data, status="pending"):
@@ -227,7 +231,7 @@ class Sync:
         with self.catalog.db_sessions.begin() as session:
             session.execute(update(SyncPartitionRecord).where(
                 SyncPartitionRecord.key == key
-            ).values(status=status, data=json.dumps(data)))
+            ).values(status=status, data=data))
         self.save()
 
     def request(self, path, params=None):
@@ -236,10 +240,10 @@ class Sync:
             if self.max_requests is not None and self.calls >= self.max_requests:
                 raise Paused("Request budget reached; rerun to resume")
             # Wait once for the longest of backoff, provider cooldown, and normal pacing.
-            delay = max(4 ** attempt if attempt else 0,
+            delay = max(2 ** attempt if attempt else 0,
                         self.state.get("retry_after", 0) - time.time())
             if self.last_call is not None:
-                delay = max(delay, 2 - (self.monotonic() - self.last_call))
+                delay = max(delay, self.settings.sync_min_interval_seconds - (self.monotonic() - self.last_call))
             if attempt:
                 logger.info("Retrying SkillsMP %s in %.1fs (retry %s/3)", path, delay, attempt)
             if delay:
@@ -252,7 +256,7 @@ class Sync:
                 response = self.client.get(BASE + path, params=params)
             except httpx.TransportError as exc:
                 if attempt == 3:
-                    raise Paused(f"Transport failure: {exc}") from exc
+                    raise Paused(f"Transport failure: {type(exc).__name__}") from None
                 continue
             retry_after = response.headers.get("Retry-After")
             if retry_after:
@@ -274,14 +278,7 @@ class Sync:
                     raise Paused(f"Provider retries exhausted: HTTP {response.status_code}")
                 continue
             if response.status_code != 200:
-                detail = ""
-                try:
-                    error = response.json().get("error")
-                    if isinstance(error, str):
-                        detail = ": " + error[:200]
-                except (ValueError, AttributeError):
-                    pass
-                raise Paused(f"Unexpected provider response HTTP {response.status_code} for {path}{detail}")
+                raise Paused(f"Unexpected provider response HTTP {response.status_code} for {path}")
             return response
 
     def discover(self):
@@ -327,15 +324,15 @@ class Sync:
         with self.catalog.db_sessions() as session:
             partitions = session.execute(select(
                 SyncPartitionRecord.key, SyncPartitionRecord.data,
-            ).where(func.json_extract(SyncPartitionRecord.data, "$.capped") == 1)).all()
+            ).where(SyncPartitionRecord.data["capped"].as_boolean().is_(True))).all()
         for row in partitions:
-            data = json.loads(row.data)
+            data = row.data
             if not self.expand(data):
                 continue
             with self.catalog.db_sessions.begin() as session:
                 session.execute(update(SyncPartitionRecord).where(
                     SyncPartitionRecord.key == row.key
-                ).values(data=json.dumps(data)))
+                ).values(data=data))
 
     def warn(self, message):
         if message not in self.state["warnings"]:
@@ -442,10 +439,10 @@ class Sync:
                     partition = session.execute(select(
                         SyncPartitionRecord.key, SyncPartitionRecord.data,
                     ).where(SyncPartitionRecord.status == "pending").order_by(
-                        literal_column("sync_partitions.rowid")
+                        SyncPartitionRecord.ordinal
                     ).limit(1)).first()
                 if partition:
-                    self.page(partition.key, json.loads(partition.data))
+                    self.page(partition.key, partition.data)
                 if self.state["discovery_pending"]:
                     self.discover()
                 elif not partition:
@@ -469,12 +466,21 @@ def positive(value: str) -> int:
     return number
 
 
+@contextmanager
+def writer_lock(catalog: CatalogStore):
+    # A dedicated session owns this lock across network I/O without holding a transaction.
+    with catalog.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        acquired = connection.scalar(text("SELECT pg_try_advisory_lock(73519002)"))
+        if not acquired:
+            raise RuntimeError("Another catalog sync/index writer is active.")
+        try:
+            yield
+        finally:
+            connection.execute(text("SELECT pg_advisory_unlock(73519002)"))
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--catalog-db-path", type=str, default=str(default_catalog_db_path()),
-        help="Path to the catalog database",
-    )
     parser.add_argument("--max-requests", type=positive, help="remote-call budget for this invocation")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--index-only", action="store_true")
@@ -484,33 +490,36 @@ def main(argv: Sequence[str] | None = None) -> None:
         logger.addHandler(logging.StreamHandler())
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    catalog = CatalogStore(args.catalog_db_path)
-    if args.status:
-        print(json.dumps(sync_status(catalog), indent=2))
-        return
-    lock_path = catalog.path.with_name(catalog.path.name + ".sync.lock")
-    # Discovery and index publication share one writer lock; readers use committed data.
-    with lock_path.open("a") as lock:
+    settings = load_settings("ingest")
+    database = Database(settings)
+    catalog = CatalogStore(database, settings)
+    try:
+        database.check_schema()
+        if args.status:
+            print(json.dumps(sync_status(catalog), indent=2))
+            return
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            parser.exit(1, "Another catalog sync/index writer is active.\n")
-        result = {}
-        if not args.index_only:
-            try:
-                with httpx.Client(timeout=30, follow_redirects=False, headers={
-                    "User-Agent": "Skinder/0.1 (best-effort SkillsMP catalog sync)",
-                }) as client:
-                    result["sync"] = Sync(catalog, client, max_requests=args.max_requests).run()
-            except KeyboardInterrupt:
-                print(json.dumps({"sync": sync_status(catalog)}, indent=2))
-                raise SystemExit(130) from None
-        from .retrieval import index_catalog
-        # A quota/budget pause can still leave useful committed rows to index before reporting it.
-        result["index"] = index_catalog(catalog, allow_download=True)
-        print(json.dumps(result, indent=2))
-        if result.get("sync", {}).get("status") == "paused":
-            raise SystemExit(2)
+            with writer_lock(catalog):
+                result = {}
+                if not args.index_only:
+                    try:
+                        with httpx.Client(timeout=settings.sync_http_timeout_seconds,
+                            follow_redirects=False, headers={
+                                "User-Agent": "Skinder/0.1 (best-effort SkillsMP catalog sync)",
+                            }) as client:
+                            result["sync"] = Sync(catalog, client, max_requests=args.max_requests).run()
+                    except KeyboardInterrupt:
+                        print(json.dumps({"sync": sync_status(catalog)}, indent=2))
+                        raise SystemExit(130) from None
+                from .retrieval import index_catalog
+                result["index"] = index_catalog(catalog, allow_download=False)
+                print(json.dumps(result, indent=2))
+                if result.get("sync", {}).get("status") == "paused":
+                    raise SystemExit(2)
+        except RuntimeError as exc:
+            parser.exit(1, str(exc) + "\n")
+    finally:
+        database.close()
 
 
 if __name__ == "__main__":

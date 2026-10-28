@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import type { Agent, Feedback, MatchSession, PassReason, Recommendation, Skill } from "../lib/types";
+import type { Agent, Feedback, MatchSession, PassReason, Recommendation, Saved, Skill } from "../lib/types";
 import { useSavedSkills, type SavedSkillsState } from "./useSavedSkills";
 import { errorMessage, type LoadState } from "../lib/async";
 
@@ -212,7 +212,21 @@ export function useMatchSession({
     void saved.mutate("Retry undo", async () => {
       if (isMatching(currentSession.current) && currentSession.current?.id === current.id)
         throw new Error("Wait for matching to finish before undoing a choice.");
-      const result = await api.undo(choice.id);
+      const generation = version.current;
+      let result: Saved;
+      try {
+        result = await api.undo(choice.id);
+      } catch (error) {
+        if (generation !== version.current) return;
+        if (error instanceof ApiError && error.status !== 404 && error.status < 500) throw error;
+        // A lost response or a retry's 404 can follow a committed deletion.
+        const next = await api.session(current.id);
+        if (generation !== version.current) return;
+        if (next.id !== current.id || next.feedback.some((item) => item.id === choice.id)) throw error;
+        // Observe deletion before reading the collection that it may have changed.
+        result = await api.saved();
+      }
+      if (generation !== version.current) return;
       version.current++;
       // The server preserves bookmarks owned outside this deck when undo removes a review save.
       saved.setItems(result.items);

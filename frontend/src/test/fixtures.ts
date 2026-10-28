@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import {
   defaultProfile,
   type Agent,
@@ -197,17 +197,16 @@ export function installBackend(options: BackendOptions = {}) {
     persistFeedback(...args),
   );
   vi.spyOn(api, "undo").mockImplementation(async (id) => {
-    if (session) {
-      const feedback = session.feedback.find((item) => item.id === id);
-      if (feedback?.action === "save") {
-        feedbackSaved.delete(feedback.skill_id);
-        removeIfUnowned(feedback.skill_id);
-      }
-      session = {
-        ...session,
-        feedback: session.feedback.filter((item) => item.id !== id),
-      };
+    const feedback = session?.feedback.find((item) => item.id === id);
+    if (!session || !feedback) throw new ApiError("Feedback not found.", 404);
+    if (feedback.action === "save") {
+      feedbackSaved.delete(feedback.skill_id);
+      removeIfUnowned(feedback.skill_id);
     }
+    session = {
+      ...session,
+      feedback: session.feedback.filter((item) => item.id !== id),
+    };
     return savedResponse();
   });
   vi.spyOn(api, "save").mockImplementation(async (id) => {

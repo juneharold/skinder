@@ -75,6 +75,9 @@ export function useSavedSkills({ enabled, canWrite, onNotice }: SavedSkillsOptio
       await operation();
       setLoadState("ready");
     } catch (error) {
+      // A failed write invalidated any pending read; expose its existing reload control.
+      setLoadState((previous) => previous === "loading" ? "error" : previous);
+      setLoadError(errorMessage(error));
       setError({
         message: `${skill ? `${skill.name}: ` : ""}${errorMessage(error)}`,
         label,

@@ -131,6 +131,22 @@ def test_feedback_retry_and_independent_bookmark_survive_undo(backend):
     assert [item['skill']['id'] for item in undone['items']] == ['example-0']
 
 
+def test_undo_retry_can_be_reconciled_from_owned_session_and_saved_collection(backend):
+    original = submit(backend.client).json()
+    complete(backend.app)
+    event = backend.client.post('/api/feedback', json={
+        'session_id': original['id'], 'skill_id': 'example-0', 'action': 'save'}).json()
+    path = '/api/feedback/' + event['feedback']['id']
+
+    # The deletion commits even if the client never receives this response.
+    assert backend.client.delete(path).status_code == 200
+    assert backend.client.delete(path).status_code == 404
+    restored = backend.client.get('/api/matches/' + original['id']).json()
+    assert restored['feedback'] == []
+    assert [item['skill_id'] for item in restored['recommendations']] == ['example-0']
+    assert backend.client.get('/api/saved').json()['items'] == []
+
+
 def test_mutations_require_csrf_and_exact_origin(backend):
     client = backend.client
     assert client.put('/api/profile', json={'output_style': 'private'},

@@ -12,6 +12,9 @@ from sqlalchemy.exc import ArgumentError
 
 
 class Settings(BaseSettings):
+    """BaseSettings allows us to load values from arguments, environment variables, and .env. when initiated"""
+
+    # Load environment variables and matches them to existing fields (e.g. SKINDER_ENV matches to env field)
     model_config = SettingsConfigDict(
         env_prefix="SKINDER_", env_file=".env", extra="ignore",
         populate_by_name=True, hide_input_in_errors=True,

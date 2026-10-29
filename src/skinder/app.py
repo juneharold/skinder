@@ -37,7 +37,7 @@ from .models import (
 )
 from .orm import FeedbackRecord, WorkerRecord
 from .retrieval import HybridRetriever
-from .settings import Settings, load_settings
+from .settings import Settings
 from .user import UserStore
 from .work import SyncWork, wait_for_work
 
@@ -45,38 +45,38 @@ ROOT = Path(__file__).resolve().parents[2]
 logger = logging.getLogger("skinder.http")
 
 
-def create_app(*, settings: Settings | None = None, database: Database | None = None,
-               frontend_path: str | Path | None = None) -> FastAPI:
-    settings = settings or load_settings('web')
+def create_app(*, settings: Settings, database: Database) -> FastAPI:
     settings.require('web')
-    owns_database = database is None
-    database = database or Database(settings)
+
+    # objects serving their own purpose
     users = UserStore(database)
     catalog = CatalogStore(database, settings)
     jobs = JobStore(database, settings, users)
     auth = AuthService(database, settings)
     search = HybridRetriever(catalog, settings)
     work = SyncWork()
+
     frontend_path = Path(frontend_path or ROOT / 'frontend' / 'dist')
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
+            # check_schema checks if db is most recent alembic schema version
             await work.run(database.check_schema)
             yield
         finally:
             await wait_for_work(asyncio.create_task(work.drain()))
-            if owns_database:
-                database.close()
 
     app = FastAPI(title='Skinder API', version='0.2.0', lifespan=lifespan,
                   responses={code: {'model': Error} for code in (400, 401, 403, 404, 409, 422, 429)})
-    app.state.auth = auth
+    
     app.state.users = users
     app.state.catalog = catalog
     app.state.jobs = jobs
+    app.state.auth = auth
     app.state.database = database
     app.state.settings = settings
+
     app.add_middleware(SessionMiddleware, secret_key=settings.session_secret.get_secret_value(),
                        session_cookie='skinder_oauth', max_age=600, same_site='lax',
                        https_only=settings.secure_cookies)

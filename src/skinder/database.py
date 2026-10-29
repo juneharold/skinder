@@ -18,11 +18,14 @@ class Database:
         self.settings = settings
         url = make_url(settings.database_url.get_secret_value()).set(drivername="postgresql+psycopg")
         args = {"connect_timeout": settings.db_connect_timeout_seconds}
+
+        # schema is not None only when testing
         if schema is not None:
             if not re.fullmatch(r"test_[a-f0-9]+", schema):
                 raise ValueError("Only isolated test schemas may override search_path")
             args["options"] = f"-csearch_path={schema},public"
         self.schema = schema
+
         self.engine = create_engine(url, pool_pre_ping=True, pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow, pool_timeout=settings.db_pool_timeout_seconds,
             connect_args=args, hide_parameters=True)
